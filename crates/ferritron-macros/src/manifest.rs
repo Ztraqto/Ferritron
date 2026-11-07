@@ -26,7 +26,7 @@ pub fn generate(m: &Manifest, self_ty: &str, manifest_path: &str) -> String {
     // Rebuild the plugin whenever the project file changes.
     writeln!(w, "const _: &[u8] = ::core::include_bytes!({manifest_path:?});").unwrap();
 
-    writeln!(w, "/// Parameters generated from the project file (`.frtx`).").unwrap();
+    writeln!(w, "/// Parameters generated from the project file (`.ferritroject`).").unwrap();
     writeln!(w, "pub struct Params {{").unwrap();
     for p in &m.params {
         let ty = param_type(&p.kind);
@@ -82,6 +82,16 @@ pub fn generate(m: &Manifest, self_ty: &str, manifest_path: &str) -> String {
     }
     writeln!(w, "        _ => ::core::option::Option::None,").unwrap();
     writeln!(w, "    }} }}").unwrap();
+    // Only parameters with options other than the default need a case.
+    let special: Vec<(usize, &ferritron_manifest::Param)> = m.params.iter().enumerate().filter(|(_, p)| !p.automatable || p.hidden).collect();
+    if !special.is_empty() {
+        writeln!(w, "    fn options(index: usize) -> ::ferritron::ParamOptions {{ match index {{").unwrap();
+        for (i, p) in special {
+            writeln!(w, "        {i} => ::ferritron::ParamOptions {{ automatable: {}, hidden: {} }},", p.automatable, p.hidden).unwrap();
+        }
+        writeln!(w, "        _ => ::ferritron::ParamOptions::DEFAULT,").unwrap();
+        writeln!(w, "    }} }}").unwrap();
+    }
     writeln!(w, "}}").unwrap();
 
     writeln!(w, "/// Processing context of this plugin.").unwrap();
@@ -121,7 +131,7 @@ id = \"com.example.gain\"
 name = \"Gain\"
 [params]
 gain = { type = \"float\", range = [-60, 12], default = 0, unit = \"dB\" }";
-        let code = generate(&parse(src).unwrap(), "Gain", "C:/x/gain.frtx");
+        let code = generate(&parse(src).unwrap(), "Gain", "C:/x/gain.ferritroject");
         assert!(code.contains("pub gain: ::ferritron::FloatParam"));
         assert!(code.contains("__export_formats!(Gain)"));
     }

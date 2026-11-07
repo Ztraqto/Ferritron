@@ -9,7 +9,7 @@ pub enum ParamKind {
     Enum { choices: &'static [&'static str] },
 }
 
-/// Static description of a parameter, generated from the project file (`.frtx`).
+/// Static description of a parameter, generated from the project file (`.ferritroject`).
 #[derive(Debug)]
 pub struct ParamInfo {
     /// Stable ID derived from `key`; this is what hosts store in automation.
@@ -174,12 +174,38 @@ impl EnumParam {
     }
 }
 
+/// How hosts may use a parameter: `automatable` and `hidden` in the
+/// project file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamOptions {
+    /// Hosts offer it for automation (default true).
+    pub automatable: bool,
+    /// Hosts do not show it in their parameter lists (default false); it is
+    /// still saved and the plugin's own editor may still show it.
+    pub hidden: bool,
+}
+
+impl ParamOptions {
+    pub const DEFAULT: Self = Self { automatable: true, hidden: false };
+}
+
+impl Default for ParamOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// The full parameter set of a plugin. Implemented by generated code.
 pub trait ParamSet: Default + Send + Sync + 'static {
     fn infos() -> &'static [ParamInfo];
     fn cell(&self, index: usize) -> &ParamCell;
     /// Maps a parameter ID to its index. Must not allocate or lock.
     fn index_of(id: u32) -> Option<usize>;
+    /// Options of the parameter at `index` (see [`ParamOptions`]).
+    fn options(index: usize) -> ParamOptions {
+        let _ = index;
+        ParamOptions::DEFAULT
+    }
 }
 
 #[cfg(test)]

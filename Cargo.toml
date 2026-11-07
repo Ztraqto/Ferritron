@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "examples/*", "tools/*"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -13,6 +13,7 @@ authors = ["Ztraqto"]
 ferritron = { path = "crates/ferritron" }
 ferritron-core = { path = "crates/ferritron-core" }
 ferritron-build = { path = "crates/ferritron-build" }
+ferritron-sdk = { path = "crates/ferritron-sdk" }
 ferritron-macros = { path = "crates/ferritron-macros" }
 ferritron-manifest = { path = "crates/ferritron-manifest" }
 ferritron-vulkan = { path = "crates/ferritron-vulkan" }

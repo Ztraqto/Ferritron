@@ -1,4 +1,4 @@
-//! `#[ferritron::plugin]`: turns the project file (`<name>.frtx`) into typed Rust code and
+//! `#[ferritron::plugin]`: turns the project file (`<name>.ferritroject`) into typed Rust code and
 //! exports the plugin for every enabled format.
 
 mod locales;
@@ -9,7 +9,7 @@ use proc_macro::{Delimiter, Group, TokenStream, TokenTree};
 
 /// Put this on the `impl Process for MyPlugin` block.
 ///
-/// It reads the project file next to `Cargo.toml` (`<name>.frtx`, or the
+/// It reads the project file next to `Cargo.toml` (`<name>.ferritroject` or `<name>.frtx`, or the
 /// former `ferritron.toml`) and generates, in the same
 /// module: a `Params` struct, a `Context` alias, the plugin metadata and the
 /// format entry points.

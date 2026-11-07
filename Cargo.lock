@@ -34,14 +34,14 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "ara-reverse"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
 ]
 
 [[package]]
 name = "ara-stretch"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
 ]
@@ -203,6 +203,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -324,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "cpp-gain"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cc",
  "ferritron-clap",
@@ -508,10 +514,25 @@ checksum = "6f34b169b8cbbaed2b4995205f1d02d7eac4b2771df5479255fe5483e1334a39"
 
 [[package]]
 name = "crash-fixture"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
 ]
+
+[[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
@@ -555,7 +576,7 @@ dependencies = [
 
 [[package]]
 name = "csharp-gain"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-clap",
  "ferritron-core",
@@ -778,7 +799,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferritron"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-ara",
  "ferritron-au",
@@ -792,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-ara"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cc",
  "ferritron-build",
@@ -801,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-au"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "block2",
  "cc",
@@ -812,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-bench"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
  "ferritron-gpu",
@@ -820,11 +841,14 @@ dependencies = [
 
 [[package]]
 name = "ferritron-build"
-version = "1.1.0"
+version = "1.2.0"
+dependencies = [
+ "toml 1.1.8+spec-1.1.0",
+]
 
 [[package]]
 name = "ferritron-clap"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cc",
  "ferritron-build",
@@ -833,9 +857,11 @@ dependencies = [
 
 [[package]]
 name = "ferritron-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
+ "ferritron-build",
  "ferritron-manifest",
+ "ferritron-sdk",
  "fluent-syntax",
  "serde_json",
  "toml 1.1.8+spec-1.1.0",
@@ -843,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "fluent-syntax",
  "libc",
@@ -852,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-gpu"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-graph",
  "ferritron-vulkan",
@@ -862,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-gpu-view"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-core",
  "objc2",
@@ -874,11 +900,11 @@ dependencies = [
 
 [[package]]
 name = "ferritron-graph"
-version = "1.1.0"
+version = "1.2.0"
 
 [[package]]
 name = "ferritron-macros"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-manifest",
  "fluent-syntax",
@@ -887,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-manifest"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "serde",
  "toml 1.1.8+spec-1.1.0",
@@ -895,22 +921,32 @@ dependencies = [
 
 [[package]]
 name = "ferritron-mcp"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-core",
  "serde_json",
 ]
 
 [[package]]
+name = "ferritron-sdk"
+version = "1.2.0"
+dependencies = [
+ "ferritron-build",
+ "lzma-rs",
+ "sha2",
+ "toml 1.1.8+spec-1.1.0",
+]
+
+[[package]]
 name = "ferritron-slang"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "ferritron-testhost"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cc",
  "ferritron-build",
@@ -918,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-vst3"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "cc",
  "ferritron-build",
@@ -927,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-vulkan"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ash",
  "half",
@@ -935,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-wasm"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-core",
  "wasmtime",
@@ -944,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "ferritron-web"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-core",
  "raw-window-handle",
@@ -1089,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "gain"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
  "ferritron-mcp",
@@ -1098,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "gain-match"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
 ]
@@ -1333,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-chain"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
  "ferritron-gpu",
@@ -1341,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-modal"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
  "ferritron-gpu",
@@ -1349,7 +1385,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-reverb"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
  "ferritron-gpu",
@@ -1357,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-view"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
 ]
@@ -1601,6 +1637,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "instances"
+version = "1.2.0"
+dependencies = [
+ "ferritron",
+ "serde_json",
+]
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1785,6 +1829,16 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
+]
 
 [[package]]
 name = "mach2"
@@ -2667,7 +2721,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sine-synth"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
 ]
@@ -2686,7 +2740,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slang-drive"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
  "ferritron-gpu",
@@ -3241,7 +3295,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-crusher"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron",
 ]
@@ -3270,7 +3324,7 @@ dependencies = [
 
 [[package]]
 name = "wasm-sandbox"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "ferritron-clap",
  "ferritron-vst3",

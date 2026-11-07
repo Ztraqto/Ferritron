@@ -4,6 +4,8 @@ mod exports;
 mod formats;
 mod i18n;
 mod new;
+mod sdk;
+mod target;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -16,6 +18,8 @@ Usage:
   cargo ferritron new <name> [--template instrument]   Create a plugin project
   cargo ferritron bundle <package> [options]    Build and package a plugin
   cargo ferritron i18n check <package>          List untranslated strings
+  cargo ferritron notarize <bundle>             Notarize a signed macOS bundle (on a Mac)
+  cargo ferritron sdk ...                       SDKs: status, list, available, fetch, use, source, remove
   cargo ferritron --version                     Print the Ferritron version
 
 `bundle` packages <package> for every plugin format it was built with
@@ -27,10 +31,19 @@ Options:
               `cargo build -p <package>` updates the plugin inside the running host
   --install   Also copy the results to each format's system folder
               (may need administrator rights)
+  --target T  Build for another target: aarch64-apple-darwin,
+              x86_64-apple-darwin, universal-apple-darwin (both in one).
+              From Windows or Linux, macOS builds go through xclang
+              (`cargo ferritron sdk fetch xclang`, then `... fetch macos`).
+              Output: target/<T>/bundled/
+
+SDK versions pinned in the project file (`[sdk] vst3 = \"3.8.1\"`) are used
+from Ferritron's SDK folder; see `cargo ferritron sdk status`.
 
 macOS: bundles get an Info.plist, the `ferritron-host` helper for crash
-isolation (compiled with `cc`) and a code signature: ad hoc, or with the
-identity in FERRITRON_CODESIGN_IDENTITY (e.g. \"Developer ID Application: ...\").";
+isolation and a code signature: ad hoc, or with the identity in
+FERRITRON_CODESIGN_IDENTITY (e.g. \"Developer ID Application: ...\"). They
+need macOS 13.0 or later (MACOSX_DEPLOYMENT_TARGET changes it).";
 
 fn main() -> ExitCode {
     // Invoked as `cargo-ferritron ferritron ...` by cargo, or directly via the alias.
@@ -76,6 +89,11 @@ fn run(args: &[String]) -> Result<(), String> {
             let dir = package_dir(&cargo, package).ok_or_else(|| format!("package `{package}` not found"))?;
             return i18n::check(&dir);
         }
+        Some("sdk") => return sdk::run(&args[1..]),
+        Some("notarize") => {
+            let bundle = args.get(1).ok_or_else(|| format!("missing <bundle>\n\n{USAGE}"))?;
+            return target::notarize(Path::new(bundle));
+        }
         Some("-V" | "--version") => {
             println!("cargo-ferritron {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -87,20 +105,28 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(other) => return Err(format!("unknown command `{other}`\n\n{USAGE}")),
     }
     let mut package = None;
-    let (mut dev, mut install) = (false, false);
-    for arg in &args[1..] {
+    let (mut dev, mut install, mut triple) = (false, false, None);
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--dev" => dev = true,
             "--install" => install = true,
+            "--target" => triple = Some(rest.next().ok_or("--target needs a target triple")?.clone()),
             flag if flag.starts_with('-') => return Err(format!("unknown option `{flag}`\n\n{USAGE}")),
             name => package = Some(name.to_string()),
         }
     }
     let package = package.ok_or_else(|| format!("missing <package>\n\n{USAGE}"))?;
+    let target = target::Target::parse(triple.as_deref())?;
+    if target.triple.is_some() && (dev || install) {
+        return Err("--dev and --install build for this computer; leave out --target".into());
+    }
+    formats::set_target(&target.os, &target.arch);
 
     let cargo = cargo_program();
-    let artifact = build(&package, !dev)?;
+    let artifact = build(&package, !dev, &target)?;
     let metadata = cargo_metadata(&cargo, false).ok_or("`cargo metadata` failed")?;
+    warn_on_version_mismatch(&metadata);
     let exported = exports::exported_names(&artifact.library)?;
     let formats: Vec<formats::Format> = formats::discover(&metadata)?
         .into_iter()
@@ -132,15 +158,15 @@ fn run(args: &[String]) -> Result<(), String> {
             // A marker left by an earlier dev build would make this release package hot reload.
             let _ = std::fs::remove_file(formats::with_suffix(&binary, HOT_RELOAD_MARKER_SUFFIX));
         }
-        if root.is_dir() && cfg!(unix) {
+        if root.is_dir() && target.is_unix() {
             // Isolated plugins run in a child process started by this helper.
-            let helper = host_helper(&out_dir)?;
+            let helper = host_helper(&out_dir, &target)?;
             let helpers = root.join("Contents/Helpers");
             std::fs::create_dir_all(&helpers).map_err(|e| format!("cannot create {}: {e}", helpers.display()))?;
             std::fs::copy(&helper, helpers.join("ferritron-host")).map_err(|e| format!("cannot copy the ferritron-host helper: {e}"))?;
         }
-        if cfg!(target_os = "macos") {
-            sign(&root)?;
+        if target.is_macos() && root.is_dir() {
+            target::sign_macos(&root)?;
         }
         println!("Bundled {} ({})", root.display(), format.name);
         if install {
@@ -194,14 +220,68 @@ struct Artifact {
     out_dir: Option<PathBuf>,
 }
 
-/// Runs `cargo build` and returns the plugin library it produced.
-fn build(package: &str, release: bool) -> Result<Artifact, String> {
-    let cargo = cargo_program();
-    let mut cmd = Command::new(&cargo);
-    cmd.args(["build", "--package", package, "--message-format=json-render-diagnostics"]);
-    if let Some(dir) = package_dir(&cargo, package) {
-        cmd.env("FERRITRON_ASSETS_STAMP", assets_stamp(&dir));
+/// Builds `package` for `target` (both architectures and joined, for
+/// universal macOS) and returns the plugin library.
+fn build(package: &str, release: bool, target: &target::Target) -> Result<Artifact, String> {
+    let triples = target.cargo_triples();
+    if triples.len() < 2 {
+        return build_one(package, release, target, triples.first().map(String::as_str));
     }
+    let parts: Vec<Artifact> = triples.iter().map(|t| build_one(package, release, target, Some(t))).collect::<Result<_, _>>()?;
+    // target/<arch triple>/<profile>/<lib> -> target/universal-apple-darwin/<profile>/<lib>
+    let first = &parts[0].library;
+    let profile = first.parent().and_then(Path::file_name).ok_or("unexpected build output location")?;
+    let target_dir = first.parent().and_then(Path::parent).and_then(Path::parent).ok_or("unexpected build output location")?;
+    let library = target_dir.join(target.triple.as_deref().unwrap_or_default()).join(profile).join(first.file_name().unwrap_or_default());
+    target::lipo(&parts.iter().map(|a| a.library.clone()).collect::<Vec<_>>(), &library)?;
+    let Artifact { manifest_dir, out_dir, .. } = parts.into_iter().next().expect("two parts");
+    Ok(Artifact { library, manifest_dir, out_dir })
+}
+
+/// The environment of a build: SDK versions pinned in the project file
+/// (`[sdk]`), and a stamp of `sdk.toml` so a new or changed one rebuilds.
+fn sdk_environment(cmd: &mut Command, package_dir: Option<&Path>) -> Result<(), String> {
+    if let Some(dir) = package_dir
+        && let Ok(path) = ferritron_manifest::locate(dir)
+        && let Ok(text) = std::fs::read_to_string(&path)
+    {
+        let manifest = ferritron_manifest::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        for (id, version) in &manifest.sdk {
+            if let Some(spec) = ferritron_build::sdk::find(id) {
+                cmd.env(ferritron_build::sdk::pin_var(spec), version);
+            }
+        }
+    }
+    let stamp = ferritron_build::sdk::settings_path()
+        .and_then(|p| std::fs::read(p).ok())
+        .map(|bytes| format!("{:x}", bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))))
+        .unwrap_or_default();
+    cmd.env("FERRITRON_SDK_STAMP", stamp);
+    Ok(())
+}
+
+/// Runs `cargo build` (through xclang across to macOS) and returns the plugin library it produced.
+fn build_one(package: &str, release: bool, target: &target::Target, triple: Option<&str>) -> Result<Artifact, String> {
+    let cargo = cargo_program();
+    let mut cmd = if target.crosses_to_macos() {
+        let mut cmd = Command::new(ferritron_sdk::xclang_program(&target::xclang()?));
+        cmd.arg("cargo");
+        cmd
+    } else {
+        Command::new(&cargo)
+    };
+    cmd.args(["build", "--package", package, "--message-format=json-render-diagnostics"]);
+    if let Some(triple) = triple {
+        cmd.args(["--target", triple]);
+    }
+    if let Some(minimum) = target.deployment_target() {
+        cmd.env("MACOSX_DEPLOYMENT_TARGET", minimum);
+    }
+    let dir = package_dir(&cargo, package);
+    if let Some(dir) = &dir {
+        cmd.env("FERRITRON_ASSETS_STAMP", assets_stamp(dir));
+    }
+    sdk_environment(&mut cmd, dir.as_deref())?;
     if release {
         cmd.arg("--release");
     }
@@ -242,6 +322,20 @@ fn build(package: &str, release: bool) -> Result<Artifact, String> {
         }
     }
     Err(format!("`{package}` did not produce a plugin library; add `crate-type = [\"cdylib\"]` under [lib] in its Cargo.toml"))
+}
+
+/// An old `cargo-ferritron` left on `PATH` may not know what the plugin's
+/// Ferritron does: say so instead of failing in odd ways.
+fn warn_on_version_mismatch(metadata: &serde_json::Value) {
+    let ours = env!("CARGO_PKG_VERSION");
+    let framework = metadata["packages"].as_array().and_then(|p| p.iter().find(|p| p["name"] == "ferritron")).and_then(|p| p["version"].as_str());
+    if let Some(framework) = framework
+        && framework != ours
+    {
+        eprintln!(
+            "warning: this is cargo-ferritron {ours}, the plugin uses Ferritron {framework};              install the matching tool (`cargo install --path crates/ferritron-cli` in the Ferritron folder)"
+        );
+    }
 }
 
 fn cargo_metadata(cargo: &str, no_deps: bool) -> Option<serde_json::Value> {
@@ -306,9 +400,21 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The `ferritron-host` helper (macOS, Linux), compiled once into `out_dir`
-/// with the system C compiler (`CC` or `cc`).
-fn host_helper(out_dir: &Path) -> Result<PathBuf, String> {
+/// The `ferritron-host` helper (macOS, Linux), compiled once into `out_dir`:
+/// with the system C compiler (`CC` or `cc`), or xclang's clang across to
+/// macOS (each architecture, joined for universal).
+fn host_helper(out_dir: &Path, target: &target::Target) -> Result<PathBuf, String> {
+    let triples = target.cargo_triples();
+    if triples.len() > 1 {
+        let parts: Vec<PathBuf> = triples.iter().map(|t| host_helper_for(&out_dir.join(t), target, Some(t))).collect::<Result<_, _>>()?;
+        let joined = out_dir.join(".ferritron-host").join("ferritron-host");
+        target::lipo(&parts, &joined)?;
+        return Ok(joined);
+    }
+    host_helper_for(out_dir, target, triples.first().map(String::as_str))
+}
+
+fn host_helper_for(out_dir: &Path, target: &target::Target, triple: Option<&str>) -> Result<PathBuf, String> {
     const SOURCE: &str = include_str!("host_helper.c");
     let dir = out_dir.join(".ferritron-host");
     let (source, binary) = (dir.join("host_helper.c"), dir.join("ferritron-host"));
@@ -317,35 +423,17 @@ fn host_helper(out_dir: &Path) -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     std::fs::write(&source, SOURCE).map_err(|e| format!("cannot write {}: {e}", source.display()))?;
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let (cc, flags) = target::c_compiler(target, triple)?;
+    let cc_name = cc.display().to_string();
     let mut cmd = Command::new(&cc);
-    cmd.args(["-O2", "-o"]).arg(&binary).arg(&source);
-    if cfg!(target_os = "linux") {
+    cmd.args(&flags).args(["-O2", "-o"]).arg(&binary).arg(&source);
+    if target.os == "linux" {
         cmd.arg("-ldl");
     }
-    let status = cmd.status().map_err(|e| format!("cannot run {cc} to build the ferritron-host helper: {e}"))?;
+    let status = cmd.status().map_err(|e| format!("cannot run {cc_name} to build the ferritron-host helper: {e}"))?;
     if !status.success() {
-        return Err(format!("building the ferritron-host helper with {cc} failed"));
+        return Err(format!("building the ferritron-host helper with {cc_name} failed"));
     }
     Ok(binary)
 }
 
-/// Signs a macOS bundle: hosts on Apple Silicon only load signed code. Ad
-/// hoc unless FERRITRON_CODESIGN_IDENTITY names a certificate.
-fn sign(root: &Path) -> Result<(), String> {
-    let identity = std::env::var("FERRITRON_CODESIGN_IDENTITY").unwrap_or_else(|_| "-".into());
-    let helper = root.join("Contents/Helpers/ferritron-host");
-    // Nested code first, then the bundle.
-    for target in [helper.as_path(), root].into_iter().filter(|p| p.exists()) {
-        let mut cmd = Command::new("codesign");
-        cmd.args(["--force", "--sign", &identity]);
-        if identity != "-" {
-            cmd.args(["--timestamp", "--options", "runtime"]);
-        }
-        let status = cmd.arg(target).status().map_err(|e| format!("cannot run codesign: {e}"))?;
-        if !status.success() {
-            return Err(format!("codesign failed for {}", target.display()));
-        }
-    }
-    Ok(())
-}

@@ -1,0 +1,18 @@
+[plugin]
+id     = "dev.ferritron.examples.instances"
+name   = "Ferritron Instances"
+vendor = "Ztraqto"
+
+[params]
+level = { type = "float", range = [-60, 12], default = 0, unit = "dB" }
+# Internal state the host need not list or automate.
+color_seed = { type = "int", range = [0, 255], default = 0, automatable = false, hidden = true }
+
+[view]
+backend    = "web"
+entry      = "ui"
+size       = [520, 320]
+resizable  = true
+min_size   = [400, 240]
+max_size   = [1200, 900]
+background = "#16181d"

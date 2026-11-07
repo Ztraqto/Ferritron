@@ -15,7 +15,7 @@ Rust で書かれた、シンプルで速く、拡張しやすいオーディオ
 
 ## プラグインの全体
 
-プロジェクトファイル `gain.frtx`（中身は TOML。パッケージごとに1つ、`Cargo.toml` の隣に置きます）:
+プロジェクトファイル `gain.ferritroject`（中身は TOML。パッケージごとに1つ、`Cargo.toml` の隣に置きます）:
 
 ```toml
 [plugin]
@@ -56,7 +56,7 @@ WebView（Windows では WebView2）で表示されます。ローカルサー�
 CLAP のどちらでも動きます。
 
 ```toml
-# gain.frtx
+# gain.ferritroject
 [view]
 backend   = "web"
 entry     = "ui"          # must contain index.html
@@ -755,6 +755,24 @@ let (mut l, mut r) = ([1.0; 64], [1.0; 64]);
 assert!(h.process(&mut [&mut l, &mut r]));
 ```
 
+### インスタンス・トラック・ストア
+
+各インスタンスは `InstanceHandle` を持ちます。プラグインは `Process::init`（と
+`ctx.instance()`）で、GPU エディタは `ui.instance()` で、Web エディタは
+`ferritron.instance` で受け取ります。`ferritron::instances::<P>()` で、同じプロセス内の
+そのプラグインのインスタンスを列挙できます。
+
+- `id()`: プロジェクトに保存される ID。トラックを複製すると新しい ID になります。
+- `track()`: ホストが伝えるトラックの名前・色・位置。
+- `begin` / `set` / `end` / `edit`: オーディオスレッド以外のどのスレッドからでも
+  パラメータを変え、ホストにオートメーションとして記録させます。インスタンスも起こします
+  （`wake()` 単体でも可）。
+- `store()`: プロジェクトに保存されるキーバリュー（文字列・バイト列）。
+- `on_message` / `post`: Web エディタの `ferritron.send` / `ferritron.onMessage` と JSON をやり取り。
+
+[examples/instances](examples/instances) を参照してください。プラグインとエディタが
+ホストのプロセス内にあるときだけ使えます（`[isolation]` やエディタの別プロセス化では不可）。
+
 ### パラメータの型
 
 | `type`  | キー                                   | 読み取り       |
@@ -765,7 +783,8 @@ assert!(h.process(&mut [&mut l, &mut r]));
 | `enum`  | `choices = ["A", "B"]`, `default = "A"` | `.index() -> usize` |
 
 どのパラメータにも、表示名の `name` を任意で指定できます（省略するとキーを先頭大文字に
-したもの）。キーは保存されたプロジェクトとオートメーションでのパラメータの識別子なので、
+したもの）。`automatable = false` でオートメーションの対象から外し、`hidden = true` で
+ホストのパラメータ一覧から隠せます（内部状態用）。キーは保存されたプロジェクトとオートメーションでのパラメータの識別子なので、
 リリース後に名前を変えないでください。
 
 ### 多言語対応
@@ -809,32 +828,62 @@ param-gain = ゲイン
 有効です。片方だけをビルドするには
 `ferritron = { ..., default-features = false, features = ["vst3"] }` を使います。
 
-VST3 の場合:
+いちばん簡単なのは、Ferritron に取得させる方法です。SDK ごとにライセンスを表示し、
+同意したときだけ配布元から取得します（Ferritron Editor の設定画面からも同じことが
+できます）:
 
-1. Steinberg から VST3 SDK をダウンロードし
-   （<https://github.com/steinbergmedia/vst3sdk> または
-   <https://www.steinberg.net/developers/>）、そのライセンスに同意します。
-2. `VST3_SDK_DIR` に SDK のフォルダ（`pluginterfaces/` を含むフォルダ）を指定します。
-   たとえばプロジェクトの `.cargo/config.toml` で:
+```bash
+cargo ferritron sdk available        # Ferritron が確認済みのバージョン
+cargo ferritron sdk fetch vst3       # ライセンスを表示し、同意を求めます
+cargo ferritron sdk fetch clap
+cargo ferritron sdk status           # 各 SDK がどこから・なぜ使われるか
+```
 
-   ```toml
-   [env]
-   VST3_SDK_DIR = "C:/SDKs/vst3sdk"
-   CLAP_SDK_DIR = "C:/SDKs/clap"
-   ```
+取得した SDK は Ferritron の SDK フォルダ（Windows は `C:\Ferritron\SDK`、ほかは
+`~/Ferritron/SDK`）にバージョンごとに置かれます（`<root>/<id>/<version>`。手作業で置いても
+かまいません）。ビルドは次の規則で SDK を探します。
 
-CLAP の場合: <https://github.com/free-audio/clap> からヘッダをダウンロードし、
-`CLAP_SDK_DIR` に `include/clap/clap.h` を含むフォルダを指定します。
+1. プロジェクトファイルで固定したバージョン（`[sdk] vst3 = "3.8.1"`。`cargo ferritron bundle` が使います）
+2. `sdk.toml`（Windows は `%APPDATA%\Ferritron\sdk.toml`）の `source`: `auto`（既定。環境変数が
+   あればそれ、なければ管理フォルダのバージョン）、`env`、`managed`、`path`
+3. どれでも見つからなければ、探した場所をすべて示してビルドを止めます
+
+```toml
+# sdk.toml（cargo ferritron sdk use / source と Editor が書きます）
+root = "C:/Ferritron/SDK"       # FERRITRON_SDK_ROOT で上書きできます
+[vst3]
+source  = "managed"
+version = "3.8.1"
+[ara]
+source = "path"
+path   = "D:/work/ARA_SDK"
+```
+
+`sdk.toml` がなければ Ferritron 1.1 から何も変わらず、環境変数がそのまま使えます。
+手作業で用意する場合は、Steinberg の VST3 SDK（<https://github.com/steinbergmedia/vst3sdk>、
+サブモジュールを含む）と CLAP（<https://github.com/free-audio/clap>）を入手してライセンスに
+同意し、`VST3_SDK_DIR`（`pluginterfaces/` を含むフォルダ）と `CLAP_SDK_DIR`
+（`include/clap/clap.h` を含むフォルダ）を指定します。たとえばプロジェクトの
+`.cargo/config.toml` で:
+
+```toml
+[env]
+VST3_SDK_DIR = "C:/SDKs/vst3sdk"
+CLAP_SDK_DIR = "C:/SDKs/clap"
+```
 
 ### 2. 必要なもの
 
 - Rust 1.89 以降
 - C++17 コンパイラ: Windows では Rust の MSVC ツールチェーンが使う Visual Studio Build Tools、Linux では GCC か Clang
 
-**macOS**（Apple Silicon と Intel、macOS 11 以降）では Xcode のコマンドラインツール
+**macOS**（Apple Silicon と Intel、macOS 13 以降。`MACOSX_DEPLOYMENT_TARGET` で変更可）では Xcode のコマンドラインツール
 （`xcode-select --install`）が必要です。`cargo ferritron bundle gain` は Info.plist 付きの
 `<name>.vst3`、`<name>.clap`、`<name>.component`（Audio Unit）のバンドルを書き出し、署名
-します（アドホック、または `FERRITRON_CODESIGN_IDENTITY` の ID で）。`--install` は
+します（アドホック、または `FERRITRON_CODESIGN_IDENTITY` の ID で。続けて
+`cargo ferritron notarize <bundle>` で `xcrun notarytool` による公証もできます。資格情報は
+`FERRITRON_NOTARY_PROFILE`、または `FERRITRON_NOTARY_KEY` / `_KEY_ID` / `_ISSUER`。公証して
+いないプラグインをダウンロードで配ると Gatekeeper に止められます）。`--install` は
 `~/Library/Audio/Plug-Ins/{VST3,CLAP,Components}` にコピーします。エディタ（Web:
 WKWebView、GPU: Metal）、ホットリロード、プロセス分離、ARA、Audio Workgroup はすべて
 macOS 向けの実装があります。**これらは書かれていて型検査
@@ -923,6 +972,27 @@ manufacturer = "Ztrq"  # 4 characters, at least one not lowercase
 `--install` の後、`auval -v aufx Gain Ztrq` でバンドルを確認できます。対応するホストは
 Audio Workgroup（レンダーコンテキストのオブザーバー）を渡し、Ferritron のワーカー
 スレッドがそこに参加します。
+
+#### Windows や Linux から macOS 向けにビルドする（xclang）
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo ferritron sdk fetch xclang     # クロスビルド用のツールチェーン（Apache 2.0）
+cargo ferritron sdk fetch macos      # Apple の macOS SDK（xclang 経由）
+cargo ferritron bundle gain --target universal-apple-darwin
+```
+
+`--target` には `aarch64-apple-darwin`、`x86_64-apple-darwin`、`universal-apple-darwin`
+（両方を 1 つのバイナリに）を指定できます。バンドルは `target/<target>/bundled/` に出ます。
+Mac 以外では [xclang](https://github.com/clice-io/xclang)（`xclang cargo build`）を通して
+ビルドし、xclang は SDK と同じ規則（`XCLANG_DIR`、`sdk.toml`、SDK フォルダ）で探します。
+macOS SDK は Apple のもので、Apple の利用規約（Apple 製ハードウェア上での利用が前提）の
+もとで使います。Windows や Linux でこれを使ってビルドするかどうかは、利用者の判断です。
+こうして作ったバンドルの署名はリンカによるアドホック署名だけです（`rcodesign` があれば
+その署名）。配布するには Mac で署名と公証を行ってください。この方法で確認できるのは
+「ビルドできる」までで、動作の確認は Mac で行います（CI の `.github/workflows/macos.yml` は、
+リポジトリ変数 `FERRITRON_CROSS_MACOS` が `true` のとき、クロスビルドしたバンドルを Mac で
+検証します）。
 
 #### Windows や Linux から macOS のコードを検査する
 
@@ -1045,9 +1115,9 @@ cargo run -p ferritron-testhost -- "target/bundled/Ferritron Gain.vst3" --second
 
 ## バージョン
 
-Ferritron のすべてのクレートは1つのバージョンを共有します（現在 **1.1.0**）。
+Ferritron のすべてのクレートは1つのバージョンを共有します（現在 **1.2.0**）。
 [CHANGELOG.md](CHANGELOG.md) を参照してください。プラグインでは
-`ferritron = { path = "...", version = "1.1.0" }` で固定できます。`ferritron::VERSION` と
+`ferritron = { path = "...", version = "1.2.0" }` で固定できます。`ferritron::VERSION` と
 `cargo ferritron --version` で確認できます。
 
 ## ライセンス

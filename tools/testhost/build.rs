@@ -6,12 +6,8 @@ fn main() {
         return;
     }
     ferritron_build::rerun_if_changed(["host.cpp", "clap_checks.inc", "shared_runtime.inc"]);
-    let sdk = ferritron_build::sdk_dir(
-        "VST3_SDK_DIR",
-        &["pluginterfaces/vst/ivstcomponent.h"],
-        "See the README: Ferritron does not ship the VST3 SDK.",
-    );
-    let clap = ferritron_build::optional_sdk_dir("CLAP_SDK_DIR", "include/clap/clap.h");
+    let sdk = ferritron_build::sdk("vst3");
+    let clap = ferritron_build::optional_sdk("clap");
     if ferritron_build::skip_native() {
         return;
     }

@@ -16,7 +16,6 @@
 
 use serde_json::{Value, json};
 use std::cell::UnsafeCell;
-use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -45,17 +44,7 @@ pub fn port() -> u16 {
     std::env::var("FERRITRON_MCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT)
 }
 
-/// `ferritron_host_callbacks`: the shim's way to tell the host about a
-/// parameter the plugin changed by itself (any thread).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct HostCallbacks {
-    pub ctx: *mut c_void,
-    pub edited: Option<unsafe extern "C" fn(*mut c_void, u32, f64)>,
-}
-
-// SAFETY: the shim promises the callbacks may be called from any thread.
-unsafe impl Send for HostCallbacks {}
+pub use crate::instance::HostCallbacks;
 
 /// Pre- and post-processing audio of one instance, a ring per channel.
 /// Written only by the audio thread; read (approximately) by the agent.
@@ -111,14 +100,14 @@ impl Tap {
 pub(crate) struct Shared {
     pub handle: u64,
     pub tap: AtomicPtr<Tap>,
-    pub track: Mutex<String>,
-    pub host: Mutex<Option<HostCallbacks>>,
+    /// The instance's link: track name, host edits.
+    pub link: Arc<crate::instance::Link>,
 }
 
 impl Shared {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(link: Arc<crate::instance::Link>) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self { handle: NEXT.fetch_add(1, Ordering::Relaxed), tap: AtomicPtr::new(std::ptr::null_mut()), track: Mutex::new(String::new()), host: Mutex::new(None) }
+        Self { handle: NEXT.fetch_add(1, Ordering::Relaxed), tap: AtomicPtr::new(std::ptr::null_mut()), link }
     }
 
     /// The capture rings, for the audio thread (None until enabled).
@@ -205,7 +194,7 @@ fn process_info() -> Value {
 
 fn describe(e: &dyn Endpoint) -> Value {
     let (id, name, vendor) = e.identity();
-    let track = e.shared().track.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let track = e.shared().link.track_name();
     json!({ "instance": e.shared().handle, "plugin_id": id, "plugin": name, "vendor": vendor, "track": track })
 }
 

@@ -31,7 +31,8 @@ const CONTROL: usize = 1 << 18;
 const OPTION: usize = 1 << 19;
 const COMMAND: usize = 1 << 20;
 
-// NSTrackingAreaOptions: mouse moves whenever the view is visible.
+// NSTrackingAreaOptions: mouse moves (and leaving) whenever the view is visible.
+const TRACKING_MOUSE_ENTERED_AND_EXITED: usize = 0x01;
 const TRACKING_MOUSE_MOVED: usize = 0x02;
 const TRACKING_ACTIVE_ALWAYS: usize = 0x80;
 const TRACKING_IN_VISIBLE_RECT: usize = 0x200;
@@ -187,7 +188,40 @@ extern "C-unwind" fn mouse_up(this: &AnyObject, _cmd: Sel, event: *mut AnyObject
 /// view the press started in, also outside it).
 extern "C-unwind" fn mouse_moved(this: &AnyObject, _cmd: Sel, event: *mut AnyObject) {
     let (x, y) = position(this, event);
-    with_view(this, |view| view.canvas.input(Input::Move { x, y }));
+    with_view(this, |view| {
+        view.canvas.input(Input::Move { x, y });
+        apply_cursor(view.canvas.cursor());
+    });
+}
+
+extern "C-unwind" fn mouse_exited(this: &AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    with_view(this, |view| view.canvas.input(Input::Leave));
+}
+
+/// Shows the pointer shape the editor asked for (`NSCursor`).
+fn apply_cursor(cursor: crate::Cursor) {
+    use crate::Cursor;
+    let Some(class) = AnyClass::get(c"NSCursor") else { return };
+    unsafe {
+        if cursor == Cursor::Hidden {
+            let _: () = msg_send![class, setHiddenUntilMouseMoves: Bool::YES];
+            return;
+        }
+        let shape: *mut AnyObject = match cursor {
+            Cursor::Hand => msg_send![class, pointingHandCursor],
+            Cursor::Grab => msg_send![class, openHandCursor],
+            Cursor::Grabbing | Cursor::Move => msg_send![class, closedHandCursor],
+            Cursor::Text => msg_send![class, IBeamCursor],
+            Cursor::Crosshair => msg_send![class, crosshairCursor],
+            Cursor::ResizeHorizontal => msg_send![class, resizeLeftRightCursor],
+            Cursor::ResizeVertical => msg_send![class, resizeUpDownCursor],
+            Cursor::NotAllowed => msg_send![class, operationNotAllowedCursor],
+            _ => msg_send![class, arrowCursor],
+        };
+        if let Some(shape) = shape.as_ref() {
+            let _: () = msg_send![shape, set];
+        }
+    }
 }
 
 extern "C-unwind" fn scroll_wheel(this: &AnyObject, _cmd: Sel, event: *mut AnyObject) {
@@ -281,6 +315,7 @@ fn view_class() -> &'static ViewClass {
                 builder.add_method(sel, mouse_moved as extern "C-unwind" fn(_, _, _));
             }
             builder.add_method(sel!(scrollWheel:), scroll_wheel as extern "C-unwind" fn(_, _, _));
+            builder.add_method(sel!(mouseExited:), mouse_exited as extern "C-unwind" fn(_, _, _));
             builder.add_method(sel!(keyDown:), key_down as extern "C-unwind" fn(_, _, _));
             builder.add_method(sel!(keyUp:), key_up as extern "C-unwind" fn(_, _, _));
             builder.add_method(sel!(becomeFirstResponder), become_first_responder as extern "C-unwind" fn(_, _) -> _);
@@ -301,7 +336,7 @@ fn create<P: Process + PluginMeta, E: GpuEditor>(parent: *mut c_void, host: View
     unsafe {
         let _: () = msg_send![&*ns_view, setWantsLayer: Bool::YES];
         let tracking: Allocated<AnyObject> = msg_send![AnyClass::get(c"NSTrackingArea")?, alloc];
-        let options = TRACKING_MOUSE_MOVED | TRACKING_ACTIVE_ALWAYS | TRACKING_IN_VISIBLE_RECT;
+        let options = TRACKING_MOUSE_ENTERED_AND_EXITED | TRACKING_MOUSE_MOVED | TRACKING_ACTIVE_ALWAYS | TRACKING_IN_VISIBLE_RECT;
         let tracking: Retained<AnyObject> =
             msg_send![tracking, initWithRect: frame, options: options, owner: &*ns_view, userInfo: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![&*ns_view, addTrackingArea: &*tracking];

@@ -73,6 +73,8 @@ pub(crate) struct Canvas {
     /// Physical pixels per logical pixel.
     pub scale: f64,
     last: Vec<f64>,
+    /// The instance's revision and the instance list's, as last drawn.
+    seen: (u64, u64),
     dirty: bool,
     /// Set while the editor runs, against re-entry from nested events.
     busy: bool,
@@ -89,7 +91,8 @@ impl Canvas {
         let ui = Ui::new::<P>(host, (pixels.0 as f64 / scale, pixels.1 as f64 / scale));
         let editor: Box<dyn GpuEditor> = Box::new(catch_unwind(AssertUnwindSafe(|| E::new(&gpu, &ui))).ok()?);
         let last = ui.snapshot();
-        Some(Self { editor: Some(editor), surface, config, gpu, ui, scale, last, dirty: true, busy: false })
+        let seen = revisions(&ui);
+        Some(Self { editor: Some(editor), surface, config, gpu, ui, scale, last, seen, dirty: true, busy: false })
     }
 
     /// Runs `f` on the editor, unless it panicked before or is already running.
@@ -150,9 +153,24 @@ impl Canvas {
         if self.editor(|editor, _, _| editor.animating()).unwrap_or(false) {
             self.dirty = true;
         }
+        // Asked by another thread, or the instance (track, store) or the
+        // list of instances changed.
+        if self.ui.take_redraw() {
+            self.dirty = true;
+        }
+        let seen = revisions(&self.ui);
+        if seen != self.seen {
+            self.seen = seen;
+            self.dirty = true;
+        }
         if self.dirty {
             self.render();
         }
+    }
+
+    /// The pointer shape the editor asked for.
+    pub fn cursor(&self) -> super::Cursor {
+        self.ui.cursor()
     }
 
     pub fn input(&mut self, event: Input) {
@@ -170,6 +188,10 @@ impl Canvas {
         self.surface.configure(&self.gpu.device, &self.config);
         self.render();
     }
+}
+
+fn revisions(ui: &Ui) -> (u64, u64) {
+    (ui.instance().map_or(0, |i| i.revision()), ferritron_core::instances_revision())
 }
 
 /// The `open` entry point of every platform: checks the pointers and returns

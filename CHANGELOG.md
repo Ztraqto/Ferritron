@@ -3,8 +3,113 @@
 All notable changes to Ferritron. Versions follow [Semantic Versioning](https://semver.org/):
 every crate of the workspace shares one version (`[workspace.package]` in
 `Cargo.toml`). A plugin can pin it with
-`ferritron = { path = "...", version = "1.1.0" }`, and read it at run time as
+`ferritron = { path = "...", version = "1.2.0" }`, and read it at run time as
 `ferritron::VERSION`.
+
+## 1.2.0 — 2026-11-07
+
+Instances that know themselves, their track and each other. Plugins built
+with 1.1.x build unchanged; parameter IDs stay valid. State saved by 1.2
+carries the instance ID and the store after the parameter entries; 1.1
+reads such state and ignores both. 1.2 reads state of every earlier version.
+
+### Added
+- **Instance handles** (`ferritron::InstanceHandle`, `Send + Sync`, cheap to
+  clone): the plugin gets its own in `Process::init` (new, called once
+  after creation) and `Context::instance`, editors through `Ui::instance`
+  (GPU) and `window.ferritron.instance` (web), any code through
+  `ferritron::instances::<P>()` (the live instances of a plugin in the
+  process) and `instances_revision()`. A handle:
+  - `id()`: an `InstanceId` saved with the project, new for a duplicated
+    instance (same state loaded while the original lives);
+  - `track()`: `TrackInfo { name, color, index }` from the host (VST3
+    `IInfoListener`, CLAP `track-info`), now for every plugin, not only
+    with `[mcp]`;
+  - `value` / `normalized` and `begin` / `set` / `end` / `edit`: change a
+    parameter from any thread (not the audio thread) and tell the host as a
+    gesture, so DAWs record automation on the right track;
+  - `wake()`: a sleeping instance processes its next block (CLAP:
+    `request_process`); edits through a handle and loaded state wake too;
+  - `store()`: a key-value store (text or bytes) saved with the project;
+  - `on_message` / `post`: JSON messages with the web editor.
+- Web editors: `ferritron.send(obj)`, `ferritron.onMessage(fn)`,
+  `ferritron.instance` (`{ id, track }`) and `ferritron.onInstanceChange(fn)`.
+- GPU editors: `Input::Leave`; `Ui::set_cursor(Cursor::…)`;
+  `Ui::redraw_handle()` (`RedrawHandle::request()` from any thread) and
+  `Ui::request_redraw()`; editors also redraw when their instance (track,
+  store) or the list of instances changes; `Ui::track()`, `Ui::track_name()`,
+  `Ui::instance_id()`; `Ui::for_tests::<P>(w, h)` for unit tests of editor
+  logic without host or GPU.
+- Parameters: `automatable = false` and `hidden = true` in the project file
+  (`ParamOptions`, `ParamSet::options`). VST3: no `kCanAutomate` /
+  `kIsHidden`; CLAP: no `CLAP_PARAM_IS_AUTOMATABLE` / `CLAP_PARAM_IS_HIDDEN`.
+  The Ferritron Editor's CLI takes `--hidden` and `--not-automatable`.
+- Tests: `Harness::params()` (typed), `Harness::instance()`,
+  `Harness::set_track()`, `Harness::send_message()`.
+- `ferritron-testhost`: screenshots as PNG (`--bmp` for BMP);
+  `--instances N` also with `--gui` (each instance told its own track);
+  mouse scripts `--drag X0 Y0 X1 Y1`, `--move X Y`, `--wheel X Y N`, `--leave`.
+- `cargo ferritron bundle` warns when the tool and the plugin's Ferritron
+  versions differ.
+- C ABI: `ferritron.host.v2` (`ferritron_host_callbacks2`: edits as
+  gestures, `request_process`), `ferritron.track.v1` (`ferritron_track_info`),
+  `FERRITRON_PARAM_HIDDEN`. The callbacks' `ctx` is the same pointer as the
+  editor's `ferritron_view_host::ctx`, which is how editors find their instance.
+- Example `examples/instances`: every instance with its track, levels set
+  from any instance's editor, a note per track in the store.
+- **SDK management**: one rule finds every SDK (`ferritron_build::sdk`): a
+  version pinned in the project file (`[sdk] vst3 = "3.8.1"`), else `source`
+  in `sdk.toml` (`auto`, `env`, `managed`, `path`), else the build stops and
+  lists where it looked. Ferritron's SDK folder holds several versions side
+  by side (`C:\Ferritron\SDK` or `~/Ferritron/SDK`, `FERRITRON_SDK_ROOT`).
+  `cargo ferritron sdk status | list | available | fetch | use | source |
+  remove`: `fetch` shows the license and asks before downloading from the
+  publisher, checks each part (SHA-256, or the git commit of a tag archive)
+  and leaves nothing behind on failure. New crate `ferritron-sdk` (catalog
+  and fetching). Without `sdk.toml`, builds behave as in 1.1.
+- **macOS targets**: `cargo ferritron bundle --target aarch64-apple-darwin |
+  x86_64-apple-darwin | universal-apple-darwin` (bundle layout chosen by
+  the target, not the computer; universal joined with lipo). From Windows or
+  Linux through xclang (`cargo ferritron sdk fetch xclang`, then `fetch
+  macos` for Apple's SDK under Apple's terms). macOS 13.0 minimum
+  (`MACOSX_DEPLOYMENT_TARGET`). `cargo ferritron notarize <bundle>` (Mac,
+  `xcrun notarytool`). Off a Mac, bundles are signed with `rcodesign` if
+  installed.
+- CI: `.github/workflows/macos.yml` bundles the examples on macOS and runs
+  the VST3 validator, clap-validator and auval; optionally validates bundles
+  cross-built on Windows.
+- Ferritron Editor (closed source): SDK settings (source, version, fetch
+  after the license sheet, delete), checks for newer SDKs and for a newer
+  Editor; the Windows starter kit is also an installer
+  (`Ferritron-StarterKit-<v>-windows-x64-setup.exe`, Inno Setup, per user),
+  and an Editor installed with it updates itself: the new setup is
+  downloaded in the background, checked against the release's SHA-256 and
+  run without a window when the Editor quits. The Editor's program is
+  `Ferritron Editor.exe` in every package.
+
+### Changed
+- **Project files are `<name>.ferritroject`**. `.frtx` is still read
+  everywhere (build, CLI, Editor); a package with both is an error. New
+  projects, the examples and locked projects (`.ferritroject-locked`;
+  `.frtx-locked` still opens) use the new name.
+- `ParamSet` gained `options` (default provided); `Context` and the
+  `ferritron-core` state format gained the fields above. `Input` (GPU) has a
+  new variant, `Leave`: an exhaustive `match` on it needs a new arm.
+
+### Not in this release
+- Instance handles, track info and editor messages need the plugin and its
+  editor in the host's process: with `[isolation]` or `[view] process =
+  true`, and during hot reload, `Ui::instance` is `None` and handles see no host.
+- Audio Unit: edits through handles use `ferritron.host.v1` (one-shot
+  edits); no track info.
+- macOS: still not built or run on a Mac by the maintainers; the CI
+  workflow is written but has not run yet. Cross-built bundles are "builds",
+  not "runs", until a Mac validates them.
+- From the PanStudio requests, still open: a 2D drawing helper with Japanese
+  font fallback for GPU editors, native tooltips and menus, multichannel
+  buses, transport, sidechain, smoothing and meter helpers, presets, undo,
+  DirectLink discovery, groups, floating editor windows; the CLAP
+  validator's denormal warning was not investigated (no validator here).
 
 ## 1.1.0 — 2026-11-07
 

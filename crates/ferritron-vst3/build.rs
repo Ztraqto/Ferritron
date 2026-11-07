@@ -1,21 +1,13 @@
 //! Compiles the VST3 shim against the developer's own copy of the VST3 SDK.
 //!
-//! Ferritron does not ship the SDK. Download it from Steinberg and point
-//! `VST3_SDK_DIR` at the folder that contains `pluginterfaces/`.
+//! Ferritron does not ship the SDK: it is found by Ferritron's rule
+//! (`ferritron_build::sdk`: `VST3_SDK_DIR`, `sdk.toml`, the managed folder).
 
-const HELP: &str = "\
-Ferritron does not include the VST3 SDK; please provide your own copy.
-  1. Download it from Steinberg: https://github.com/steinbergmedia/vst3sdk
-     (or https://www.steinberg.net/developers/) and accept its license.
-  2. Set VST3_SDK_DIR to the SDK folder (the one containing `pluginterfaces`),
-     e.g. in your project's .cargo/config.toml:
-         [env]
-         VST3_SDK_DIR = \"C:/SDKs/vst3sdk\"
-  Or build without VST3: ferritron = { ..., default-features = false, features = [\"clap\"] }";
+const HINT: &str = "Or build without VST3: ferritron = { ..., default-features = false, features = [\"clap\"] }";
 
 fn main() {
     ferritron_build::rerun_if_changed(["shim/vst3_shim.cpp"]);
-    let sdk = ferritron_build::sdk_dir("VST3_SDK_DIR", &["pluginterfaces/vst/ivstcomponent.h"], HELP);
+    let sdk = ferritron_build::sdk_with_hint("vst3", HINT);
     let ara = ferritron_build::ara_sdk_dir();
     if ferritron_build::skip_native() {
         return;

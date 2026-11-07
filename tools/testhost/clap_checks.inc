@@ -154,7 +154,7 @@ extern "C" int ferritron_testhost_clap_gui(const wchar_t* binary, const wchar_t*
 
 	std::wstring dir = shotDir;
 	pump(2.0);
-	screenshot(hwnd, (dir + L"\\clap-1-initial.bmp").c_str());
+	screenshot(hwnd, shot(dir, L"clap-1-initial").c_str());
 
 	// The host changes the value through a flush, as it does outside processing.
 	EventList in, out;
@@ -171,7 +171,7 @@ extern "C" int ferritron_testhost_clap_gui(const wchar_t* binary, const wchar_t*
 	params->flush(plugin, &in.in, &out.out);
 	std::printf("host: set param %u to %.2f\n", info.id, ev.value);
 	pump(0.5);
-	screenshot(hwnd, (dir + L"\\clap-2-after-host-change.bmp").c_str());
+	screenshot(hwnd, shot(dir, L"clap-2-after-host-change").c_str());
 
 	click(hwnd, static_cast<int>(clickX * scale), static_cast<int>(clickY * scale));
 	pump(0.8);
@@ -190,7 +190,7 @@ extern "C" int ferritron_testhost_clap_gui(const wchar_t* binary, const wchar_t*
 	double value = 0;
 	params->get_value(plugin, info.id, &value);
 	std::printf("plugin: param %u is now %.2f\n", info.id, value);
-	screenshot(hwnd, (dir + L"\\clap-3-after-click.bmp").c_str());
+	screenshot(hwnd, shot(dir, L"clap-3-after-click").c_str());
 
 	if (resizeW > 0 && resizeH > 0) {
 		uint32_t rw = static_cast<uint32_t>(resizeW), rh = static_cast<uint32_t>(resizeH);
@@ -200,7 +200,7 @@ extern "C" int ferritron_testhost_clap_gui(const wchar_t* binary, const wchar_t*
 		std::printf("plugin accepted set_size: %s\n", gui->set_size(plugin, rw, rh) ? "yes" : "no");
 		pump(0.8);
 		printClientSize("resized", hwnd);
-		screenshot(hwnd, (dir + L"\\clap-4-resized.bmp").c_str());
+		screenshot(hwnd, shot(dir, L"clap-4-resized").c_str());
 	}
 
 	gui->destroy(plugin);

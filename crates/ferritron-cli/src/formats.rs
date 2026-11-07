@@ -49,8 +49,8 @@ pub fn discover(metadata: &serde_json::Value) -> Result<Vec<Format>, String> {
         }
         let crate_name = package["name"].as_str().unwrap_or("?");
         let crate_dir = package["manifest_path"].as_str().and_then(|m| Path::new(m).parent()).map(Path::to_path_buf).unwrap_or_default();
-        // Keys under `[...format.<os>]` replace the general ones on that OS.
-        let over = &spec[std::env::consts::OS];
+        // Keys under `[...format.<os>]` replace the general ones on that OS (the target's).
+        let over = &spec[platform().0];
         let pick = |key: &str| over[key].as_str().or(spec[key].as_str()).map(str::to_string);
         let field = |key: &str| pick(key).ok_or_else(|| format!("{crate_name}: format metadata needs `{key}`"));
         let table = |key: &str| -> BTreeMap<String, String> {
@@ -77,9 +77,17 @@ pub fn discover(metadata: &serde_json::Value) -> Result<Vec<Format>, String> {
     Ok(formats)
 }
 
+/// The OS and architecture bundles are made for (`--target`), this computer's by default.
+static TARGET: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// Bundles are made for `os` (`windows`, `macos`, `linux`) and `arch`.
+pub fn set_target(os: &str, arch: &str) {
+    let _ = TARGET.set((os.to_string(), arch.to_string()));
+}
+
 fn platform() -> (&'static str, String) {
-    let os = std::env::consts::OS;
-    (os, format!("{os}-{}", std::env::consts::ARCH))
+    let (os, arch) = TARGET.get_or_init(|| (std::env::consts::OS.into(), std::env::consts::ARCH.into()));
+    (os.as_str(), format!("{os}-{arch}"))
 }
 
 impl Format {

@@ -160,6 +160,10 @@ struct View {
     params: Vec<(usize, &'static ParamInfo)>,
     last: Vec<f64>,
     describe: fn(usize, &ParamInfo, f64) -> String,
+    /// The editor's instance (messages, track), when the shim links it.
+    instance: Option<ferritron_core::InstanceHandle>,
+    /// Its revision as last shown to the page.
+    revision: u64,
 }
 
 impl View {
@@ -175,12 +179,28 @@ impl View {
             let state = (self.describe)(index, info, normalized);
             script.push_str(&format!("(p=>ferritron._update({},p.value,p.normalized,p.text))({state});", json_str(info.key)));
         }
+        if let Some(instance) = &self.instance {
+            let revision = instance.revision();
+            if revision != self.revision {
+                self.revision = revision;
+                script.push_str(&format!("ferritron._instance({});", super::instance_json(Some(instance))));
+            }
+            for message in instance.take_posted() {
+                script.push_str(&format!("ferritron._message({});", json_str(&message)));
+            }
+        }
         if !script.is_empty() {
             let _ = self.webview.evaluate_script(&script);
         }
     }
 
     fn handle_message(&self, message: &str) {
+        if let Some(json) = message.strip_prefix("msg:") {
+            if let Some(instance) = &self.instance {
+                instance.deliver_message(json);
+            }
+            return;
+        }
         let mut parts = message.split(':');
         let (Some(kind), Some(id)) = (parts.next(), parts.next().and_then(|s| s.parse::<u32>().ok())) else { return };
         let Some(&(_, info)) = self.params.iter().find(|(_, info)| info.id == id) else { return };
@@ -217,6 +237,9 @@ fn create<P: Process + PluginMeta + WebAssets>(parent: *mut c_void, host: ViewHo
     let params: Vec<(usize, &'static ParamInfo)> =
         ferritron_core::abi::all_params::<P>().filter(|(_, info)| info.key != "ferritron.mcp").collect();
     let own = P::Params::infos().len();
+    // The shim's object for the instance is the view host's context.
+    let instance = ferritron_core::InstanceHandle::for_shim_ctx(host.ctx);
+    let revision = instance.as_ref().map_or(0, |i| i.revision());
     let last: Vec<f64> = params.iter().map(|(_, i)| unsafe { (host.get_param)(host.ctx, i.id) }).collect();
     let json = |range: &dyn Fn(usize) -> bool| -> String {
         let entries: Vec<String> = params
@@ -233,7 +256,8 @@ fn create<P: Process + PluginMeta + WebAssets>(parent: *mut c_void, host: ViewHo
         .replace("__PARAMS__", &json(&|index| index < own))
         .replace("__BUILTINS__", &json(&|index| index >= own))
         .replace("__MESSAGES__", &format!("{{{}}}", messages.join(",")))
-        .replace("__LANGUAGE__", &json_str(&localized.language));
+        .replace("__LANGUAGE__", &json_str(&localized.language))
+        .replace("__INSTANCE__", &super::instance_json(instance.as_ref()));
 
     let view_cell: std::rc::Rc<RefCell<*const View>> = std::rc::Rc::new(RefCell::new(std::ptr::null()));
     let ipc_target = view_cell.clone();
@@ -268,7 +292,7 @@ fn create<P: Process + PluginMeta + WebAssets>(parent: *mut c_void, host: ViewHo
         let _ = webview.zoom(zoom);
     }
 
-    let mut view = Box::new(View { timer: None, webview, parent, zoom, _context: context, host, params, last, describe: param_json::<P> });
+    let mut view = Box::new(View { timer: None, webview, parent, zoom, _context: context, host, params, last, describe: param_json::<P>, instance, revision });
     *view_cell.borrow_mut() = &*view;
     let target: *mut View = &mut *view;
     // SAFETY: the timer is the view's first field: it stops before the view goes.

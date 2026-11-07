@@ -17,7 +17,16 @@
 //! ferritron.t("ui-voices", { count: 4 })   // `ui-voices = { $count } voices`
 //! ferritron.language           // e.g. "ja"
 //! ferritron.nativeContextMenu = true   // bring back the browser's right-click menu
+//! ferritron.instance           // { id, track: { name, color: [r, g, b], index } } (null when unknown)
+//! ferritron.onInstanceChange((instance) => { ... })   // the track was renamed, recolored, ...
+//! ferritron.send({ kind: "rename", name: "Lead" })   // to the plugin (InstanceHandle::on_message)
+//! ferritron.onMessage((message) => { ... })           // from the plugin (InstanceHandle::post)
 //! ```
+//!
+//! Messages are JSON in both directions. The plugin receives them on the UI
+//! thread in the handler it set with `InstanceHandle::on_message` (usually in
+//! `Process::init`) and answers, or sends at any time, with
+//! `InstanceHandle::post`.
 //!
 //! Values passed to `set` are plain (e.g. dB). Every edit is reported to the
 //! host, so DAWs can record it as automation.
@@ -118,6 +127,16 @@ fn json_num(v: f64) -> String {
     if v.is_finite() { format!("{v}") } else { "0".into() }
 }
 
+/// `ferritron.instance`: the instance's identity and track, or `null`.
+fn instance_json(instance: Option<&ferritron_core::InstanceHandle>) -> String {
+    let Some(instance) = instance else { return "null".into() };
+    let track = instance.track();
+    let name = track.name.as_deref().map_or_else(|| "null".into(), json_str);
+    let color = track.color.map_or_else(|| "null".into(), |[r, g, b]| format!("[{r},{g},{b}]"));
+    let index = track.index.map_or_else(|| "null".into(), |i| i.to_string());
+    format!("{{\"id\":{},\"track\":{{\"name\":{name},\"color\":{color},\"index\":{index}}}}}", json_str(&instance.id().to_string()))
+}
+
 /// What the UI needs to show one parameter in its current state.
 fn param_json<P: Process + PluginMeta>(index: usize, info: &ParamInfo, normalized: f64) -> String {
     let localized = P::localized();
@@ -150,6 +169,8 @@ const BRIDGE: &str = r#"
   const builtins = __BUILTINS__;
   const messages = __MESSAGES__;
   const listeners = [];
+  const instanceListeners = [];
+  const messageListeners = [];
   const send = (m) => window.ipc.postMessage(m);
   const id = (key) => {
     const p = params[key] ?? builtins[key];
@@ -166,6 +187,19 @@ const BRIDGE: &str = r#"
       return text.replace(/\{\$(\w+)\}/g, (m, name) => (name in args ? String(args[name]) : m));
     },
     onChange(fn) { listeners.push(fn); },
+    instance: __INSTANCE__,
+    onInstanceChange(fn) { instanceListeners.push(fn); },
+    send(message) { send(`msg:${JSON.stringify(message)}`); },
+    onMessage(fn) { messageListeners.push(fn); },
+    _instance(info) {
+      this.instance = info;
+      for (const fn of instanceListeners) fn(info);
+    },
+    _message(text) {
+      let message;
+      try { message = JSON.parse(text); } catch { message = text; }
+      for (const fn of messageListeners) fn(message);
+    },
     begin(key) { send(`begin:${id(key)}`); },
     set(key, value) { send(`set:${id(key)}:${Number(value)}`); },
     end(key) { send(`end:${id(key)}`); },

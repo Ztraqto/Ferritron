@@ -1,6 +1,6 @@
 [package]
 name = "ferritron-manifest"
-description = "Project file (.frtx) location, parsing and validation, shared by the plugin macro and the Ferritron Editor"
+description = "Project file (.ferritroject) location, parsing and validation, shared by the plugin macro and the Ferritron Editor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

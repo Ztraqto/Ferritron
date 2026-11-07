@@ -544,6 +544,8 @@ static bool params_get_info(const clap_plugin_t* plugin, uint32_t index, clap_pa
         out->flags |= CLAP_PARAM_IS_ENUM;
     if (info.flags & FERRITRON_PARAM_BYPASS)
         out->flags |= CLAP_PARAM_IS_BYPASS;
+    if (info.flags & FERRITRON_PARAM_HIDDEN)
+        out->flags |= CLAP_PARAM_IS_HIDDEN;
     out->cookie = NULL;
     copy_utf8(out->name, sizeof(out->name), info.name.ptr ? info.name.ptr : "", info.name.len);
     out->module[0] = 0;
@@ -685,15 +687,46 @@ static void host_edited(void* ctx, uint32_t id, double normalized) {
     queue_edit(instance, EDIT_END, id, 0.0);
 }
 
+/* ferritron.host.v2: one step of an edit the plugin made by itself (any thread). */
+static void host_edit2(void* ctx, uint32_t kind, uint32_t id, double normalized) {
+    instance_t* instance = (instance_t*)ctx;
+    uint32_t edit = kind == FERRITRON_EDIT_BEGIN ? EDIT_BEGIN : kind == FERRITRON_EDIT_END ? EDIT_END : EDIT_VALUE;
+    queue_edit(instance, edit, id, normalized);
+}
+
+/* The plugin wants process() although its output was silent (CLAP_PROCESS_SLEEP). */
+static void host_request_process(void* ctx) {
+    instance_t* instance = (instance_t*)ctx;
+    instance->host->request_process(instance->host);
+}
+
 static void update_track_name(const clap_plugin_t* plugin) {
     instance_t* instance = (instance_t*)plugin->plugin_data;
     const ferritron_host_api* link = (const ferritron_host_api*)g_api->get_extension(FERRITRON_EXT_HOST);
+    const ferritron_track_api* track = (const ferritron_track_api*)g_api->get_extension(FERRITRON_EXT_TRACK);
     clap_track_info_t info;
-    if (!link || !instance->host_track_info || !instance->host_track_info->get(instance->host, &info))
+    if ((!link && !track) || !instance->host_track_info || !instance->host_track_info->get(instance->host, &info))
         return;
+    ferritron_str name = {"", 0};
     if (info.flags & CLAP_TRACK_INFO_HAS_TRACK_NAME) {
         const char* end = (const char*)memchr(info.name, 0, sizeof(info.name)); /* strnlen is not C11 */
-        ferritron_str name = {info.name, (uint32_t)(end ? end - info.name : (ptrdiff_t)sizeof(info.name))};
+        name.ptr = info.name;
+        name.len = (uint32_t)(end ? end - info.name : (ptrdiff_t)sizeof(info.name));
+    }
+    if (track) {
+        ferritron_track_info out;
+        memset(&out, 0, sizeof(out));
+        out.name = name;
+        if (info.flags & CLAP_TRACK_INFO_HAS_TRACK_NAME)
+            out.flags |= FERRITRON_TRACK_HAS_NAME;
+        if (info.flags & CLAP_TRACK_INFO_HAS_TRACK_COLOR) {
+            out.color[0] = info.color.red;
+            out.color[1] = info.color.green;
+            out.color[2] = info.color.blue;
+            out.flags |= FERRITRON_TRACK_HAS_COLOR;
+        }
+        track->set_track_info(instance->core, &out);
+    } else if (info.flags & CLAP_TRACK_INFO_HAS_TRACK_NAME) {
         link->set_track_name(instance->core, name);
     }
 }
@@ -1013,8 +1046,13 @@ static const clap_plugin_t* factory_create(const clap_plugin_factory_t* factory,
         free(instance);
         return NULL;
     }
+    /* Edits the plugin makes by itself; ctx is the instance, as for the editor's view host. */
+    const ferritron_host_api2* link2 = (const ferritron_host_api2*)g_api->get_extension(FERRITRON_EXT_HOST2);
     const ferritron_host_api* link = (const ferritron_host_api*)g_api->get_extension(FERRITRON_EXT_HOST);
-    if (link) {
+    if (link2) {
+        ferritron_host_callbacks2 callbacks = {instance, host_edit2, host_request_process};
+        link2->attach(instance->core, &callbacks);
+    } else if (link) {
         ferritron_host_callbacks callbacks = {instance, host_edited};
         link->attach(instance->core, &callbacks);
     }

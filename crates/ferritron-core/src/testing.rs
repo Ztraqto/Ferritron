@@ -129,6 +129,43 @@ impl<P: Process + PluginMeta> Harness<P> {
         }
     }
 
+    /// The plugin's typed parameters (`h.params().gain.value()`).
+    pub fn params(&self) -> &P::Params {
+        unsafe { abi::params_of::<P>(self.instance) }
+    }
+
+    /// The instance's handle: identity, track, store, edits, messages.
+    pub fn instance(&self) -> &crate::InstanceHandle {
+        unsafe { abi::handle_of::<P>(self.instance) }
+    }
+
+    /// Tells the instance the track it sits on, as a host does.
+    pub fn set_track(&mut self, track: crate::TrackInfo) {
+        use crate::instance::{TRACK_HAS_COLOR, TRACK_HAS_INDEX, TRACK_HAS_NAME, TrackInfoC};
+        let name = track.name.clone().unwrap_or_default();
+        let info = TrackInfoC {
+            flags: if track.name.is_some() { TRACK_HAS_NAME } else { 0 }
+                | if track.color.is_some() { TRACK_HAS_COLOR } else { 0 }
+                | if track.index.is_some() { TRACK_HAS_INDEX } else { 0 },
+            name: abi::FerritronStr { ptr: name.as_ptr(), len: name.len() as u32 },
+            color: track.color.unwrap_or_default(),
+            index: track.index.unwrap_or_default(),
+        };
+        let api = unsafe { abi::get_extension::<P>(abi::EXT_TRACK.as_ptr()) } as *const abi::TrackApi;
+        if let Some(api) = unsafe { api.as_ref() } {
+            unsafe { (api.set_track_info)(self.instance, &info) };
+        }
+    }
+
+    /// Sends a message to the plugin as its web editor does
+    /// (`ferritron.send`), and returns what the plugin posted back
+    /// (`InstanceHandle::post`) so far.
+    pub fn send_message(&mut self, json: &str) -> Vec<String> {
+        let handle = self.instance().clone();
+        handle.deliver_message(json);
+        handle.take_posted()
+    }
+
     /// Saves the plugin state, as a host does when storing a project.
     pub fn save_state(&self) -> Vec<u8> {
         let size = unsafe { abi::save_state::<P>(self.instance, std::ptr::null_mut(), 0) };

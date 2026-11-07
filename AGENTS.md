@@ -6,14 +6,14 @@ with Ferritron. For details, the README is the reference ([README.en.md](README.
 [docs/architecture.md](docs/architecture.md) (Japanese) is the design document.
 
 Ferritron is a Rust audio plugin framework. A plugin is two files: a **project
-file** (`<name>.frtx`, TOML) that declares everything static, and a **Rust
+file** (`<name>.ferritroject`, TOML) that declares everything static, and a **Rust
 `lib.rs`** that implements `process`. The macro `#[ferritron::plugin]` generates
 the typed parameters, stable parameter IDs and the VST3/CLAP entry points from
 the project file.
 
-**Version: 1.1.0** (all crates share it; history in [CHANGELOG.md](CHANGELOG.md)).
+**Version: 1.2.0** (all crates share it; history in [CHANGELOG.md](CHANGELOG.md)).
 When you develop against Ferritron, state the version you target and pin it:
-`ferritron = { path = "...", version = "1.1.0" }`. `ferritron::VERSION` and
+`ferritron = { path = "...", version = "1.2.0" }`. `ferritron::VERSION` and
 `cargo ferritron --version` report the version in use.
 
 ## 1. Prerequisites
@@ -21,14 +21,21 @@ When you develop against Ferritron, state the version you target and pin it:
 - Rust 1.89+ (workspace `rust-version`), MSVC toolchain on Windows (Visual
   Studio Build Tools provide the C++17 compiler).
 - **Plugin-format SDKs are never bundled and must not be committed.** The user
-  downloads them and accepts their licenses. Point Ferritron at them with
-  environment variables:
+  gets them and accepts their licenses, by hand or with
+  `cargo ferritron sdk fetch <id>` (it shows the license and asks; never pass
+  `--accept-license` for the user). `cargo ferritron sdk status` shows where
+  each SDK is found. Builds find SDKs by one rule (`ferritron_build::sdk`): a
+  version pinned in the project file's `[sdk]`, else `source` in `sdk.toml`
+  (`auto` default: the environment variable, else Ferritron's SDK folder
+  `C:\Ferritron\SDK` / `~/Ferritron/SDK`, `<root>/<id>/<version>`), else the
+  build stops and lists where it looked. The environment variables:
 
 | Variable | Needed for | Folder to point at | Source |
 |---|---|---|---|
 | `VST3_SDK_DIR` | VST3 (default) | the one containing `pluginterfaces/` | Steinberg VST3 SDK |
 | `CLAP_SDK_DIR` | CLAP (default) | the one containing `include/clap/clap.h` | github.com/free-audio/clap |
 | `ARA_SDK_DIR` | ARA 2 (feature `ara`) | the one containing `ARA_API` and `ARA_Library` | `git clone --recursive https://github.com/Celemony/ARA_SDK` (Apache 2.0) |
+| `XCLANG_DIR` | macOS builds from Windows/Linux | the one containing `bin/xclang` | github.com/clice-io/xclang (Apache 2.0); Apple's macOS SDK through `cargo ferritron sdk fetch macos` (Apple's terms, the user's decision) |
 
 Set them as user environment variables, or in `.cargo/config.toml`:
 
@@ -66,12 +73,13 @@ A plugin package needs:
 
 - `Cargo.toml` with `[lib] crate-type = ["cdylib"]` and a `ferritron`
   dependency.
-- `<name>.frtx` next to `Cargo.toml` (exactly one per package).
+- `<name>.ferritroject` next to `Cargo.toml` (exactly one per package;
+  `<name>.frtx` from before 1.2 is still read, but not both at once).
 - `src/lib.rs`.
 
 ### Effect
 
-`gain.frtx`:
+`gain.ferritroject`:
 
 ```toml
 [plugin]
@@ -112,8 +120,25 @@ key is declared in `[params]`.
 | `bool` | `default` | `.value() -> bool` |
 | `enum` | `choices = ["A", "B"]`, `default = "A"` | `.index() -> usize` |
 
-Optional `name` sets the display name. **The key is the parameter's identity in
-saved projects and automation: do not rename it after release.**
+Optional `name` sets the display name; `automatable = false` keeps it out of
+host automation, `hidden = true` out of host parameter lists (internal state).
+**The key is the parameter's identity in saved projects and automation: do not
+rename it after release.**
+
+### Instances (1.2)
+
+Each instance has an `InstanceHandle` (`ferritron::InstanceHandle`): the
+plugin gets it in `fn init(&mut self, instance: &InstanceHandle)` and as
+`ctx.instance()`; GPU editors as `ui.instance()`; web editors see
+`ferritron.instance`. It gives the saved `id()`, the host's `track()`
+(name, color, index), parameter edits from any non-audio thread that the
+host records (`begin`/`set`/`end`/`edit`), `wake()` for a sleeping
+instance, a `store()` saved with the project, and JSON messages with the
+web editor (`on_message`/`post` ↔ `ferritron.send`/`ferritron.onMessage`).
+`ferritron::instances::<MyPlugin>()` lists the live instances in the
+process. Reference: [examples/instances](examples/instances). Handles need
+the plugin and editor in the host's process (not with `[isolation]` or
+`[view] process = true`).
 
 ### Instrument
 
@@ -162,7 +187,10 @@ cargo ferritron bundle gain
 ```
 
 Builds in release mode and writes `target/bundled/<Name>.vst3` and
-`<Name>.clap` (and `.component` on macOS).
+`<Name>.clap` (and `.component` on macOS). `--target aarch64-apple-darwin`
+(or `x86_64-`, `universal-apple-darwin`) builds for macOS into
+`target/<target>/bundled/`, through xclang when not on a Mac (macOS 13.0
+minimum). `cargo ferritron notarize <bundle>` notarizes on a Mac.
 
 For quick iteration inside a running host, build a dev bundle once and then use
 plain `cargo build`; the new code is swapped in between audio blocks (debug
@@ -181,7 +209,10 @@ cargo run -p ferritron-testhost -- "target/bundled/Ferritron Gain.vst3" --second
 
 For unit tests, `ferritron::testing::Harness::<MyPlugin>::new(48_000.0, 512)` runs
 the plugin through the same path as hosts (`set_param`, `automate`, `process`,
-notes, state).
+notes, state, `params()`, `instance()`, `set_track`, `send_message`). GPU
+editor logic can be tested with `gpu_view::Ui::for_tests::<MyPlugin>(w, h)`.
+`ferritron-testhost` takes `--instances N`, `--gui DIR` (PNG screenshots),
+`--drag`, `--move`, `--wheel`, `--leave`.
 
 Official validators:
 
@@ -263,7 +294,7 @@ sandboxing exist too; see the README sections of the same names.
 | Path | Role |
 |---|---|
 | `crates/ferritron` | The crate plugins depend on (prelude, features) |
-| `crates/ferritron-core` / `-macros` / `-manifest` | Runtime, `#[plugin]` macro, `.frtx` parsing |
+| `crates/ferritron-core` / `-macros` / `-manifest` | Runtime, `#[plugin]` macro, `.ferritroject` parsing |
 | `crates/ferritron-vst3` / `-clap` / `-au` | Format adapters |
 | `crates/ferritron-ara` | ARA 2 |
 | `crates/ferritron-web` / `-gpu-view` | HTML/JS and wgpu editors |

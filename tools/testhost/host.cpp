@@ -13,6 +13,8 @@
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstattributes.h"
+#include "pluginterfaces/vst/ivstchannelcontextinfo.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -31,6 +33,14 @@ using namespace Steinberg;
 using namespace Steinberg::Vst;
 
 namespace {
+
+// The process environment as it is now: unlike std::getenv (the C runtime's
+// copy from startup), this sees variables the Rust side set (--instances, ...).
+const char* envVar(const char* name) {
+	static thread_local char value[4096];
+	DWORD n = GetEnvironmentVariableA(name, value, sizeof(value));
+	return n > 0 && n < sizeof(value) ? value : nullptr;
+}
 
 template <class T>
 T* query(FUnknown* obj, const TUID iid) {
@@ -84,7 +94,86 @@ void pump(double seconds) {
 	}
 }
 
-// Saves the window's client area (including WebView2 content) as a BMP.
+// --- PNG (uncompressed deflate: no library needed) ---------------------------
+
+uint32_t crc32(const uint8_t* data, size_t len, uint32_t crc = 0) {
+	static uint32_t table[256];
+	if (!table[1])
+		for (uint32_t n = 0; n < 256; ++n) {
+			uint32_t c = n;
+			for (int k = 0; k < 8; ++k)
+				c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+			table[n] = c;
+		}
+	crc = ~crc;
+	for (size_t i = 0; i < len; ++i)
+		crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+	return ~crc;
+}
+
+void putBe32(std::vector<uint8_t>& out, uint32_t v) {
+	for (int shift = 24; shift >= 0; shift -= 8)
+		out.push_back(static_cast<uint8_t>(v >> shift));
+}
+
+void pngChunk(std::vector<uint8_t>& out, const char* type, const std::vector<uint8_t>& body) {
+	putBe32(out, static_cast<uint32_t>(body.size()));
+	size_t start = out.size();
+	out.insert(out.end(), type, type + 4);
+	out.insert(out.end(), body.begin(), body.end());
+	putBe32(out, crc32(out.data() + start, out.size() - start));
+}
+
+// `bgr`: bottom-up = false, rows of `stride` bytes, 3 bytes per pixel (B, G, R).
+std::vector<uint8_t> encodePng(int w, int h, const std::vector<uint8_t>& bgr, int stride) {
+	std::vector<uint8_t> raw;
+	raw.reserve(static_cast<size_t>(h) * (w * 3 + 1));
+	for (int y = 0; y < h; ++y) {
+		raw.push_back(0); // filter: none
+		const uint8_t* row = bgr.data() + static_cast<size_t>(y) * stride;
+		for (int x = 0; x < w; ++x) {
+			raw.push_back(row[x * 3 + 2]);
+			raw.push_back(row[x * 3 + 1]);
+			raw.push_back(row[x * 3 + 0]);
+		}
+	}
+	std::vector<uint8_t> z{0x78, 0x01};
+	for (size_t at = 0; at < raw.size() || at == 0;) {
+		size_t len = std::min<size_t>(65535, raw.size() - at);
+		bool last = at + len >= raw.size();
+		z.push_back(last ? 1 : 0);
+		z.push_back(static_cast<uint8_t>(len));
+		z.push_back(static_cast<uint8_t>(len >> 8));
+		z.push_back(static_cast<uint8_t>(~len));
+		z.push_back(static_cast<uint8_t>(~len >> 8));
+		z.insert(z.end(), raw.begin() + at, raw.begin() + at + len);
+		at += len;
+		if (last)
+			break;
+	}
+	uint32_t a = 1, b = 0;
+	for (uint8_t v : raw) {
+		a = (a + v) % 65521;
+		b = (b + a) % 65521;
+	}
+	putBe32(z, (b << 16) | a);
+	std::vector<uint8_t> png{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+	std::vector<uint8_t> ihdr;
+	putBe32(ihdr, static_cast<uint32_t>(w));
+	putBe32(ihdr, static_cast<uint32_t>(h));
+	ihdr.insert(ihdr.end(), {8, 2, 0, 0, 0}); // 8-bit RGB
+	pngChunk(png, "IHDR", ihdr);
+	pngChunk(png, "IDAT", z);
+	pngChunk(png, "IEND", {});
+	return png;
+}
+
+// Screenshot file names: PNG, or BMP with FERRITRON_TESTHOST_BMP=1.
+std::wstring shot(const std::wstring& dir, const wchar_t* name) {
+	return dir + L"\\" + name + (envVar("FERRITRON_TESTHOST_BMP") ? L".bmp" : L".png");
+}
+
+// Saves the window's client area (including WebView2 content) as PNG or BMP (by the path's extension).
 void screenshot(HWND hwnd, const wchar_t* path) {
 	RECT rc;
 	GetClientRect(hwnd, &rc);
@@ -112,11 +201,17 @@ void screenshot(HWND hwnd, const wchar_t* path) {
 	std::vector<uint8_t> pixels(static_cast<size_t>(stride) * h);
 	GetDIBits(mem, bmp, 0, h, pixels.data(), reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS);
 	BITMAPFILEHEADER bf{0x4D42, static_cast<DWORD>(sizeof(bf) + sizeof(bi) + pixels.size()), 0, 0, sizeof(bf) + sizeof(bi)};
+	const bool bmpFile = std::wcslen(path) > 4 && _wcsicmp(path + std::wcslen(path) - 4, L".bmp") == 0;
 	FILE* f = nullptr;
 	if (_wfopen_s(&f, path, L"wb") == 0 && f) {
-		fwrite(&bf, sizeof(bf), 1, f);
-		fwrite(&bi, sizeof(bi), 1, f);
-		fwrite(pixels.data(), 1, pixels.size(), f);
+		if (bmpFile) {
+			fwrite(&bf, sizeof(bf), 1, f);
+			fwrite(&bi, sizeof(bi), 1, f);
+			fwrite(pixels.data(), 1, pixels.size(), f);
+		} else {
+			std::vector<uint8_t> png = encodePng(w, h, pixels, stride);
+			fwrite(png.data(), 1, png.size(), f);
+		}
 		fclose(f);
 	}
 	DeleteObject(bmp);
@@ -193,6 +288,138 @@ void click(HWND hwnd, int x, int y) {
 	SendInput(1, &in[0], sizeof(INPUT));
 	pump(0.15);
 	SendInput(1, &in[1], sizeof(INPUT));
+}
+
+// The deepest window under client point `at` of `hwnd`; `at` becomes its coordinates.
+HWND windowAt(HWND hwnd, POINT& at) {
+	HWND target = hwnd;
+	for (;;) {
+		HWND child = ChildWindowFromPointEx(target, at, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT);
+		if (!child || child == target)
+			return target;
+		MapWindowPoints(target, child, &at, 1);
+		target = child;
+	}
+}
+
+// FERRITRON_TESTHOST_SCRIPT="drag:X0,Y0,X1,Y1;wheel:X,Y,NOTCHES;move:X,Y;leave":
+// mouse input posted to the window under each point, in logical pixels
+// (times the content scale), after the click and keys.
+void runScript(HWND hwnd, const char* script, double scale) {
+	std::string all = script;
+	size_t at = 0;
+	HWND last = hwnd;
+	while (at <= all.size()) {
+		size_t end = all.find(';', at);
+		if (end == std::string::npos)
+			end = all.size();
+		std::string step = all.substr(at, end - at);
+		at = end + 1;
+		std::string verb = step.substr(0, step.find(':'));
+		std::vector<double> n;
+		if (step.find(':') != std::string::npos) {
+			std::string args = step.substr(step.find(':') + 1);
+			for (size_t p = 0; p <= args.size();) {
+				size_t q = args.find(',', p);
+				if (q == std::string::npos)
+					q = args.size();
+				n.push_back(std::atof(args.substr(p, q - p).c_str()));
+				p = q + 1;
+			}
+		}
+		auto point = [&](double x, double y) { return POINT{static_cast<LONG>(x * scale), static_cast<LONG>(y * scale)}; };
+		if (verb == "drag" && n.size() == 4) {
+			POINT from = point(n[0], n[1]);
+			HWND target = windowAt(hwnd, from);
+			POINT offset{from.x - static_cast<LONG>(n[0] * scale), from.y - static_cast<LONG>(n[1] * scale)};
+			PostMessageW(target, WM_MOUSEMOVE, 0, MAKELPARAM(from.x, from.y));
+			PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(from.x, from.y));
+			pump(0.05);
+			for (int i = 1; i <= 10; ++i) {
+				double t = i / 10.0;
+				POINT p = point(n[0] + (n[2] - n[0]) * t, n[1] + (n[3] - n[1]) * t);
+				PostMessageW(target, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(p.x + offset.x, p.y + offset.y));
+				pump(0.03);
+			}
+			POINT to = point(n[2], n[3]);
+			PostMessageW(target, WM_LBUTTONUP, 0, MAKELPARAM(to.x + offset.x, to.y + offset.y));
+			last = target;
+			std::printf("script: drag %.0f,%.0f -> %.0f,%.0f\n", n[0], n[1], n[2], n[3]);
+		} else if (verb == "move" && n.size() == 2) {
+			POINT p = point(n[0], n[1]);
+			last = windowAt(hwnd, p);
+			PostMessageW(last, WM_MOUSEMOVE, 0, MAKELPARAM(p.x, p.y));
+			std::printf("script: move %.0f,%.0f\n", n[0], n[1]);
+		} else if (verb == "wheel" && n.size() == 3) {
+			POINT p = point(n[0], n[1]);
+			POINT screenAt = p;
+			ClientToScreen(hwnd, &screenAt);
+			last = windowAt(hwnd, p);
+			short delta = static_cast<short>(n[2] * WHEEL_DELTA);
+			PostMessageW(last, WM_MOUSEWHEEL, MAKEWPARAM(0, delta), MAKELPARAM(screenAt.x, screenAt.y));
+			std::printf("script: wheel %.0f,%.0f by %.1f\n", n[0], n[1], n[2]);
+		} else if (verb == "leave") {
+			PostMessageW(last, WM_MOUSELEAVE, 0, 0);
+			std::printf("script: leave\n");
+		} else if (!step.empty()) {
+			std::printf("script: unknown step \"%s\"\n", step.c_str());
+		}
+		pump(0.2);
+	}
+}
+
+// The track an instance sits on, as a DAW tells it (ChannelContext::IInfoListener).
+class TrackAttributes final : public IAttributeList {
+public:
+	std::u16string name;
+	int64 color = 0;
+	int64 index = 0;
+	tresult PLUGIN_API queryInterface(const TUID, void** obj) override {
+		*obj = nullptr;
+		return kNoInterface;
+	}
+	uint32 PLUGIN_API addRef() override { return 1; }
+	uint32 PLUGIN_API release() override { return 1; }
+	tresult PLUGIN_API setInt(AttrID, int64) override { return kResultFalse; }
+	tresult PLUGIN_API getInt(AttrID id, int64& value) override {
+		if (std::strcmp(id, ChannelContext::kChannelColorKey) == 0) {
+			value = color;
+			return kResultOk;
+		}
+		if (std::strcmp(id, ChannelContext::kChannelIndexKey) == 0) {
+			value = index;
+			return kResultOk;
+		}
+		return kResultFalse;
+	}
+	tresult PLUGIN_API setFloat(AttrID, double) override { return kResultFalse; }
+	tresult PLUGIN_API getFloat(AttrID, double&) override { return kResultFalse; }
+	tresult PLUGIN_API setString(AttrID, const TChar*) override { return kResultFalse; }
+	tresult PLUGIN_API getString(AttrID id, TChar* string, uint32 sizeInBytes) override {
+		if (std::strcmp(id, ChannelContext::kChannelNameKey) != 0 || sizeInBytes < 2)
+			return kResultFalse;
+		size_t chars = std::min<size_t>(name.size(), sizeInBytes / 2 - 1);
+		std::memcpy(string, name.data(), chars * 2);
+		string[chars] = 0;
+		return kResultOk;
+	}
+	tresult PLUGIN_API setBinary(AttrID, const void*, uint32) override { return kResultFalse; }
+	tresult PLUGIN_API getBinary(AttrID, const void*&, uint32&) override { return kResultFalse; }
+};
+
+// Tells instance `obj` it sits on track `index` (from 0): "Track N" with a color of its own.
+void announceTrack(FUnknown* obj, int index) {
+	auto* listener = query<ChannelContext::IInfoListener>(obj, ChannelContext::IInfoListener_iid);
+	if (!listener)
+		return;
+	static const uint32 colors[] = {0xFFE0505A, 0xFF50A0E0, 0xFF60C060, 0xFFE0B040, 0xFFA070E0, 0xFF40C0B0};
+	TrackAttributes track;
+	std::string name = "Track " + std::to_string(index + 1);
+	track.name.assign(name.begin(), name.end());
+	track.color = colors[index % 6];
+	track.index = index + 1; // VST3 counts from 1
+	listener->setChannelContextInfos(&track);
+	listener->release();
 }
 
 // Keys that reach the host's own window (the editor passes on keys it does not use).
@@ -339,24 +566,31 @@ int runGui(IEditController* controller, const wchar_t* shotDir, int clickX, int 
 	ParameterInfo param{};
 	controller->getParameterInfo(0, param);
 	pump(2.0);
-	screenshot(hwnd, (dir + L"\\gui-1-initial.bmp").c_str());
+	screenshot(hwnd, shot(dir, L"gui-1-initial").c_str());
 
 	controller->setParamNormalized(param.id, 0.25); // as automation would
 	std::printf("host: set param %u to 0.25\n", param.id);
 	pump(0.5);
-	screenshot(hwnd, (dir + L"\\gui-2-after-host-change.bmp").c_str());
+	screenshot(hwnd, shot(dir, L"gui-2-after-host-change").c_str());
 
 	click(hwnd, static_cast<int>(clickX * scale), static_cast<int>(clickY * scale));
 	pump(0.8);
 	std::printf("plugin: param %u is now %.4f\n", param.id, controller->getParamNormalized(param.id));
-	screenshot(hwnd, (dir + L"\\gui-3-after-click.bmp").c_str());
+	screenshot(hwnd, shot(dir, L"gui-3-after-click").c_str());
 
 	if (const char* keys = std::getenv("FERRITRON_TESTHOST_KEYS")) {
 		sendKeys(hwnd, keys);
 		pump(0.8);
 		std::printf("plugin: after keys \"%s\", param %u is now %.4f\n", keys, param.id,
 		            controller->getParamNormalized(param.id));
-		screenshot(hwnd, (dir + L"\\gui-3b-after-keys.bmp").c_str());
+		screenshot(hwnd, shot(dir, L"gui-3b-after-keys").c_str());
+	}
+
+	if (const char* script = envVar("FERRITRON_TESTHOST_SCRIPT")) {
+		runScript(hwnd, script, scale);
+		pump(0.5);
+		std::printf("plugin: after the script, param %u is now %.4f\n", param.id, controller->getParamNormalized(param.id));
+		screenshot(hwnd, shot(dir, L"gui-3c-after-script").c_str());
 	}
 
 	if (resizeW > 0 && resizeH > 0) {
@@ -367,7 +601,7 @@ int runGui(IEditController* controller, const wchar_t* shotDir, int clickX, int 
 		view->onSize(&want);
 		pump(0.8);
 		printClientSize("resized", hwnd);
-		screenshot(hwnd, (dir + L"\\gui-4-resized.bmp").c_str());
+		screenshot(hwnd, shot(dir, L"gui-4-resized").c_str());
 	}
 
 	// FERRITRON_TESTHOST_REOPEN=N: close and reopen the editor N times, as a
@@ -388,7 +622,7 @@ int runGui(IEditController* controller, const wchar_t* shotDir, int clickX, int 
 		pump(0.5);
 	}
 	if (reopen)
-		screenshot(hwnd, (dir + L"\\gui-5-reopened.bmp").c_str());
+		screenshot(hwnd, shot(dir, L"gui-5-reopened").c_str());
 
 	view->removed();
 	view->release();
@@ -454,7 +688,28 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 	}
 
 	if (guiShotDir) {
+		// FERRITRON_TESTHOST_INSTANCES=N (--instances): N instances in this
+		// process, each on a track of its own; the editor opens for the first.
+		std::vector<IComponent*> others;
+		const char* count = envVar("FERRITRON_TESTHOST_INSTANCES");
+		for (int i = 1; count && i < std::atoi(count); ++i) {
+			void* more = nullptr;
+			if (factory->createInstance(info.cid, IComponent_iid, &more) != kResultOk)
+				return fail("createInstance failed");
+			auto* c = static_cast<IComponent*>(more);
+			c->initialize(nullptr);
+			announceTrack(c, i);
+			others.push_back(c);
+		}
+		if (count) {
+			announceTrack(component, 0);
+			std::printf("instances: %zu\n", others.size() + 1);
+		}
 		int code = runGui(controller, guiShotDir, clickX, clickY, scale, resizeW, resizeH);
+		for (auto* c : others) {
+			c->terminate();
+			c->release();
+		}
 		if (code == 0 && resizeW > 0 && resizeH > 0) {
 			// The size the user chose travels with the project: a new instance
 			// loading the saved state opens its editor at that size.
@@ -505,7 +760,7 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 		std::vector<float> l, r;
 	};
 	std::vector<Extra> extras;
-	const char* instances = std::getenv("FERRITRON_TESTHOST_INSTANCES");
+	const char* instances = envVar("FERRITRON_TESTHOST_INSTANCES");
 	for (int i = 1; instances && i < std::atoi(instances); ++i) {
 		void* more = nullptr;
 		if (factory->createInstance(info.cid, IComponent_iid, &more) != kResultOk)

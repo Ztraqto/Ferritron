@@ -15,7 +15,7 @@ A simple, fast and extensible audio plugin framework written in Rust.
 
 ## A complete plugin
 
-`gain.frtx`, the project file (TOML inside; one per package, next to
+`gain.ferritroject`, the project file (TOML inside; one per package, next to
 `Cargo.toml`):
 
 ```toml
@@ -57,7 +57,7 @@ shown with the system WebView (WebView2 on Windows). There is no local
 server, and it works in VST3 and CLAP.
 
 ```toml
-# gain.frtx
+# gain.ferritroject
 [view]
 backend   = "web"
 entry     = "ui"          # must contain index.html
@@ -779,6 +779,32 @@ let (mut l, mut r) = ([1.0; 64], [1.0; 64]);
 assert!(h.process(&mut [&mut l, &mut r]));
 ```
 
+### Instances, tracks and the store
+
+Every instance has an `InstanceHandle`: the plugin gets it in
+`Process::init` (and as `ctx.instance()`), GPU editors as `ui.instance()`,
+web editors see `ferritron.instance`, and `ferritron::instances::<P>()`
+lists the live instances of a plugin in the process:
+
+```rust
+fn init(&mut self, instance: &InstanceHandle) {
+    instance.on_message(|json, me| me.post(format!("{{\"track\":{:?}}}", me.track().name)));
+}
+```
+
+- `id()`: saved with the project; a duplicated track gets a new one.
+- `track()`: name, color and position from the host.
+- `begin` / `set` / `end` / `edit`: parameter edits from any thread but
+  the audio thread, recorded by the host as automation; they wake the
+  instance. `wake()` alone does too.
+- `store()`: text or bytes by key, saved with the project.
+- `on_message` / `post` with `ferritron.send` / `ferritron.onMessage` in
+  web editors.
+
+See [examples/instances](examples/instances). Handles need the plugin and
+its editor in the host's process (not with `[isolation]` or a `[view]` in
+its own process).
+
 ### Parameter types
 
 | `type`  | Keys                                   | Read with      |
@@ -789,7 +815,8 @@ assert!(h.process(&mut [&mut l, &mut r]));
 | `enum`  | `choices = ["A", "B"]`, `default = "A"` | `.index() -> usize` |
 
 Every parameter also accepts an optional display `name` (defaults to the key in
-title case). The key is the parameter's identity in saved projects and
+title case), `automatable = false` (not offered for automation) and
+`hidden = true` (not listed by hosts; for internal state). The key is the parameter's identity in saved projects and
 automation, so don't rename it after release.
 
 ### Localization
@@ -833,33 +860,67 @@ code that builds against the SDKs you supply. Both VST3 and CLAP are enabled by
 default; to build only one, use
 `ferritron = { ..., default-features = false, features = ["vst3"] }`.
 
-For VST3:
+The easiest way: let Ferritron fetch them, from their publishers, after you
+read and accept each license (the Ferritron Editor does the same from its
+settings):
 
-1. Download the VST3 SDK from Steinberg
-   (<https://github.com/steinbergmedia/vst3sdk> or
-   <https://www.steinberg.net/developers/>) and accept its license.
-2. Point `VST3_SDK_DIR` at the SDK folder (the one containing
-   `pluginterfaces/`), for example in your project's `.cargo/config.toml`:
+```bash
+cargo ferritron sdk available        # versions Ferritron knows and checked
+cargo ferritron sdk fetch vst3       # shows the license; asks you to accept
+cargo ferritron sdk fetch clap
+cargo ferritron sdk status           # what each build will use, and why
+```
 
-   ```toml
-   [env]
-   VST3_SDK_DIR = "C:/SDKs/vst3sdk"
-   CLAP_SDK_DIR = "C:/SDKs/clap"
-   ```
+They go to Ferritron's SDK folder, `C:\Ferritron\SDK` (Windows) or
+`~/Ferritron/SDK`, one folder per version (`<root>/<id>/<version>`; you may
+also put an SDK there by hand). Builds find each SDK by one rule:
 
-For CLAP: download the headers from <https://github.com/free-audio/clap> and
-point `CLAP_SDK_DIR` at the folder that contains `include/clap/clap.h`.
+1. A version pinned by the project file (`[sdk] vst3 = "3.8.1"`), used by
+   `cargo ferritron bundle`;
+2. its `source` in `sdk.toml` (`%APPDATA%\Ferritron\sdk.toml`, or the same
+   folder as the Editor's settings elsewhere): `auto` (default: the
+   environment variable if set, else the managed version), `env`, `managed`
+   or `path`;
+3. else the build stops and lists every place it looked.
+
+```toml
+# sdk.toml (written by `cargo ferritron sdk use / source` and the Editor)
+root = "C:/Ferritron/SDK"       # FERRITRON_SDK_ROOT overrides it
+[vst3]
+source  = "managed"
+version = "3.8.1"
+[ara]
+source = "path"
+path   = "D:/work/ARA_SDK"
+```
+
+Without `sdk.toml` nothing changes from Ferritron 1.1: environment variables
+still work. By hand: download the VST3 SDK from Steinberg
+(<https://github.com/steinbergmedia/vst3sdk>, with its submodules) and CLAP from
+<https://github.com/free-audio/clap>, accept their licenses, and point
+`VST3_SDK_DIR` (the folder containing `pluginterfaces/`) and `CLAP_SDK_DIR`
+(the folder containing `include/clap/clap.h`) at them, for example in your
+project's `.cargo/config.toml`:
+
+```toml
+[env]
+VST3_SDK_DIR = "C:/SDKs/vst3sdk"
+CLAP_SDK_DIR = "C:/SDKs/clap"
+```
 
 ### 2. Requirements
 
 - Rust 1.89 or newer
 - A C++17 compiler: on Windows, the Visual Studio Build Tools that Rust's MSVC toolchain already uses; on Linux, GCC or Clang
 
-**macOS** (Apple Silicon and Intel, macOS 11 or newer) needs the Xcode
+**macOS** (Apple Silicon and Intel, macOS 13 or newer; `MACOSX_DEPLOYMENT_TARGET` changes it) needs the Xcode
 command line tools (`xcode-select --install`): `cargo ferritron bundle gain`
 writes `<name>.vst3`, `<name>.clap` and `<name>.component` (Audio Unit)
 bundles with an Info.plist, signs them (ad hoc, or with the identity in
-`FERRITRON_CODESIGN_IDENTITY`), and `--install` copies them to
+`FERRITRON_CODESIGN_IDENTITY`; `cargo ferritron notarize <bundle>` then
+notarizes it with `xcrun notarytool`, credentials in `FERRITRON_NOTARY_PROFILE`
+or `FERRITRON_NOTARY_KEY` / `_KEY_ID` / `_ISSUER`: downloaded plugins that are
+not notarized are stopped by Gatekeeper), and `--install` copies them to
 `~/Library/Audio/Plug-Ins/{VST3,CLAP,Components}`. Editors (web: WKWebView;
 GPU: Metal), hot reload, process isolation, ARA and the Audio Workgroup all
 have macOS implementations. **They are written and type-checked
@@ -951,6 +1012,27 @@ Check a bundle with `auval -v aufx Gain Ztrq` after `--install`. Hosts that
 support it hand over their Audio Workgroup (render context observer), and
 Ferritron's worker threads join it.
 
+#### Building for macOS from Windows or Linux (xclang)
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo ferritron sdk fetch xclang     # the cross toolchain (Apache 2.0)
+cargo ferritron sdk fetch macos      # Apple's macOS SDK, through xclang
+cargo ferritron bundle gain --target universal-apple-darwin
+```
+
+`--target` takes `aarch64-apple-darwin`, `x86_64-apple-darwin` or
+`universal-apple-darwin` (both in one binary); the bundles go to
+`target/<target>/bundled/`. Off a Mac the build runs through
+[xclang](https://github.com/clice-io/xclang) (`xclang cargo build`), found like
+an SDK (`XCLANG_DIR`, `sdk.toml`, the SDK folder). The macOS SDK is Apple's and
+used under Apple's terms, which allow it on Apple hardware: building for macOS
+on Windows or Linux with it is your decision. Such bundles carry only the
+linker's ad-hoc signature (or `rcodesign`'s, if installed); to distribute them,
+sign and notarize on a Mac. This path builds; that the result runs is checked
+on a Mac (the CI workflow `.github/workflows/macos.yml` validates cross-built
+bundles there when the repository variable `FERRITRON_CROSS_MACOS` is `true`).
+
 #### Checking macOS code from Windows or Linux
 
 ```bash
@@ -1036,7 +1118,7 @@ A format is one crate; neither Ferritron's core nor the CLI changes:
 |---|---|
 | `crates/ferritron` | The crate plugins depend on (re-exports, prelude) |
 | `crates/ferritron-core` | Format-independent API and the C ABI (`include/ferritron_abi.h`) |
-| `crates/ferritron-macros` | `#[ferritron::plugin]`: reads the project file (`.frtx`), generates code |
+| `crates/ferritron-macros` | `#[ferritron::plugin]`: reads the project file (`.ferritroject`), generates code |
 | `crates/ferritron-vst3` | VST3 adapter: a C++ shim compiled against your VST3 SDK |
 | `crates/ferritron-clap` | CLAP adapter: a C shim compiled against your CLAP headers |
 | `crates/ferritron-au` | Audio Unit v2 adapter (macOS), in Rust |
@@ -1063,7 +1145,7 @@ A format is one crate; neither Ferritron's core nor the CLI changes:
 | `examples/gain-match` | DirectLink: a gain-match pair around an effect |
 | `examples/gpu-modal` | GPU modal synthesizer example (instrument, reports latency) |
 | `tools/ferritron-mcp` | The MCP hub for AI clients (one per computer) |
-| `crates/ferritron-manifest` | Project file (`.frtx`): location, parsing and new-project templates, shared by the macro, the CLI and the Ferritron Editor |
+| `crates/ferritron-manifest` | Project file (`.ferritroject`): location, parsing and new-project templates, shared by the macro, the CLI and the Ferritron Editor |
 | `tools/bench` | Runtime benchmarks (parallel speedup, GPU convolution) |
 | `tools/crash-fixture` | Plugin that crashes on demand, for testing process isolation |
 | `examples/gain` | Minimal effect example |
@@ -1072,9 +1154,9 @@ A format is one crate; neither Ferritron's core nor the CLI changes:
 
 ## Versions
 
-All Ferritron crates share one version (currently **1.1.0**); see
+All Ferritron crates share one version (currently **1.2.0**); see
 [CHANGELOG.md](CHANGELOG.md). Pin it in a plugin with
-`ferritron = { path = "...", version = "1.1.0" }`; `ferritron::VERSION` and
+`ferritron = { path = "...", version = "1.2.0" }`; `ferritron::VERSION` and
 `cargo ferritron --version` report it.
 
 ## License

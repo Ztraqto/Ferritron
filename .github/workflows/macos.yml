@@ -1,0 +1,127 @@
+# macOS: native builds checked by the official validators, and (optional)
+# bundles cross-built on Windows with xclang checked on the same Mac.
+#
+# SDKs are fetched in the job from their publishers with `cargo ferritron
+# sdk fetch ... --accept-license`: whoever enables this workflow accepts the
+# VST3 SDK (MIT), CLAP (MIT) and ARA SDK (Apache 2.0) licenses for it. They
+# are cached on the runner, never committed.
+#
+# The cross job also fetches Apple's macOS SDK through xclang, which is used
+# under Apple's terms (they allow it on Apple hardware; using it on Windows is
+# the repository owner's decision). It runs only when the repository variable
+# FERRITRON_CROSS_MACOS is "true".
+
+name: macOS
+
+# Started by hand (Actions > macOS > Run workflow): macOS runners cost
+# minutes on private repositories.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  cross:
+    name: Cross-build on Windows (xclang)
+    if: vars.FERRITRON_CROSS_MACOS == 'true'
+    runs-on: windows-latest
+    env:
+      FERRITRON_SDK_ROOT: ${{ github.workspace }}\sdk
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: actions/cache@v4
+        with:
+          path: sdk
+          key: sdk-windows-${{ hashFiles('crates/ferritron-sdk/sdk-catalog.toml') }}
+      - name: SDKs
+        shell: bash
+        run: |
+          for id in vst3 clap xclang; do
+            [ -n "$(ls sdk/$id 2>/dev/null)" ] || cargo ferritron sdk fetch $id --accept-license
+          done
+          cargo ferritron sdk fetch macos --accept-license
+          cargo ferritron sdk status
+      - run: cargo ferritron bundle gain --target universal-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cross-bundles
+          path: target/universal-apple-darwin/bundled
+
+  native:
+    name: Build and validate on macOS
+    needs: [cross]
+    # Runs whether or not the cross job ran.
+    if: ${{ !cancelled() && (needs.cross.result == 'success' || needs.cross.result == 'skipped') }}
+    runs-on: macos-14
+    env:
+      FERRITRON_SDK_ROOT: ${{ github.workspace }}/sdk
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-apple-darwin
+      - uses: actions/cache@v4
+        with:
+          path: |
+            sdk
+            ~/.cargo/bin/clap-validator
+          key: sdk-macos-${{ hashFiles('crates/ferritron-sdk/sdk-catalog.toml') }}
+      - name: SDKs
+        run: |
+          for id in vst3 clap ara; do
+            [ -n "$(ls sdk/$id 2>/dev/null)" ] || cargo ferritron sdk fetch $id --accept-license
+          done
+          cargo ferritron sdk status
+
+      - name: Bundle the examples
+        run: |
+          cargo ferritron bundle gain
+          cargo ferritron bundle sine-synth
+          cargo ferritron bundle ara-reverse
+          cargo ferritron bundle gpu-view
+          cargo ferritron bundle gain --target universal-apple-darwin
+          lipo -info "target/universal-apple-darwin/bundled/Ferritron Gain.vst3/Contents/MacOS/Ferritron Gain"
+
+      - name: Unit tests
+        run: cargo test -p ferritron-core -p ferritron-manifest -p ferritron-build -p ferritron-sdk -p gain -p instances
+
+      - name: VST3 validator
+        run: |
+          VST3=$(cargo ferritron sdk status | awk '$1=="vst3" && $2=="found" {print $3}')
+          cmake -S "$VST3" -B build-vst3 -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF -DSMTG_ADD_VST3_PLUGINS_SAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-vst3 --target validator --config Release
+          VALIDATOR=$(find build-vst3 -type f -name validator -perm -u+x | head -1)
+          for b in target/bundled/*.vst3; do "$VALIDATOR" -e "$b"; done
+
+      - name: CLAP validator
+        run: |
+          command -v clap-validator || cargo install --locked --git https://github.com/free-audio/clap-validator clap-validator
+          for b in target/bundled/*.clap; do clap-validator validate "$b"; done
+
+      - name: Audio Unit (auval)
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R target/bundled/*.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          sleep 2
+          auval -a | grep -i ferritron
+          auval -a | grep -i ferritron | while read -r type sub manu _; do auval -v "$type" "$sub" "$manu"; done
+
+      - name: Cross-built bundles from Windows
+        if: needs.cross.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: cross-bundles
+          path: cross
+      - name: Validate the cross-built bundles
+        if: needs.cross.result == 'success'
+        run: |
+          VALIDATOR=$(find build-vst3 -type f -name validator -perm -u+x | head -1)
+          for b in cross/*.vst3; do codesign --force --deep --sign - "$b"; "$VALIDATOR" -e "$b"; done
+          for b in cross/*.clap; do codesign --force --deep --sign - "$b"; clap-validator validate "$b"; done
+          rm -rf ~/Library/Audio/Plug-Ins/Components/*.component
+          for b in cross/*.component; do codesign --force --deep --sign - "$b"; cp -R "$b" ~/Library/Audio/Plug-Ins/Components/; done
+          killall -9 AudioComponentRegistrar || true
+          sleep 2
+          auval -a | grep -i ferritron | while read -r type sub manu _; do auval -v "$type" "$sub" "$manu"; done

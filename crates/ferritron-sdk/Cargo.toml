@@ -1,0 +1,14 @@
+[package]
+name = "ferritron-sdk"
+description = "SDK catalog and fetching for the Ferritron audio plugin framework (after the developer accepts each license)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ferritron-build.workspace = true
+lzma-rs = "0.3"
+sha2 = "0.10"
+toml = "1"

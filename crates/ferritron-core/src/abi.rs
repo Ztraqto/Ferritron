@@ -75,6 +75,7 @@ impl PluginInfoC {
 const PARAM_LIST: u32 = 1 << 0;
 const PARAM_BYPASS: u32 = 1 << 1;
 const PARAM_NOT_AUTOMATABLE: u32 = 1 << 2;
+const PARAM_HIDDEN: u32 = 1 << 3;
 
 /// The "AI Access" switch of plugins with `[mcp]`: while on, AI clients may
 /// reach the instance through the Ferritron MCP hub. Off for every new
@@ -129,6 +130,8 @@ pub const EXT_HOST: &std::ffi::CStr = c"ferritron.host.v1";
 pub const EXT_EDITOR_SIZE: &std::ffi::CStr = c"ferritron.editor-size.v1";
 pub const EXT_ARA: &std::ffi::CStr = c"ferritron.ara.v1";
 pub const EXT_SLEEP: &std::ffi::CStr = c"ferritron.sleep.v1";
+pub const EXT_HOST2: &std::ffi::CStr = c"ferritron.host.v2";
+pub const EXT_TRACK: &std::ffi::CStr = c"ferritron.track.v1";
 
 /// `ferritron_sleep_api`: silence (see [`Tail`]). Shims report the tail to
 /// the host and tell it when the output is silence.
@@ -198,6 +201,16 @@ pub unsafe fn params_of<'a, P: Process>(ptr: *mut c_void) -> &'a P::Params {
     unsafe { &instance::<P>(ptr).params }
 }
 
+/// The handle of instance `ptr` (for extensions such as ARA).
+///
+/// # Safety
+/// `ptr` must be an instance of `P` created by this table, and the reference
+/// must not be used after the instance is destroyed.
+#[doc(hidden)]
+pub unsafe fn handle_of<'a, P: Process>(ptr: *mut c_void) -> &'a crate::InstanceHandle {
+    unsafe { &instance::<P>(ptr).handle }
+}
+
 /// A slot an extension may use for per-instance data (ARA's plug-in extension).
 ///
 /// # Safety
@@ -206,6 +219,10 @@ pub unsafe fn params_of<'a, P: Process>(ptr: *mut c_void) -> &'a P::Params {
 pub unsafe fn extension_slot<'a, P: Process>(ptr: *mut c_void) -> &'a std::sync::atomic::AtomicPtr<c_void> {
     unsafe { &instance::<P>(ptr).extension }
 }
+
+/// The instance's [`InstanceId`](crate::InstanceId), saved as two 32-bit halves.
+const INSTANCE_ID_HIGH: u32 = crate::__private::param_id("ferritron.instance.high");
+const INSTANCE_ID_LOW: u32 = crate::__private::param_id("ferritron.instance.low");
 
 /// The editor size the user chose, saved with the project (logical pixels).
 const EDITOR_WIDTH: u32 = crate::__private::param_id("ferritron.editor.width");
@@ -236,12 +253,23 @@ unsafe extern "C" fn set_editor_size<P: Process>(ptr: *mut c_void, width: u32, h
     unsafe { instance::<P>(ptr) }.editor_size.store(size, Ordering::Relaxed);
 }
 
-/// `ferritron_host_api`.
-#[cfg(any(windows, unix))]
+/// `ferritron_host_api` (`ferritron.host.v1`).
 #[repr(C)]
 pub struct HostApi {
-    pub attach: unsafe extern "C" fn(*mut c_void, *const crate::mcp::HostCallbacks),
+    pub attach: unsafe extern "C" fn(*mut c_void, *const crate::instance::HostCallbacks),
     pub set_track_name: unsafe extern "C" fn(*mut c_void, FerritronStr),
+}
+
+/// `ferritron_host_api2` (`ferritron.host.v2`): edits as gestures, waking.
+#[repr(C)]
+pub struct HostApi2 {
+    pub attach: unsafe extern "C" fn(*mut c_void, *const crate::instance::HostCallbacks2),
+}
+
+/// `ferritron_track_api` (`ferritron.track.v1`): the track the instance sits on.
+#[repr(C)]
+pub struct TrackApi {
+    pub set_track_info: unsafe extern "C" fn(*mut c_void, *const crate::instance::TrackInfoC),
 }
 
 /// `ferritron_render_api`: offline rendering. [`Context::quality`] follows
@@ -264,24 +292,42 @@ impl<P: Process> Latency<P> {
     const RENDER: RenderApi = RenderApi { set_offline: set_offline::<P> };
     const EDITOR_SIZE: EditorSizeApi = EditorSizeApi { get: get_editor_size::<P>, set: set_editor_size::<P> };
     const SLEEP: SleepApi = SleepApi { tail: tail_of::<P>, silent: silent_of::<P> };
-    #[cfg(any(windows, unix))]
     const HOST: HostApi = HostApi { attach: attach_host::<P>, set_track_name: set_track_name::<P> };
+    const HOST2: HostApi2 = HostApi2 { attach: attach_host2::<P> };
+    const TRACK: TrackApi = TrackApi { set_track_info: set_track_info::<P> };
 }
 
-#[cfg(any(windows, unix))]
-unsafe extern "C" fn attach_host<P: Process>(ptr: *mut c_void, host: *const crate::mcp::HostCallbacks) {
+unsafe extern "C" fn attach_host<P: Process>(ptr: *mut c_void, host: *const crate::instance::HostCallbacks) {
     let instance = unsafe { instance::<P>(ptr) };
-    if let (Some(shared), Some(host)) = (&instance.mcp_shared, unsafe { host.as_ref() }) {
-        *shared.host.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(*host);
+    if let Some(host) = unsafe { host.as_ref() } {
+        instance.handle.0.attach_v1(*host);
     }
 }
 
-#[cfg(any(windows, unix))]
+unsafe extern "C" fn attach_host2<P: Process>(ptr: *mut c_void, host: *const crate::instance::HostCallbacks2) {
+    let instance = unsafe { instance::<P>(ptr) };
+    if let Some(host) = unsafe { host.as_ref() } {
+        instance.handle.0.attach_v2(*host);
+    }
+}
+
 unsafe extern "C" fn set_track_name<P: Process>(ptr: *mut c_void, name: FerritronStr) {
     let instance = unsafe { instance::<P>(ptr) };
-    if let (Some(shared), Some(name)) = (&instance.mcp_shared, unsafe { name.to_str() }) {
-        *shared.track.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = name.to_string();
+    if let Some(name) = unsafe { name.to_str() } {
+        instance.handle.0.set_track_name(name);
     }
+}
+
+unsafe extern "C" fn set_track_info<P: Process>(ptr: *mut c_void, info: *const crate::instance::TrackInfoC) {
+    use crate::instance::{TRACK_HAS_COLOR, TRACK_HAS_INDEX, TRACK_HAS_NAME};
+    let instance = unsafe { instance::<P>(ptr) };
+    let Some(info) = (unsafe { info.as_ref() }) else { return };
+    let name = if info.flags & TRACK_HAS_NAME != 0 { unsafe { info.name.to_str() }.filter(|n| !n.is_empty()).map(str::to_string) } else { None };
+    instance.handle.0.set_track(crate::TrackInfo {
+        name,
+        color: (info.flags & TRACK_HAS_COLOR != 0).then_some(info.color),
+        index: (info.flags & TRACK_HAS_INDEX != 0).then_some(info.index),
+    });
 }
 
 unsafe extern "C" fn set_offline<P: Process>(ptr: *mut c_void, offline: bool) {
@@ -401,9 +447,14 @@ pub(crate) unsafe extern "C" fn get_extension<P: Process + PluginMeta>(id: *cons
     if id == EXT_ARA {
         return P::ara().map_or(std::ptr::null(), |ara| ara as *const AraApi as *const c_void);
     }
-    #[cfg(any(windows, unix))]
-    if id == EXT_HOST && P::MCP {
+    if id == EXT_HOST {
         return &Latency::<P>::HOST as *const HostApi as *const c_void;
+    }
+    if id == EXT_HOST2 {
+        return &Latency::<P>::HOST2 as *const HostApi2 as *const c_void;
+    }
+    if id == EXT_TRACK {
+        return &Latency::<P>::TRACK as *const TrackApi as *const c_void;
     }
     match P::view() {
         Some(view) if id == EXT_VIEW => crate::isolation::editor(view, P::VIEW_PROCESS),
@@ -413,7 +464,9 @@ pub(crate) unsafe extern "C" fn get_extension<P: Process + PluginMeta>(id: *cons
 }
 
 struct Instance<P: Process> {
-    params: P::Params,
+    params: std::sync::Arc<P::Params>,
+    /// What handles, editors and the host link share.
+    handle: crate::InstanceHandle,
     /// Touched only by `activate` (main thread) and `process` (audio
     /// thread), which hosts never run concurrently.
     plugin: UnsafeCell<P>,
@@ -671,21 +724,27 @@ impl<P: Process + PluginMeta> crate::mcp::Endpoint for Endpoint<P> {
         let plain = info.sanitize(value);
         instance.cell(index).set(plain);
         // Tell the DAW, as an edit from the editor would.
-        let host = *self.shared.host.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(edited) = host.and_then(|h| h.edited.map(|f| (h.ctx, f))) {
-            unsafe { (edited.1)(edited.0, info.id, info.normalize(plain)) };
-        }
+        self.shared.link.edited(info.id, info.normalize(plain));
+        instance.handle.0.wake.store(true, Ordering::Release);
         Ok(serde_json::json!({ "key": info.key, "value": plain, "text": P::localized().format(index, info, plain) }))
     }
 }
 
 pub(crate) unsafe extern "C" fn create<P: Process + PluginMeta>() -> *mut c_void {
-    let Some(plugin) = guarded(P::default) else { return std::ptr::null_mut() };
+    let Some(mut plugin) = guarded(P::default) else { return std::ptr::null_mut() };
+    let Some(params) = guarded(|| std::sync::Arc::new(P::Params::default())) else { return std::ptr::null_mut() };
+    let link = crate::instance::Link::new::<P>(P::INFO.id, params.clone());
+    let handle = crate::InstanceHandle(link.clone());
+    if guarded(|| plugin.init(&handle)).is_none() {
+        link.destroy();
+        return std::ptr::null_mut();
+    }
     if P::PARALLEL {
         crate::parallel::acquire();
     }
     let instance = Instance::<P> {
-        params: P::Params::default(),
+        params,
+        handle,
         plugin: UnsafeCell::new(plugin),
         bypass: ParamCell::new(BYPASS.default),
         sample_rate: AtomicU64::new(44_100f64.to_bits()),
@@ -700,7 +759,7 @@ pub(crate) unsafe extern "C" fn create<P: Process + PluginMeta>() -> *mut c_void
         editor_size: AtomicU64::new(0),
         extension: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         #[cfg(any(windows, unix))]
-        mcp_shared: P::MCP.then(|| std::sync::Arc::new(crate::mcp::Shared::new())),
+        mcp_shared: P::MCP.then(|| std::sync::Arc::new(crate::mcp::Shared::new(link.clone()))),
     };
     let ptr = Box::into_raw(Box::new(instance));
     // Starts the editor's browser now, without waiting for it (`[view] preload`).
@@ -722,6 +781,7 @@ pub(crate) unsafe extern "C" fn destroy<P: Process + PluginMeta>(ptr: *mut c_voi
             unsafe { (ara.release)(ptr) };
         }
         let instance = unsafe { Box::from_raw(ptr as *mut Instance<P>) };
+        instance.handle.0.destroy();
         // Plugin destructors are plugin code too.
         let _ = guarded(move || drop(instance));
         let _ = guarded(|| P::preload_view(false));
@@ -740,13 +800,22 @@ unsafe extern "C" fn param_info<P: Process + PluginMeta>(index: u32, out: *mut P
     if out.is_null() {
         return false;
     }
-    let flags = match info.kind {
+    let mut flags = match info.kind {
         _ if info.id == BYPASS.id => PARAM_BYPASS,
         _ if info.id == MCP_SWITCH.id => PARAM_NOT_AUTOMATABLE,
         _ if info.id == QUALITY.id => PARAM_LIST | PARAM_NOT_AUTOMATABLE,
         ParamKind::Enum { .. } => PARAM_LIST,
         _ => 0,
     };
+    if (index as usize) < P::Params::infos().len() {
+        let options = P::Params::options(index as usize);
+        if !options.automatable {
+            flags |= PARAM_NOT_AUTOMATABLE;
+        }
+        if options.hidden {
+            flags |= PARAM_HIDDEN;
+        }
+    }
     unsafe {
         out.write(ParamInfoC {
             id: info.id,
@@ -938,7 +1007,8 @@ pub(crate) unsafe extern "C" fn process<P: Process + PluginMeta>(
     // note held or started, no parameter changed.
     // SAFETY: like the plugin, the sleep state belongs to the audio thread.
     let sleep = unsafe { &mut *instance.sleep.get() };
-    let mut woken = false;
+    // Woken from outside (`InstanceHandle::wake`, edits through a handle).
+    let mut woken = instance.handle.0.wake.swap(false, Ordering::AcqRel);
     for event in events {
         match event.kind {
             EVENT_PARAM => {
@@ -995,7 +1065,7 @@ pub(crate) unsafe extern "C" fn process<P: Process + PluginMeta>(
             let io = unsafe { AudioIo::from_raw(&ptrs[..channels.len()], end - start) };
             // Read per piece: the user's switch may change inside the block.
             let quality = instance.quality();
-            let mut ctx = Context { params: &instance.params, io, notes, sample_rate, quality, executor };
+            let mut ctx = Context { params: &*instance.params, io, notes, sample_rate, quality, executor, instance: &instance.handle };
             plugin.process(&mut ctx);
         };
         let frames = frames as usize;
@@ -1069,7 +1139,10 @@ pub(crate) unsafe extern "C" fn save_state<P: Process + PluginMeta>(ptr: *mut c_
         extra.push((EDITOR_WIDTH, (size >> 32) as f64));
         extra.push((EDITOR_HEIGHT, (size & 0xffff_ffff) as f64));
     }
-    let data = state::serialize(&instance.params, &extra);
+    let id = instance.handle.0.id();
+    extra.push((INSTANCE_ID_HIGH, (id >> 32) as f64));
+    extra.push((INSTANCE_ID_LOW, (id & 0xffff_ffff) as f64));
+    let data = state::serialize(&*instance.params, &extra, &instance.handle.0.store_snapshot());
     if !buf.is_null() && data.len() <= cap as usize {
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len()) };
     }
@@ -1083,8 +1156,10 @@ pub(crate) unsafe extern "C" fn load_state<P: Process + PluginMeta>(ptr: *mut c_
     }
     let data = unsafe { std::slice::from_raw_parts(data, len as usize) };
     let (mut width, mut height) = (0u32, 0u32);
+    let (mut id_high, mut id_low) = (None, None);
     let pixels = |v: f64| if v.is_finite() && (1.0..=65_535.0).contains(&v) { v as u32 } else { 0 };
-    let loaded = state::deserialize(&instance.params, data, |id, value| {
+    let word = |v: f64| (v.is_finite() && (0.0..=u32::MAX as f64).contains(&v)).then_some(v as u64);
+    let loaded = state::deserialize(&*instance.params, data, |id, value| {
         if id == BYPASS.id {
             instance.bypass.set(BYPASS.sanitize(value));
         } else if P::MCP && id == MCP_SWITCH.id {
@@ -1095,10 +1170,20 @@ pub(crate) unsafe extern "C" fn load_state<P: Process + PluginMeta>(ptr: *mut c_
             width = pixels(value);
         } else if id == EDITOR_HEIGHT {
             height = pixels(value);
+        } else if id == INSTANCE_ID_HIGH {
+            id_high = word(value);
+        } else if id == INSTANCE_ID_LOW {
+            id_low = word(value);
         }
     });
     if loaded {
         unsafe { set_editor_size::<P>(ptr, width, height) };
+        if let (Some(high), Some(low)) = (id_high, id_low) {
+            instance.handle.0.restore_id((high << 32) | low);
+        }
+        instance.handle.0.replace_store(state::store_of(data));
+        // Whatever changed must reach `process`, even while it sleeps.
+        instance.handle.0.wake.store(true, Ordering::Release);
     }
     loaded
 }
@@ -1527,6 +1612,131 @@ mod tests {
             // Re-activation gives the plugin another chance.
             assert!((API.activate)(a, 48_000.0, 64));
             assert!(run(a, &mut buf));
+            (API.destroy)(a);
+        }
+    }
+    #[test]
+    fn instance_ids_are_saved_and_duplicates_get_new_ones() {
+        unsafe {
+            let a = (API.create)();
+            let id = handle_of::<Doubler>(a).id();
+            let state = saved_state(a);
+            // A duplicated track: the same state while the original lives.
+            let b = (API.create)();
+            assert!((API.load_state)(b, state.as_ptr(), state.len() as u32));
+            assert_ne!(handle_of::<Doubler>(b).id(), id);
+            (API.destroy)(a);
+            (API.destroy)(b);
+            // A reopened project: the original is gone, the ID comes back.
+            let c = (API.create)();
+            assert!((API.load_state)(c, state.as_ptr(), state.len() as u32));
+            assert_eq!(handle_of::<Doubler>(c).id(), id);
+            (API.destroy)(c);
+        }
+    }
+
+    #[test]
+    fn the_store_is_saved_with_the_project() {
+        unsafe {
+            let a = (API.create)();
+            handle_of::<Doubler>(a).store().set("name", "リード");
+            let state = saved_state(a);
+            let b = (API.create)();
+            let before = handle_of::<Doubler>(b).revision();
+            assert!((API.load_state)(b, state.as_ptr(), state.len() as u32));
+            assert_eq!(handle_of::<Doubler>(b).store().get_str("name").as_deref(), Some("リード"));
+            assert!(handle_of::<Doubler>(b).revision() > before);
+            // State without a store empties it: the project is what counts.
+            let plain = state::serialize(&Params::default(), &[], &Default::default());
+            assert!((API.load_state)(b, plain.as_ptr(), plain.len() as u32));
+            assert!(handle_of::<Doubler>(b).store().keys().is_empty());
+            (API.destroy)(a);
+            (API.destroy)(b);
+        }
+    }
+
+    #[test]
+    fn instances_are_listed_and_dropped_on_destroy() {
+        unsafe {
+            let a = (API.create)();
+            let handle = handle_of::<Doubler>(a).clone();
+            assert!(crate::instances::<Doubler>().contains(&handle));
+            (API.destroy)(a);
+            assert!(!handle.is_alive());
+            assert!(!crate::instances::<Doubler>().contains(&handle));
+            // A handle that outlived its instance is harmless.
+            handle.edit("amount", 1.0);
+            handle.wake();
+        }
+    }
+
+    static EDITS: std::sync::Mutex<Vec<(u32, u32, f64)>> = std::sync::Mutex::new(Vec::new());
+    static WAKES: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn record_edit(_ctx: *mut c_void, kind: u32, id: u32, normalized: f64) {
+        EDITS.lock().unwrap().push((kind, id, normalized));
+    }
+
+    unsafe extern "C" fn record_wake(_ctx: *mut c_void) {
+        WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn handle_edits_reach_the_host_and_wake_a_sleeping_instance() {
+        unsafe {
+            let a = new_sleeper(None);
+            let host2 = (SLEEP_API.get_extension)(EXT_HOST2.as_ptr()) as *const HostApi2;
+            let mut marker = 0u8;
+            let ctx = &mut marker as *mut u8 as *mut c_void;
+            let callbacks = crate::instance::HostCallbacks2 { ctx, edit: Some(record_edit), request_process: Some(record_wake) };
+            ((*host2).attach)(a, &callbacks);
+            let handle = handle_of::<Sleeper>(a).clone();
+            assert_eq!(crate::InstanceHandle::for_shim_ctx(ctx), Some(handle.clone()));
+
+            // Fall asleep (Tail::Auto: two seconds of silence).
+            feed(a, 250, 0.0, &[]);
+            assert!(silent(a));
+            let calls = sleeper(a).calls;
+            feed(a, 1, 0.0, &[]);
+            assert_eq!(sleeper(a).calls, calls);
+
+            // A gesture through the handle: recorded by the host, applied, and it wakes the instance.
+            handle.begin("amount");
+            handle.set("amount", 3.0);
+            handle.end("amount");
+            assert_eq!(handle.value("amount"), Some(3.0));
+            let edits: Vec<_> = EDITS.lock().unwrap().iter().filter(|e| e.1 == 7).copied().collect();
+            assert_eq!(edits, [(crate::instance::EDIT_BEGIN, 7, 0.5), (crate::instance::EDIT_PERFORM, 7, 0.75), (crate::instance::EDIT_END, 7, 0.75)]);
+            assert!(WAKES.load(Ordering::Relaxed) >= 1);
+            feed(a, 1, 0.0, &[]);
+            assert_eq!(sleeper(a).calls, calls + 1);
+
+            // A plain wake does the same.
+            feed(a, 250, 0.0, &[]);
+            let calls = sleeper(a).calls;
+            handle.wake();
+            feed(a, 1, 0.0, &[]);
+            assert_eq!(sleeper(a).calls, calls + 1);
+
+            (SLEEP_API.destroy)(a);
+            assert_eq!(crate::InstanceHandle::for_shim_ctx(ctx), None);
+        }
+    }
+
+    #[test]
+    fn track_info_reaches_the_handle() {
+        use crate::instance::{TRACK_HAS_COLOR, TRACK_HAS_NAME, TrackInfoC};
+        unsafe {
+            let a = (API.create)();
+            let track = (API.get_extension)(EXT_TRACK.as_ptr()) as *const TrackApi;
+            let info = TrackInfoC { flags: TRACK_HAS_NAME | TRACK_HAS_COLOR, name: FerritronStr::new("Vocal"), color: [255, 0, 128], index: 0 };
+            ((*track).set_track_info)(a, &info);
+            let handle = handle_of::<Doubler>(a);
+            assert_eq!(handle.track(), crate::TrackInfo { name: Some("Vocal".into()), color: Some([255, 0, 128]), index: None });
+            // The v1 entry still sets the name.
+            let host = (API.get_extension)(EXT_HOST.as_ptr()) as *const HostApi;
+            ((*host).set_track_name)(a, FerritronStr::new("Lead"));
+            assert_eq!(handle.track().name.as_deref(), Some("Lead"));
             (API.destroy)(a);
         }
     }

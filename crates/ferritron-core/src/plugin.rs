@@ -33,7 +33,7 @@ pub struct NoteEvent {
     pub note_id: i32,
 }
 
-/// Static plugin metadata, generated from the project file (`.frtx`).
+/// Static plugin metadata, generated from the project file (`.ferritroject`).
 #[derive(Debug)]
 pub struct PluginInfo {
     /// Reverse-domain identifier, e.g. `com.example.gain`.
@@ -124,9 +124,17 @@ pub struct Context<'a, P> {
     /// The quality to process this block at (see [`Quality`]).
     pub quality: Quality,
     pub(crate) executor: Option<&'a Executor>,
+    pub(crate) instance: &'a crate::InstanceHandle,
 }
 
 impl<P> Context<'_, P> {
+    /// This instance (see [`InstanceHandle`](crate::InstanceHandle)). On the
+    /// audio thread use only its lock-free parts: [`id`](crate::InstanceHandle::id),
+    /// parameter values of other instances, [`revision`](crate::InstanceHandle::revision).
+    pub fn instance(&self) -> &crate::InstanceHandle {
+        self.instance
+    }
+
     /// Runs `f` on every item, spread over several cores when possible: the
     /// host's thread pool if the format offers one, otherwise Ferritron's
     /// workers (with `parallel = true` in the project file), otherwise one after
@@ -152,6 +160,13 @@ impl<P> Context<'_, P> {
 pub trait Process: Default + Send + 'static {
     /// Inserted automatically by `#[ferritron::plugin]`.
     type Params: ParamSet;
+
+    /// Called once, right after the instance was created and before
+    /// anything else, with the instance's handle: keep a clone to reach the
+    /// instance's track, store, identity and editor messages later.
+    fn init(&mut self, instance: &crate::InstanceHandle) {
+        let _ = instance;
+    }
 
     fn activate(&mut self, setup: &Setup) {
         let _ = setup;

@@ -59,6 +59,7 @@ enum ferritron_param_flags {
     FERRITRON_PARAM_LIST = 1 << 0,   /* discrete named choices */
     FERRITRON_PARAM_BYPASS = 1 << 1, /* the plugin's bypass switch (always present, listed last) */
     FERRITRON_PARAM_NOT_AUTOMATABLE = 1 << 2, /* not for automation (e.g. the AI Access switch) */
+    FERRITRON_PARAM_HIDDEN = 1 << 3, /* not shown in the host's parameter lists (still saved) */
 };
 
 typedef struct ferritron_param_info {
@@ -107,6 +108,8 @@ typedef struct ferritron_event {
 #define FERRITRON_EXT_EDITOR_SIZE "ferritron.editor-size.v1"
 #define FERRITRON_EXT_ARA "ferritron.ara.v1"
 #define FERRITRON_EXT_SLEEP "ferritron.sleep.v1"
+#define FERRITRON_EXT_HOST2 "ferritron.host.v2"
+#define FERRITRON_EXT_TRACK "ferritron.track.v1"
 
 /* FERRITRON_EXT_SLEEP: silence. A plugin stops processing (sleeps) once its
    input has been silent for as long as its output can go on; input, notes
@@ -166,6 +169,49 @@ typedef struct ferritron_host_api {
     /* The track (mixer channel) the instance sits on, when the host says. */
     void (*set_track_name)(void* instance, ferritron_str name);          /* [main] */
 } ferritron_host_api;
+
+/* FERRITRON_EXT_HOST2: what plugin code may ask of the host from any thread
+   (Ferritron's InstanceHandle). A shim that offers it attaches with it after
+   (or instead of) FERRITRON_EXT_HOST. edit() reports one step of an edit
+   the plugin made by itself, as a gesture: FERRITRON_EDIT_BEGIN, then
+   FERRITRON_EDIT_PERFORM per value, then FERRITRON_EDIT_END; the shim hands
+   them to the host on the right thread, in order. request_process() asks
+   the host to call process() soon although the output was silent (CLAP:
+   host->request_process); NULL where hosts keep calling process anyway.
+   ctx must be the same pointer the shim passes as ferritron_view_host::ctx
+   to this instance's editor: that is how an editor finds its instance. */
+enum { FERRITRON_EDIT_BEGIN = 0, FERRITRON_EDIT_PERFORM = 1, FERRITRON_EDIT_END = 2 };
+
+typedef struct ferritron_host_callbacks2 {
+    void* ctx;
+    void (*edit)(void* ctx, uint32_t kind, uint32_t id, double normalized); /* [any] */
+    void (*request_process)(void* ctx);                                       /* [any], may be NULL */
+} ferritron_host_callbacks2;
+
+typedef struct ferritron_host_api2 {
+    /* `host` is copied; ctx must stay valid until the instance is destroyed. */
+    void (*attach)(void* instance, const ferritron_host_callbacks2* host); /* [main] */
+} ferritron_host_api2;
+
+/* FERRITRON_EXT_TRACK: the track (mixer channel) the instance sits on, with
+   whatever the host tells of it. Shims call it when they first learn the
+   track and whenever the host says it changed. */
+enum {
+    FERRITRON_TRACK_HAS_NAME = 1 << 0,
+    FERRITRON_TRACK_HAS_COLOR = 1 << 1,
+    FERRITRON_TRACK_HAS_INDEX = 1 << 2,
+};
+
+typedef struct ferritron_track_info {
+    uint32_t flags;     /* FERRITRON_TRACK_HAS_* */
+    ferritron_str name; /* UTF-8 */
+    uint8_t color[3];   /* red, green, blue */
+    uint32_t index;     /* position in the host's mixer, from 0 */
+} ferritron_track_info;
+
+typedef struct ferritron_track_api {
+    void (*set_track_info)(void* instance, const ferritron_track_info* info); /* [main] */
+} ferritron_track_api;
 
 /* FERRITRON_EXT_RENDER: whether the host renders offline (bounce, export).
    The plugin's processing quality follows at once; its setup (Setup::offline)

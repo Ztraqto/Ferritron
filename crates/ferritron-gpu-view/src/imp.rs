@@ -3,7 +3,7 @@
 //! timer redraws when parameters change.
 
 use super::common::{Canvas, instance, open_view};
-use super::{Button, GpuEditor, Input, Key, Modifiers};
+use super::{Button, Cursor, GpuEditor, Input, Key, Modifiers};
 use ferritron_core::__private::PluginMeta;
 use ferritron_core::Process;
 use ferritron_core::abi::ViewHost;
@@ -77,6 +77,8 @@ unsafe extern "system" {
     fn ReleaseCapture() -> i32;
     fn ScreenToClient(hwnd: Hwnd, point: *mut Point) -> i32;
     fn LoadCursorW(instance: *mut c_void, name: *const u16) -> *mut c_void;
+    fn SetCursor(cursor: *mut c_void) -> *mut c_void;
+    fn TrackMouseEvent(track: *mut TrackMouse) -> i32;
     fn SetFocus(hwnd: Hwnd) -> Hwnd;
     fn GetKeyState(key: i32) -> i16;
     fn GetParent(hwnd: Hwnd) -> Hwnd;
@@ -129,6 +131,37 @@ const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MBUTTONDBLCLK: u32 = 0x0209;
 const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_SETCURSOR: u32 = 0x0020;
+const HTCLIENT: isize = 1;
+const TME_LEAVE: u32 = 0x0000_0002;
+
+#[repr(C)]
+struct TrackMouse {
+    size: u32,
+    flags: u32,
+    hwnd: Hwnd,
+    hover_time: u32,
+}
+
+/// Shows the pointer shape the editor asked for.
+fn apply_cursor(cursor: Cursor) {
+    let id: usize = match cursor {
+        Cursor::Hidden => {
+            unsafe { SetCursor(std::ptr::null_mut()) };
+            return;
+        }
+        Cursor::Hand | Cursor::Grab => 32649,       // IDC_HAND
+        Cursor::Grabbing | Cursor::Move => 32646,   // IDC_SIZEALL
+        Cursor::Text => 32513,                      // IDC_IBEAM
+        Cursor::Crosshair => 32515,                 // IDC_CROSS
+        Cursor::ResizeHorizontal => 32644,          // IDC_SIZEWE
+        Cursor::ResizeVertical => 32645,            // IDC_SIZENS
+        Cursor::NotAllowed => 32648,                // IDC_NO
+        _ => IDC_ARROW,
+    };
+    unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), id as *const u16)) };
+}
 
 /// About 60 redraw checks per second.
 const TICK_MS: u32 = 16;
@@ -139,6 +172,8 @@ struct View {
     canvas: Canvas,
     /// Buttons held, so the editor keeps getting moves outside the window.
     held: u32,
+    /// Windows was asked to report the mouse leaving (`WM_MOUSELEAVE`).
+    tracking: bool,
 }
 
 impl View {
@@ -277,9 +312,29 @@ unsafe extern "system" fn window_proc(hwnd: Hwnd, msg: u32, w: usize, l: isize) 
             return 0;
         }
         WM_MOUSEMOVE => {
+            if !view.tracking {
+                let mut track = TrackMouse { size: size_of::<TrackMouse>() as u32, flags: TME_LEAVE, hwnd, hover_time: 0 };
+                view.tracking = unsafe { TrackMouseEvent(&mut track) } != 0;
+            }
             let (x, y) = view.position(l);
+            let before = view.canvas.cursor();
             view.canvas.input(Input::Move { x, y });
+            if view.canvas.cursor() != before {
+                apply_cursor(view.canvas.cursor());
+            }
             return 0;
+        }
+        WM_MOUSELEAVE => {
+            view.tracking = false;
+            // While a button is held the editor still owns the mouse (capture).
+            if view.held == 0 {
+                view.canvas.input(Input::Leave);
+            }
+            return 0;
+        }
+        WM_SETCURSOR if (l & 0xffff) == HTCLIENT => {
+            apply_cursor(view.canvas.cursor());
+            return 1;
         }
         WM_MOUSEWHEEL => {
             // Wheel positions are in screen coordinates.
@@ -351,7 +406,7 @@ fn create<P: Process + PluginMeta, E: GpuEditor>(parent: Hwnd, host: ViewHost, w
         // SAFETY: the window outlives the surface (`close` drops the view first).
         let surface = unsafe { instance().create_surface_unsafe(target) }.ok()?;
         let canvas = Canvas::new::<P, E>(surface, host, (width, height), scale)?;
-        Some(Box::new(View { hwnd, canvas, held: 0 }))
+        Some(Box::new(View { hwnd, canvas, held: 0, tracking: false }))
     })();
     let Some(mut view) = made else {
         unsafe { DestroyWindow(hwnd) };

@@ -1,0 +1,109 @@
+# The SDK versions Ferritron knows how to fetch, checked against this
+# Ferritron release. Every part is downloaded from its publisher over HTTPS
+# and checked before it is used: release files by SHA-256, source archives
+# of a git commit by that commit (the archive's top folder names it).
+#
+# Fields per version:
+#   version      the folder name under <root>/<id>/
+#   recommended  the version this Ferritron release was checked with
+#   license      the license's name, shown before fetching
+#   license-url  the license text at that version
+#   ferritron    the oldest Ferritron the version works with
+#   notice       extra text shown with the license (optional)
+#   parts        what to download; `into` is the folder inside the SDK
+#                (submodules), "" for the SDK itself
+#
+# Sources (read 2026-11-07): the GitHub API's tags and submodule pins of
+# each repository; xclang's release assets and their digests.
+
+[[vst3]]
+version = "3.8.1"
+recommended = true
+license = "MIT License"
+license-url = "https://github.com/steinbergmedia/vst3sdk/blob/v3.8.1_build_84/LICENSE.txt"
+ferritron = "1.2.0"
+parts = [
+    { into = "", url = "https://api.github.com/repos/steinbergmedia/vst3sdk/tarball/3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96", commit = "3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96" },
+    { into = "pluginterfaces", url = "https://api.github.com/repos/steinbergmedia/vst3_pluginterfaces/tarball/4f547e8e102b47de4a8b8aaf343c73b700786372", commit = "4f547e8e102b47de4a8b8aaf343c73b700786372" },
+    { into = "base", url = "https://api.github.com/repos/steinbergmedia/vst3_base/tarball/fcf9da0bd27a16f7f03773a3a39822f28f5c8477", commit = "fcf9da0bd27a16f7f03773a3a39822f28f5c8477" },
+    { into = "public.sdk", url = "https://api.github.com/repos/steinbergmedia/vst3_public_sdk/tarball/586dc5e6c8012c3e4b01c79389375cbe96bdb1da", commit = "586dc5e6c8012c3e4b01c79389375cbe96bdb1da" },
+    { into = "cmake", url = "https://api.github.com/repos/steinbergmedia/vst3_cmake/tarball/054c9143cbb8d47fc4694e473f2ee3b4d951a8f5", commit = "054c9143cbb8d47fc4694e473f2ee3b4d951a8f5" },
+]
+
+[[vst3]]
+version = "3.8.0"
+license = "MIT License"
+license-url = "https://github.com/steinbergmedia/vst3sdk/blob/v3.8.0_build_66/LICENSE.txt"
+ferritron = "1.0.0"
+parts = [
+    { into = "", url = "https://api.github.com/repos/steinbergmedia/vst3sdk/tarball/9fad9770f2ae8542ab1a548a68c1ad1ac690abe0", commit = "9fad9770f2ae8542ab1a548a68c1ad1ac690abe0" },
+    { into = "pluginterfaces", url = "https://api.github.com/repos/steinbergmedia/vst3_pluginterfaces/tarball/31d6eeba6daaa3e2a8bfbe3e7a90ca0b7fbfbc1c", commit = "31d6eeba6daaa3e2a8bfbe3e7a90ca0b7fbfbc1c" },
+    { into = "base", url = "https://api.github.com/repos/steinbergmedia/vst3_base/tarball/3d2e82f8e6bff59c1d8b7a27491a29c2286b5206", commit = "3d2e82f8e6bff59c1d8b7a27491a29c2286b5206" },
+    { into = "public.sdk", url = "https://api.github.com/repos/steinbergmedia/vst3_public_sdk/tarball/a3911a4615dabbfdfd9d181ee26b05c70c289a95", commit = "a3911a4615dabbfdfd9d181ee26b05c70c289a95" },
+    { into = "cmake", url = "https://api.github.com/repos/steinbergmedia/vst3_cmake/tarball/de6e54eeaaab35b7145f5c32c279b5e892146e04", commit = "de6e54eeaaab35b7145f5c32c279b5e892146e04" },
+]
+
+[[clap]]
+version = "1.2.10"
+recommended = true
+license = "MIT License"
+license-url = "https://github.com/free-audio/clap/blob/1.2.10/LICENSE"
+ferritron = "1.2.0"
+parts = [
+    { into = "", url = "https://api.github.com/repos/free-audio/clap/tarball/195b42a004144fab0b3cf95e9c067187d15365b7", commit = "195b42a004144fab0b3cf95e9c067187d15365b7" },
+]
+
+[[clap]]
+version = "1.2.9"
+license = "MIT License"
+license-url = "https://github.com/free-audio/clap/blob/1.2.9/LICENSE"
+ferritron = "1.0.0"
+parts = [
+    { into = "", url = "https://api.github.com/repos/free-audio/clap/tarball/cd94482ba5941ae410809b6fbaed3bc851044270", commit = "cd94482ba5941ae410809b6fbaed3bc851044270" },
+]
+
+[[clap]]
+version = "1.2.8"
+license = "MIT License"
+license-url = "https://github.com/free-audio/clap/blob/1.2.8/LICENSE"
+ferritron = "1.0.0"
+parts = [
+    { into = "", url = "https://api.github.com/repos/free-audio/clap/tarball/ca1b43ee2b4f381e94e4170e622d60b92108b128", commit = "ca1b43ee2b4f381e94e4170e622d60b92108b128" },
+]
+
+[[ara]]
+version = "2.3.0"
+recommended = true
+license = "Apache License 2.0"
+license-url = "https://github.com/Celemony/ARA_API/blob/releases/2.3.0/LICENSE.txt"
+ferritron = "1.2.0"
+parts = [
+    { into = "", url = "https://api.github.com/repos/Celemony/ARA_SDK/tarball/0005c532bb03eb210e7bb490329fc6d7ba1792c7", commit = "0005c532bb03eb210e7bb490329fc6d7ba1792c7" },
+    { into = "ARA_API", url = "https://api.github.com/repos/Celemony/ARA_API/tarball/65ec5c43b943a48cb5446f448a0492db6af8534b", commit = "65ec5c43b943a48cb5446f448a0492db6af8534b" },
+    { into = "ARA_Library", url = "https://api.github.com/repos/Celemony/ARA_Library/tarball/d18a6a5e489816316be84a9de0eaf7307bc1abe4", commit = "d18a6a5e489816316be84a9de0eaf7307bc1abe4" },
+]
+
+[[ara]]
+version = "2.2.0"
+license = "Apache License 2.0"
+license-url = "https://github.com/Celemony/ARA_API/blob/releases/2.2.0/LICENSE.txt"
+ferritron = "1.0.0"
+parts = [
+    { into = "", url = "https://api.github.com/repos/Celemony/ARA_SDK/tarball/e723ce48a917b1ce2d7851c78e468f36b51ea151", commit = "e723ce48a917b1ce2d7851c78e468f36b51ea151" },
+    { into = "ARA_API", url = "https://api.github.com/repos/Celemony/ARA_API/tarball/d8a3d608e5243255aea40b1d40654d3b2c66af71", commit = "d8a3d608e5243255aea40b1d40654d3b2c66af71" },
+    { into = "ARA_Library", url = "https://api.github.com/repos/Celemony/ARA_Library/tarball/ac1beaa7a3b58c8b970628c40c8fe823f8bec573", commit = "ac1beaa7a3b58c8b970628c40c8fe823f8bec573" },
+]
+
+# xclang: one archive per host; `host` picks the part for this computer.
+[[xclang]]
+version = "23.1.3.6"
+recommended = true
+license = "Apache License 2.0"
+license-url = "https://github.com/clice-io/xclang"
+ferritron = "1.2.0"
+parts = [
+    { into = "", host = "windows-x86_64", url = "https://github.com/clice-io/xclang/releases/download/23.1.3.6/xclang-23.1.3.6-x86_64-w64-mingw32.tar.xz", sha256 = "dbcd08d897cd5b9ae9d09f5f8c70b2156b3f46e31c735327f1776c9b26f9f632", size = 104362768 },
+    { into = "", host = "linux-x86_64", url = "https://github.com/clice-io/xclang/releases/download/23.1.3.6/xclang-23.1.3.6-x86_64-unknown-linux-gnu.tar.xz", sha256 = "cdcb0975bfc7676f9d043c0fcee67ba00e700e6eed8bf2d9f6153def62c1316d", size = 103542468 },
+    { into = "", host = "macos-aarch64", url = "https://github.com/clice-io/xclang/releases/download/23.1.3.6/xclang-23.1.3.6-aarch64-apple-darwin.tar.xz", sha256 = "23c80ed7975bbdc94395ae82ed5dff0902439329b49763114b20a7e3c51044c2", size = 94443456 },
+    { into = "", host = "macos-x86_64", url = "https://github.com/clice-io/xclang/releases/download/23.1.3.6/xclang-23.1.3.6-x86_64-apple-darwin.tar.xz", sha256 = "77d4c3614c64bd1107629516fd990e895a1d208f3c5c9ee6d92b7d0253e8a551", size = 101862540 },
+]

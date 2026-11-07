@@ -16,6 +16,7 @@ pub mod share;
 mod shmem;
 #[cfg(any(windows, unix))]
 pub mod mcp;
+pub mod instance;
 pub mod isolation;
 #[cfg(any(windows, unix))]
 mod module;
@@ -32,5 +33,6 @@ pub mod util;
 pub mod __private;
 
 pub use audio::AudioIo;
-pub use params::{BoolParam, EnumParam, FloatParam, IntParam, ParamCell, ParamInfo, ParamKind, ParamSet};
+pub use instance::{InstanceHandle, InstanceId, Store, TrackInfo, instances, instances_of, instances_revision};
+pub use params::{BoolParam, EnumParam, FloatParam, IntParam, ParamCell, ParamInfo, ParamKind, ParamOptions, ParamSet};
 pub use plugin::{Context, NoteEvent, NoteKind, PluginInfo, PluginKind, Process, Quality, Setup, Tail};

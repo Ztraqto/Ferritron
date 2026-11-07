@@ -11,7 +11,7 @@
 //! The display language is the first of: `FERRITRON_LANGUAGE`, the per-plugin
 //! setting, the global setting (`<data dir>/Ferritron/settings.toml`), the OS
 //! language. Missing strings fall back along `ja-JP` -> `ja` -> `en` -> the
-//! name in the project file (`.frtx`).
+//! name in the project file (`.ferritroject`).
 
 use crate::{ParamInfo, ParamKind};
 use fluent_syntax::ast::{Entry, Expression, InlineExpression, PatternElement};

@@ -29,15 +29,24 @@
 //!
 //! All views of a process share one wgpu device. Edits go to the host as
 //! gestures (`begin` / `set` / `end`), so DAWs record them as automation.
+//!
+//! [`Ui::instance`] is the editor's plugin instance (identity, track, store,
+//! the other instances of the plugin); the editor is also redrawn when it
+//! changes, when instances come or go, and when another thread asks through
+//! a [`RedrawHandle`]. [`Ui::for_tests`] makes a `Ui` without a host or GPU,
+//! for unit tests of an editor's logic.
 
 // Linux has no GPU view yet: the shared code is unused there.
 #![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code, clippy::extra_unused_type_parameters))]
 
 use ferritron_core::__private::PluginMeta;
 use ferritron_core::abi::{ViewApi, ViewHost};
-use ferritron_core::{ParamInfo, ParamSet, Process};
-use std::cell::Cell;
+use ferritron_core::{InstanceHandle, InstanceId, ParamInfo, ParamSet, Process, TrackInfo};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use wgpu;
 
@@ -119,6 +128,45 @@ pub enum Input {
     Char(char),
     /// The editor gained or lost the keyboard focus.
     Focus(bool),
+    /// The mouse left the editor (no button held): hover effects end here.
+    Leave,
+}
+
+/// The shape of the mouse pointer over the editor ([`Ui::set_cursor`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Cursor {
+    #[default]
+    Arrow,
+    /// A pointing hand: something to click.
+    Hand,
+    /// An open hand: something to drag.
+    Grab,
+    /// A closed hand: dragging.
+    Grabbing,
+    /// A text cursor.
+    Text,
+    Crosshair,
+    /// Moves in every direction.
+    Move,
+    ResizeHorizontal,
+    ResizeVertical,
+    NotAllowed,
+    /// No pointer (while the editor draws its own).
+    Hidden,
+}
+
+/// Asks an editor to redraw from any thread ([`Ui::redraw_handle`]): for
+/// changes the editor cannot see in its own parameters, such as another
+/// instance moving. Cheap; several requests before the next frame make one
+/// redraw. Does nothing once the editor is closed.
+#[derive(Clone, Debug)]
+pub struct RedrawHandle(Arc<AtomicBool>);
+
+impl RedrawHandle {
+    pub fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// A key, by what it does rather than the layout under it.
@@ -160,7 +208,25 @@ pub struct Ui {
     messages: HashMap<String, String>,
     language: String,
     size: Cell<(f64, f64)>,
+    instance: Option<InstanceHandle>,
+    cursor: Cell<Cursor>,
+    redraw: Arc<AtomicBool>,
+    /// The parameter values of a `Ui` made by [`Ui::for_tests`].
+    test_values: Option<Box<TestValues>>,
 }
+
+/// Parameter values behind a test `Ui`, by ID (normalized).
+struct TestValues(RefCell<HashMap<u32, f64>>);
+
+unsafe extern "C" fn test_get(ctx: *mut c_void, id: u32) -> f64 {
+    unsafe { &*(ctx as *const TestValues) }.0.borrow().get(&id).copied().unwrap_or(0.0)
+}
+
+unsafe extern "C" fn test_set(ctx: *mut c_void, id: u32, normalized: f64) {
+    unsafe { &*(ctx as *const TestValues) }.0.borrow_mut().insert(id, normalized);
+}
+
+unsafe extern "C" fn test_gesture(_ctx: *mut c_void, _id: u32) {}
 
 impl Ui {
     pub(crate) fn new<P: Process + PluginMeta>(host: ViewHost, size: (f64, f64)) -> Self {
@@ -172,7 +238,92 @@ impl Ui {
             messages: localized.ui_messages().iter().cloned().collect(),
             language: localized.language.clone(),
             size: Cell::new(size),
+            // The shim's object for the instance is the view host's context.
+            instance: InstanceHandle::for_shim_ctx(host.ctx),
+            cursor: Cell::new(Cursor::Arrow),
+            redraw: Arc::new(AtomicBool::new(false)),
+            test_values: None,
         }
+    }
+
+    /// A `Ui` for unit tests of an editor's logic: no host, no window, no
+    /// GPU. Parameters start at their defaults; edits change them at once
+    /// (gestures are accepted and ignored). [`instance`](Self::instance) is
+    /// `None`.
+    ///
+    /// ```ignore
+    /// let ui = Ui::for_tests::<MyPlugin>(480.0, 240.0);
+    /// my_editor_logic.click(&ui, 10.0, 20.0);
+    /// assert_eq!(ui.value("gain"), -6.0);
+    /// ```
+    pub fn for_tests<P: Process + PluginMeta>(width: f64, height: f64) -> Self {
+        let values = Box::new(TestValues(RefCell::new(P::Params::infos().iter().map(|i| (i.id, i.normalize(i.default))).collect())));
+        let host = ViewHost {
+            ctx: &*values as *const TestValues as *mut c_void,
+            get_param: test_get,
+            begin_edit: test_gesture,
+            perform_edit: test_set,
+            end_edit: test_gesture,
+        };
+        let mut ui = Self::new::<P>(host, (width, height));
+        ui.instance = None;
+        ui.test_values = Some(values);
+        ui
+    }
+
+    /// Changes the size of a [`for_tests`](Self::for_tests) `Ui` (logical pixels).
+    pub fn resize_for_tests(&self, width: f64, height: f64) {
+        self.set_size(width, height);
+    }
+
+    /// The editor's plugin instance: its identity, track, store and the
+    /// other instances of the plugin ([`ferritron::instances`]). `None` when
+    /// the host links no instance to the editor (the editor in a process of
+    /// its own, hot reload, [`for_tests`](Self::for_tests)).
+    ///
+    /// [`ferritron::instances`]: ferritron_core::instances
+    pub fn instance(&self) -> Option<&InstanceHandle> {
+        self.instance.as_ref()
+    }
+
+    /// The instance's identity (see [`InstanceId`]).
+    pub fn instance_id(&self) -> Option<InstanceId> {
+        self.instance.as_ref().map(InstanceHandle::id)
+    }
+
+    /// The track the instance sits on, as far as the host says.
+    pub fn track(&self) -> TrackInfo {
+        self.instance.as_ref().map(InstanceHandle::track).unwrap_or_default()
+    }
+
+    /// The track's name, if the host says it.
+    pub fn track_name(&self) -> Option<String> {
+        self.track().name
+    }
+
+    /// Sets the mouse pointer's shape over the editor; it stays until set
+    /// again (typically from [`GpuEditor::input`] on `Move`).
+    pub fn set_cursor(&self, cursor: Cursor) {
+        self.cursor.set(cursor);
+    }
+
+    pub fn cursor(&self) -> Cursor {
+        self.cursor.get()
+    }
+
+    /// A handle another thread may use to ask for a redraw.
+    pub fn redraw_handle(&self) -> RedrawHandle {
+        RedrawHandle(self.redraw.clone())
+    }
+
+    /// Asks for a redraw at the next tick (on the UI thread).
+    pub fn request_redraw(&self) {
+        self.redraw.store(true, Ordering::Release);
+    }
+
+    /// Takes a pending redraw request.
+    pub(crate) fn take_redraw(&self) -> bool {
+        self.redraw.swap(false, Ordering::AcqRel)
     }
 
     fn info(&self, key: &str) -> Option<(usize, &'static ParamInfo)> {

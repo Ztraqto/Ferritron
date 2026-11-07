@@ -190,8 +190,11 @@ class Plugin;
    the main thread: on Windows by a timer that lives while plugins do, on
    macOS through the main dispatch queue. */
 namespace host_edits {
+// FERRITRON_EDIT_BEGIN / PERFORM / END, or ONE_SHOT for all three (ferritron.host.v1).
+constexpr uint32_t ONE_SHOT = 0xFFFFFFFFu;
 struct Edit {
 	Plugin* plugin;
+	uint32_t kind;
 	uint32_t id;
 	double normalized;
 };
@@ -205,7 +208,8 @@ void CALLBACK tick(HWND, UINT, UINT_PTR, DWORD);
 #if defined(_WIN32) || defined(__APPLE__)
 void drain(void*);
 #endif
-void deliver(Plugin* plugin, uint32_t id, double normalized);
+void deliver(Plugin* plugin, uint32_t kind, uint32_t id, double normalized);
+void push(Plugin* plugin, uint32_t kind, uint32_t id, double normalized);
 } // namespace host_edits
 
 class Editor;
@@ -233,19 +237,18 @@ public:
 	Plugin(const ferritron_plugin_api* api, void* core)
 	: api(api), core(core), instrument(api->info->kind == FERRITRON_PLUGIN_INSTRUMENT) {
 		link = static_cast<const ferritron_host_api*>(api->get_extension(FERRITRON_EXT_HOST));
-		if (link) {
+		track = static_cast<const ferritron_track_api*>(api->get_extension(FERRITRON_EXT_TRACK));
+		// Edits the plugin makes by itself; ctx is `this`, as for the editor's view host.
+		if (auto* link2 = static_cast<const ferritron_host_api2*>(api->get_extension(FERRITRON_EXT_HOST2))) {
+			ferritron_host_callbacks2 callbacks{
+			    this,
+			    [](void* ctx, uint32_t kind, uint32_t id, double value) { host_edits::push(static_cast<Plugin*>(ctx), kind, id, value); },
+			    nullptr, // VST3 hosts keep calling process
+			};
+			link2->attach(core, &callbacks);
+		} else if (link) {
 			ferritron_host_callbacks callbacks{this, [](void* ctx, uint32_t id, double value) {
-				                                   std::lock_guard<std::mutex> guard(host_edits::lock);
-				                                   host_edits::queue.push_back({static_cast<Plugin*>(ctx), id, value});
-#if defined(__APPLE__)
-				                                   if (host_edits::queue.size() == 1)
-					                                   dispatch_async_f(dispatch_get_main_queue(), nullptr, host_edits::drain);
-#elif !defined(_WIN32)
-				                                   // No main-thread timer here yet: deliver right away.
-				                                   for (auto& e : host_edits::queue)
-					                                   host_edits::deliver(e.plugin, e.id, e.normalized);
-				                                   host_edits::queue.clear();
-#endif
+				                                   host_edits::push(static_cast<Plugin*>(ctx), host_edits::ONE_SHOT, id, value);
 			                                   }};
 			link->attach(core, &callbacks);
 		}
@@ -278,9 +281,10 @@ public:
 
 	// ChannelContext::IInfoListener: the track the plugin sits on.
 	tresult PLUGIN_API setChannelContextInfos(IAttributeList* list) override {
-		String128 name{};
-		if (!link || !list || list->getString(ChannelContext::kChannelNameKey, name, sizeof(name)) != kResultOk)
+		if (!list || (!link && !track))
 			return kResultOk;
+		String128 name{};
+		bool hasName = list->getString(ChannelContext::kChannelNameKey, name, sizeof(name)) == kResultOk;
 		char utf8[512];
 		int len = 0;
 		for (int i = 0; name[i] && len < static_cast<int>(sizeof(utf8)) - 4; ++i) {
@@ -303,17 +307,43 @@ public:
 				utf8[len++] = static_cast<char>(0x80 | (c & 0x3F));
 			}
 		}
-		link->set_track_name(core, ferritron_str{utf8, static_cast<uint32_t>(len)});
+		if (!hasName)
+			len = 0;
+		if (track) {
+			ferritron_track_info info{};
+			info.name = ferritron_str{utf8, static_cast<uint32_t>(len)};
+			if (hasName)
+				info.flags |= FERRITRON_TRACK_HAS_NAME;
+			int64 color = 0;
+			if (list->getInt(ChannelContext::kChannelColorKey, color) == kResultOk) {
+				auto spec = static_cast<ChannelContext::ColorSpec>(color);
+				info.color[0] = ChannelContext::GetRed(spec);
+				info.color[1] = ChannelContext::GetGreen(spec);
+				info.color[2] = ChannelContext::GetBlue(spec);
+				info.flags |= FERRITRON_TRACK_HAS_COLOR;
+			}
+			int64 index = 0;
+			if (list->getInt(ChannelContext::kChannelIndexKey, index) == kResultOk && index >= 1) {
+				info.index = static_cast<uint32_t>(index - 1); // VST3 counts from 1
+				info.flags |= FERRITRON_TRACK_HAS_INDEX;
+			}
+			track->set_track_info(core, &info);
+		} else if (hasName) {
+			link->set_track_name(core, ferritron_str{utf8, static_cast<uint32_t>(len)});
+		}
 		return kResultOk;
 	}
 
 	// An edit the plugin made by itself, on the main thread.
-	void hostEdited(uint32_t id, double normalized) {
+	void hostEdited(uint32_t kind, uint32_t id, double normalized) {
 		if (!handler)
 			return;
-		handler->beginEdit(id);
-		handler->performEdit(id, normalized);
-		handler->endEdit(id);
+		if (kind == host_edits::ONE_SHOT || kind == FERRITRON_EDIT_BEGIN)
+			handler->beginEdit(id);
+		if (kind == host_edits::ONE_SHOT || kind == FERRITRON_EDIT_PERFORM)
+			handler->performEdit(id, normalized);
+		if (kind == host_edits::ONE_SHOT || kind == FERRITRON_EDIT_END)
+			handler->endEdit(id);
 	}
 
 	// FUnknown
@@ -661,6 +691,8 @@ public:
 			out.flags |= ParameterInfo::kIsList;
 		if (info.flags & FERRITRON_PARAM_BYPASS)
 			out.flags |= ParameterInfo::kIsBypass;
+		if (info.flags & FERRITRON_PARAM_HIDDEN)
+			out.flags |= ParameterInfo::kIsHidden;
 		return kResultOk;
 	}
 
@@ -742,6 +774,7 @@ private:
 	std::atomic<uint32> refs{1};
 	IComponentHandler* handler = nullptr;
 	const ferritron_host_api* link = nullptr;
+	const ferritron_track_api* track = nullptr;
 	SampleRate sampleRate = 44100.0;
 	int32 maxBlockSize = 1024;
 	uint32 latency = 0;
@@ -754,7 +787,22 @@ private:
 // host are physical pixels: the logical size times the scale factor, which is
 // the host's (IPlugViewContentScaleSupport) or else the window's DPI.
 namespace host_edits {
-void deliver(Plugin* plugin, uint32_t id, double normalized) { plugin->hostEdited(id, normalized); }
+void deliver(Plugin* plugin, uint32_t kind, uint32_t id, double normalized) { plugin->hostEdited(kind, id, normalized); }
+
+// Any thread: queued, then handed to the host on the main thread in order.
+void push(Plugin* plugin, uint32_t kind, uint32_t id, double normalized) {
+	std::lock_guard<std::mutex> guard(lock);
+	queue.push_back({plugin, kind, id, normalized});
+#if defined(__APPLE__)
+	if (queue.size() == 1)
+		dispatch_async_f(dispatch_get_main_queue(), nullptr, drain);
+#elif !defined(_WIN32)
+	// No main-thread timer here yet: deliver right away.
+	for (auto& e : queue)
+		deliver(e.plugin, e.kind, e.id, e.normalized);
+	queue.clear();
+#endif
+}
 #ifdef _WIN32
 void CALLBACK tick(HWND, UINT, UINT_PTR, DWORD) {
 	drain(nullptr);
@@ -769,7 +817,7 @@ void drain(void*) {
 	}
 	for (auto& e : pending) {
 		// A plugin destroyed meanwhile removed its edits from the queue under the lock.
-		deliver(e.plugin, e.id, e.normalized);
+		deliver(e.plugin, e.kind, e.id, e.normalized);
 	}
 }
 #endif

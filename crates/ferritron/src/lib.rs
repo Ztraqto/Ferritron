@@ -15,12 +15,12 @@
 //! }
 //! ```
 //!
-//! Parameters and plugin metadata live in the project file, `<name>.frtx`, next to `Cargo.toml`.
+//! Parameters and plugin metadata live in the project file, `<name>.ferritroject` (`.frtx` before 1.2), next to `Cargo.toml`.
 
 pub use ferritron_core::*;
 pub use ferritron_macros::plugin;
 
-/// The Ferritron version this plugin is built with (e.g. `"1.1.0"`).
+/// The Ferritron version this plugin is built with (e.g. `"1.2.0"`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Plugin formats. Linking a format crate is all it takes to export that
@@ -51,7 +51,7 @@ macro_rules! __require_web {
 macro_rules! __require_web {
     () => {
         ::core::compile_error!(
-            "the project file (.frtx) declares a web [view]; enable the `web` feature: ferritron = { ..., features = [\"web\"] }"
+            "the project file (.ferritroject) declares a web [view]; enable the `web` feature: ferritron = { ..., features = [\"web\"] }"
         );
     };
 }
@@ -73,7 +73,7 @@ macro_rules! __require_gpu_view {
 macro_rules! __require_gpu_view {
     () => {
         ::core::compile_error!(
-            "the project file (.frtx) declares a gpu [view]; enable the `gpu-view` feature: ferritron = { ..., features = [\"gpu-view\"] }"
+            "the project file (.ferritroject) declares a gpu [view]; enable the `gpu-view` feature: ferritron = { ..., features = [\"gpu-view\"] }"
         );
     };
 }
@@ -95,7 +95,7 @@ macro_rules! __require_ara {
 macro_rules! __require_ara {
     () => {
         ::core::compile_error!(
-            "the project file (.frtx) declares [ara]; enable the `ara` feature: ferritron = { ..., features = [\"ara\"] }"
+            "the project file (.ferritroject) declares [ara]; enable the `ara` feature: ferritron = { ..., features = [\"ara\"] }"
         );
     };
 }

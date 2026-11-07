@@ -1,6 +1,6 @@
 # Ferritron アーキテクチャ設計書
 
-> ステータス: **確定 v1.39**（2026-11-07）／ Ferritron **1.1.0**
+> ステータス: **確定 v1.41**（2026-11-07）／ Ferritron **1.2.0**
 > 以降の変更は第17章「改訂履歴」に記録し、バージョンを上げて行う。
 > コードネーム: ProjectRvst / 正式名称: **Ferritron**
 
@@ -219,7 +219,8 @@ CLAP は最も新しく、イベント、パラメータ、スレッドモデル
 **Ferritron は各形式の公式 SDK（VST3 SDK、CLAP、AAX SDK など）を同梱しない。** Ferritron が提供するのは、開発者が用意した SDK に対してビルドされる**アダプタ（Format Shim）のみ**である。
 
 - 開発者は SDK の配布元から直接入手し、そのライセンスに同意する（AAX のように NDA が必要なものも同じ扱い）
-- アダプタは SDK の場所を環境変数で受け取る（VST3 なら `VST3_SDK_DIR`）。未設定の場合は、入手先と設定方法を示すエラーでビルドを止める
+- アダプタは SDK の場所を `ferritron-build` の規則（D38）で決める：プロジェクトの `[sdk]` の固定バージョン、`sdk.toml` の `source`、環境変数（VST3 なら `VST3_SDK_DIR`）、Ferritron の管理フォルダ。見つからない場合は、探した場所と入手・設定の方法を示すエラーでビルドを止める
+- `cargo ferritron sdk fetch` と Editor は、利用者が SDK ごとのライセンスに同意したときだけ、配布元から直接取得する（一括同意はしない。同意は `sdk-consent.toml` に記録）
 - リポジトリには SDK のヘッダーや、SDK から書き写したインターフェース定義・IID を含めない
 - シムは C ABI（`ferritron_abi.h`）だけを通してプラグイン本体と話すため、SDK に触れるのはシムだけである
 
@@ -329,9 +330,9 @@ Tier は**言語から自動で決まる**ため、通常は開発者が書く�
 | C# | NativeAOT の `UnmanagedCallersOnly` で ABI を実装する。オーディオスレッドでのアロケーションを検出するアナライザを提供する |
 | Python | ① 開発モード: Tier C として実行。② 将来: `@ferritron.kernel` で書いた DSP を Slang（9.11）へトランスパイルし Tier A 化する |
 
-### 5.4 マニフェスト（プロジェクトファイル `<名前>.frtx`）
+### 5.4 マニフェスト（プロジェクトファイル `<名前>.ferritroject`）
 
-プラグインの設定はすべて、`Cargo.toml` の隣に置くプロジェクトファイル `<名前>.frtx`（中身は TOML）1 つに書く。JUCE の `.jucer` に当たり、Ferritron Editor はこのファイルを開く。マクロ・CLI・エディタは `ferritron_manifest::locate` で同じ規則で探す：フォルダに `.frtx` が 1 つならそれ、なければ旧名の `ferritron.toml`、2 つ以上ならエラー。
+プラグインの設定はすべて、`Cargo.toml` の隣に置くプロジェクトファイル `<名前>.ferritroject`（中身は TOML。1.1 までの `<名前>.frtx` も読む）1 つに書く。JUCE の `.jucer` に当たり、Ferritron Editor はこのファイルを開く。マクロ・CLI・エディタは `ferritron_manifest::locate` で同じ規則で探す：フォルダに `.ferritroject` か `.frtx` が 1 つならそれ、なければ旧名の `ferritron.toml`、2 つ以上（両方の拡張子が並ぶ場合も）ならエラー。
 
 ```toml
 [plugin]                     # 必須はこのセクションだけ
@@ -1020,6 +1021,8 @@ V3（実測）：一般的な 1 GbE / 2.5 GbE / Wi-Fi での往復時間と揺�
 | D35 | 音質の段階 | `Quality::Normal` / `Best` の 2 段階（`non_exhaustive` で将来追加可）。自動はオフラインレンダリングで Best。手動のスイッチは `[quality]` を書いたプラグインだけ（使わないプラグインに意味のないパラメータを増やさない） | 12.1 |
 | D36 | Web エディタの事前起動 | 既定で有効（`[view] preload = false` で無効）。インスタンスがある間はブラウザプロセスを常駐させる（メモリと引き換えに表示を速くする）。右クリックの既定メニューは JavaScript で抑止し、ページの `contextmenu` は届ける | 6.4 / 12.1 |
 | D37 | 公開範囲 | フレームワーク（コア、形式アダプタ、`cargo ferritron`、ツール、サンプル）は MIT / Apache-2.0 の二重ライセンスで公開する。Ferritron Editor（プロジェクトのロックを含む）はクローズドソースとし、リリースで配布する。新規プロジェクトのテンプレートは公開側の `ferritron-manifest` に置き、プロジェクトが依存する本体は実行時に探す（`FERRITRON_HOME`、なければ実行ファイルの上のフォルダ。スターターキットでは `bin/` の隣の `ferritron/`） | 15.1 |
+| D38 | SDK の場所 | 解決の規則を公開側の `ferritron-build` に 1 つだけ置く：プロジェクトの `[sdk]` で固定したバージョン → `sdk.toml` の `source`（auto / env / managed / path）→ 見つからなければ探した場所を並べて止める。管理フォルダは `<root>/<id>/<version>`（Windows は `C:\Ferritron\SDK`、ほかは `~/Ferritron/SDK`）。取得は `cargo ferritron sdk fetch`（公開）と Editor で行い、SDK ごとにライセンスを表示して同意を得てから配布元から直接取得する。カタログ（`sdk-catalog.toml`）は SHA-256 かタグのコミットで検証する | 3.1 |
+| D39 | macOS のビルド | 最低 OS は 13.0（xclang に合わせる）。Mac ではネイティブ、Windows / Linux からは任意で xclang を使う（Apple の macOS SDK は利用者の判断で xclang が取得）。配布物の正式な経路は Mac と CI。署名は Mac で codesign、ほかでは rcodesign があれば使う。公証は `cargo ferritron notarize`（Mac） | 3.2 |
 
 ### 16.2 残る事項
 
@@ -1078,3 +1081,5 @@ V3（実測）：一般的な 1 GbE / 2.5 GbE / Wi-Fi での往復時間と揺�
 | v1.37 | 2026-11-07 | Ferritron 1.0.1：リファクタリング（GPU エディタの `Canvas`、GPU スレッドの共通バッチャー、Win32 宣言の一本化、ビルドスクリプト用の `ferritron-build`）。全クレート共通のバージョン番号と `CHANGELOG.md`、`ferritron::VERSION`、`cargo ferritron --version` を追加。API・ABI・保存データの変更なし |
 | v1.38 | 2026-11-07 | Ferritron 1.1.0：動的パフォーマンス（無音時のスリープ、書き出し時の音質）、Web エディタの事前起動と右クリックメニューの抑止、Wasm のコンパイルキャッシュ、GPU の起動短縮（12.1、D34〜D36） |
 | v1.39 | 2026-11-07 | オープンソース化：公開範囲を決定（D37）。Ferritron Editor とプロジェクトのロックをクローズドソースにし、テンプレートを `ferritron-manifest` に移動。リリースの配布物（本体、Editor、スターターキット） |
+| v1.40 | 2026-11-07 | Ferritron 1.2.0：インスタンスハンドル（ID、トラック情報、通知つき編集、Wake、ストア、Web メッセージ、インスタンス一覧）、`hidden` / `automatable`、プロジェクトファイルの既定の拡張子を `.ferritroject` に（`.frtx` も読む）。C ABI に `ferritron.host.v2` と `ferritron.track.v1`。FDE（拡張開発キット）は作らないと決定：本体はソース配布なので、拡張は crate と公開フックで足りる |
+| v1.41 | 2026-11-07 | Ferritron 1.2.0：SDK の解決規則と管理フォルダ（D38）、`cargo ferritron sdk`、`--target` と xclang によるクロスビルド、公証、macOS の CI（D39）。Editor の SDK 設定・更新確認・自動アップデートと Inno Setup 版スターターキット |

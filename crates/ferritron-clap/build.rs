@@ -1,20 +1,13 @@
 //! Compiles the CLAP shim against the developer's own copy of the CLAP headers.
 //!
-//! Ferritron does not ship the CLAP SDK. Download it and point `CLAP_SDK_DIR`
-//! at the folder that contains `include/clap/clap.h`.
+//! Ferritron does not ship the CLAP SDK: it is found by Ferritron's rule
+//! (`ferritron_build::sdk`: `CLAP_SDK_DIR`, `sdk.toml`, the managed folder).
 
-const HELP: &str = "\
-Ferritron does not include the CLAP SDK; please provide your own copy.
-  1. Download it from https://github.com/free-audio/clap and accept its license.
-  2. Set CLAP_SDK_DIR to the SDK folder (the one containing `include/clap/clap.h`),
-     e.g. in your project's .cargo/config.toml:
-         [env]
-         CLAP_SDK_DIR = \"C:/SDKs/clap\"
-  Or build without CLAP: ferritron = { ..., default-features = false, features = [\"vst3\"] }";
+const HINT: &str = "Or build without CLAP: ferritron = { ..., default-features = false, features = [\"vst3\"] }";
 
 fn main() {
     ferritron_build::rerun_if_changed(["shim/clap_shim.c"]);
-    let include = ferritron_build::sdk_dir("CLAP_SDK_DIR", &["include/clap/clap.h"], HELP).join("include");
+    let include = ferritron_build::sdk_with_hint("clap", HINT).join("include");
     // The CLAP version the shim is compiled against, for clap_entry (Rust).
     let version = std::fs::read_to_string(include.join("clap/version.h")).unwrap_or_default();
     for part in ["MAJOR", "MINOR", "REVISION"] {

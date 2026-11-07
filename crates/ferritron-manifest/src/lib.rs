@@ -1,4 +1,4 @@
-//! The project file, `<name>.frtx` (TOML inside): where to find it, its
+//! The project file, `<name>.ferritroject` (TOML inside; `<name>.frtx` before 1.2): where to find it, its
 //! types, parsing and validation. Shared by the `#[ferritron::plugin]` macro
 //! (which generates code from it) and by the Ferritron Editor (which edits
 //! it), so both apply the same rules.
@@ -91,20 +91,33 @@ pub fn syntax_error(text: &str, e: &toml::de::Error) -> Error {
     error!("toml-syntax", "line {$line}, column {$column}: {$detail}", line = line, column = column, detail = e.message())
 }
 
-/// Extension of project files.
-pub const EXTENSION: &str = "frtx";
+/// Extension of project files: what new projects get.
+pub const EXTENSION: &str = "ferritroject";
 
-/// The project file's former name, still read when there is no `.frtx`.
+/// The extension project files had before 1.2: still read everywhere.
+pub const OLD_EXTENSION: &str = "frtx";
+
+/// Every extension a project file may have, the default first.
+pub const EXTENSIONS: [&str; 2] = [EXTENSION, OLD_EXTENSION];
+
+/// The project file's former name, still read when there is no project file.
 pub const LEGACY_NAME: &str = "ferritron.toml";
 
+/// Whether `path` is named like a project file (`.ferritroject` or `.frtx`).
+pub fn is_project_file(path: &Path) -> bool {
+    path.extension().is_some_and(|e| EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
 /// The project file of the package in `dir` (the folder of its
-/// `Cargo.toml`): its one `*.frtx` file, or else `ferritron.toml`.
+/// `Cargo.toml`): its one `*.ferritroject` or `*.frtx` file, or else
+/// `ferritron.toml`. Two project files (say `a.ferritroject` and `a.frtx`)
+/// are an error: which one the build used would not be clear.
 pub fn locate(dir: &Path) -> Result<PathBuf, Error> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| error!("folder-unreadable", "cannot read {$path}: {$detail}", path = dir.display(), detail = e))?
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION)))
+        .filter(|path| path.is_file() && is_project_file(path))
         .collect();
     match found.len() {
         1 => Ok(found.remove(0)),
@@ -147,7 +160,14 @@ pub struct Manifest {
     /// Audio Unit codes (`[au]`, with defaults), used when the plugin is
     /// packaged as an AU on macOS.
     pub au: AuCodes,
+    /// `[sdk]`: SDK versions pinned for this project (`vst3 = "3.8.1"`), by
+    /// SDK id. `cargo ferritron bundle` builds with exactly these versions
+    /// from Ferritron's SDK folder.
+    pub sdk: std::collections::BTreeMap<String, String>,
 }
+
+/// The SDK ids `[sdk]` may pin.
+pub const SDK_IDS: [&str; 4] = ["vst3", "clap", "ara", "xclang"];
 
 /// The three codes an Audio Unit is registered with (`AudioComponentDescription`).
 #[derive(Clone, Debug, PartialEq)]
@@ -252,6 +272,10 @@ pub struct Param {
     pub unit: String,
     pub kind: Kind,
     pub default: f64,
+    /// `automatable = false`: hosts do not offer it for automation.
+    pub automatable: bool,
+    /// `hidden = true`: hosts do not list it (the plugin's editor may still show it).
+    pub hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -264,7 +288,16 @@ pub enum Kind {
 
 pub fn parse(text: &str) -> Result<Manifest, Error> {
     let root: Table = text.parse().map_err(|e: toml::de::Error| syntax_error(text, &e))?;
-    reject_unknown(&root, "", &["plugin", "params", "view", "isolation", "mcp", "quality", "ara", "au"])?;
+    reject_unknown(&root, "", &["plugin", "params", "view", "isolation", "mcp", "quality", "ara", "au", "sdk"])?;
+    let mut sdk = std::collections::BTreeMap::new();
+    if let Some(v) = root.get("sdk") {
+        let t = v.as_table().ok_or_else(|| not_table("[sdk]"))?;
+        reject_unknown(t, "sdk.", &SDK_IDS)?;
+        for (id, version) in t {
+            let version = version.as_str().filter(|v| !v.trim().is_empty()).ok_or_else(|| not_string(&format!("sdk.{id}")))?;
+            sdk.insert(id.clone(), version.trim().to_string());
+        }
+    }
     let ara = match root.get("ara") {
         None => false,
         Some(v) => {
@@ -387,6 +420,7 @@ pub fn parse(text: &str) -> Result<Manifest, Error> {
         id,
         params,
         au,
+        sdk,
     })
 }
 
@@ -398,7 +432,15 @@ fn parse_param(key: &str, value: &Value) -> Result<Param, Error> {
         return Err(error!("bad-param-key", "{$key}: parameter keys must be snake_case identifiers (lowercase letters, digits and _)", key = key));
     }
     let t = value.as_table().ok_or_else(|| not_table(&at))?;
-    reject_unknown(t, &format!("{at}."), &["type", "name", "unit", "range", "default", "choices"])?;
+    reject_unknown(t, &format!("{at}."), &["type", "name", "unit", "range", "default", "choices", "automatable", "hidden"])?;
+    let flag = |name: &str, default: bool| -> Result<bool, Error> {
+        match t.get(name) {
+            None => Ok(default),
+            Some(v) => v.as_bool().ok_or_else(|| not_bool(&format!("{at}.{name}"))),
+        }
+    };
+    let automatable = flag("automatable", true)?;
+    let hidden = flag("hidden", false)?;
 
     let ty = t.get("type").and_then(Value::as_str).ok_or_else(|| required(&format!("{at}.type")))?;
     let name = match t.get("name") {
@@ -470,7 +512,7 @@ fn parse_param(key: &str, value: &Value) -> Result<Param, Error> {
     if !(lo..=hi).contains(&default) {
         return Err(error!("default-out-of-range", "{$at} must be inside the range", at = format!("{at}.default")));
     }
-    Ok(Param { key: key.to_string(), name, unit, kind, default })
+    Ok(Param { key: key.to_string(), name, unit, kind, default, automatable, hidden })
 }
 
 fn range<T: PartialOrd + Copy>(t: &Table, at: &str, get: impl Fn(&Value) -> Option<T>) -> Result<(T, T), Error> {
@@ -570,10 +612,47 @@ mod tests {
         std::fs::write(dir.join(LEGACY_NAME), GAIN).unwrap();
         assert_eq!(locate(&dir).unwrap(), dir.join(LEGACY_NAME));
         std::fs::write(dir.join("gain.frtx"), GAIN).unwrap();
-        assert_eq!(locate(&dir).unwrap(), dir.join("gain.frtx"), ".frtx wins over the legacy name");
-        std::fs::write(dir.join("other.frtx"), GAIN).unwrap();
+        assert_eq!(locate(&dir).unwrap(), dir.join("gain.frtx"), ".frtx (before 1.2) wins over the legacy name");
+        std::fs::remove_file(dir.join("gain.frtx")).unwrap();
+        std::fs::write(dir.join("gain.ferritroject"), GAIN).unwrap();
+        assert_eq!(locate(&dir).unwrap(), dir.join("gain.ferritroject"));
+        // Both extensions at once: the build would not know which.
+        std::fs::write(dir.join("gain.frtx"), GAIN).unwrap();
+        let both = locate(&dir).unwrap_err().to_string();
+        assert!(both.contains("several project files") && both.contains("gain.ferritroject") && both.contains("gain.frtx"), "{both}");
+        std::fs::remove_file(dir.join("gain.frtx")).unwrap();
+        std::fs::write(dir.join("other.ferritroject"), GAIN).unwrap();
         assert!(locate(&dir).unwrap_err().to_string().contains("several project files"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sdk_versions_may_be_pinned() {
+        let m = parse(&format!("{GAIN}
+[sdk]
+vst3 = \"3.8.1\"
+clap = \"1.2.10\"")).unwrap();
+        assert_eq!(m.sdk.get("vst3").map(String::as_str), Some("3.8.1"));
+        assert_eq!(m.sdk.len(), 2);
+        assert!(parse(GAIN).unwrap().sdk.is_empty());
+        assert_eq!(parse(&format!("{GAIN}
+[sdk]
+aax = \"1\"")).err().unwrap().code, "unknown-key");
+        assert_eq!(parse(&format!("{GAIN}
+[sdk]
+vst3 = 3")).err().unwrap().code, "not-string");
+    }
+
+    #[test]
+    fn parameters_may_be_hidden_or_not_automatable() {
+        let text = format!("{GAIN}").replace("[params]", "[params]
+link = { type = \"int\", range = [0, 100], automatable = false, hidden = true }");
+        let m = parse(&text).unwrap();
+        let link = m.params.iter().find(|p| p.key == "link").unwrap();
+        assert!(!link.automatable && link.hidden);
+        assert!(m.params.iter().filter(|p| p.key != "link").all(|p| p.automatable && !p.hidden), "defaults");
+        let bad = text.replace("hidden = true", "hidden = \"yes\"");
+        assert_eq!(parse(&bad).err().unwrap().code, "not-bool");
     }
 
     #[test]

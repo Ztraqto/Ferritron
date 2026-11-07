@@ -4,7 +4,7 @@
 //! editor): Up/Right and Down/Left change it by 1 dB (Shift: 0.1 dB), Home
 //! resets it, and typing a number then Enter sets it (Escape cancels).
 
-use ferritron::gpu_view::{Frame, Gpu, GpuEditor, Input, Key, Modifiers, Ui, wgpu};
+use ferritron::gpu_view::{Cursor, Frame, Gpu, GpuEditor, Input, Key, Modifiers, Ui, wgpu};
 use ferritron::prelude::*;
 
 #[derive(Default)]
@@ -166,6 +166,7 @@ impl GpuEditor for Editor {
             }
             Input::Move { x, y } => {
                 let hover = (y / ui.height() - 0.5).abs() < 0.12;
+                ui.set_cursor(if self.dragging { Cursor::ResizeHorizontal } else if hover { Cursor::Hand } else { Cursor::Arrow });
                 if self.dragging {
                     ui.set_normalized("gain", Self::at(x, ui));
                 } else if hover == self.hover {
@@ -173,6 +174,8 @@ impl GpuEditor for Editor {
                 }
                 self.hover = hover;
             }
+            // The highlight ends when the mouse leaves the editor.
+            Input::Leave if self.hover => self.hover = false,
             Input::Release { .. } if self.dragging => {
                 self.dragging = false;
                 ui.end("gain");
@@ -182,5 +185,23 @@ impl GpuEditor for Editor {
             _ => return false,
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Editor logic runs against a `Ui` without host or GPU.
+    #[test]
+    fn a_test_ui_keeps_edits_and_the_cursor() {
+        let ui = Ui::for_tests::<GpuGain>(400.0, 200.0);
+        assert_eq!(ui.value("gain"), 0.0);
+        assert!((Editor::at(200.0, &ui) - 0.5).abs() < 0.1);
+        ui.edit_normalized("gain", Editor::at(400.0, &ui));
+        assert_eq!(ui.value("gain"), 12.0);
+        ui.set_cursor(Cursor::Hand);
+        assert_eq!(ui.cursor(), Cursor::Hand);
+        assert!(ui.instance().is_none());
     }
 }

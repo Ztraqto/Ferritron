@@ -6,7 +6,7 @@ use std::process::Command;
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let guest = out.join("guest.wasm");
-    for path in ["../wasm-crusher/src/lib.rs", "../wasm-crusher/wasm-crusher.frtx", "../wasm-crusher/Cargo.toml"] {
+    for path in ["../wasm-crusher/src/lib.rs", "../wasm-crusher/wasm-crusher.ferritroject", "../wasm-crusher/Cargo.toml"] {
         println!("cargo::rerun-if-changed={path}");
     }
     // A separate target directory: the outer build holds the lock on the main one.
