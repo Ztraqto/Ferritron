@@ -1,0 +1,21 @@
+[package]
+name = "ferritron-web"
+description = "Web (HTML/JS) view backend of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ferritron-core.workspace = true
+
+# WebView2 (Windows) and WKWebView (macOS); on Linux plugins build without an editor for now.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+wry = { version = "0.57", default-features = false, features = ["os-webview"] }
+raw-window-handle = "0.6"
+
+# The shared WebView2 environment (the versions wry uses).
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Com", "Win32_UI_WindowsAndMessaging"] }

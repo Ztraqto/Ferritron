@@ -1,0 +1,7 @@
+[plugin]
+id     = "dev.ferritron.examples.gpu-reverb"
+name   = "Ferritron GPU Reverb"
+vendor = "Ztraqto"
+
+[params]
+mix = { type = "float", range = [0, 100], default = 30, unit = "%" }

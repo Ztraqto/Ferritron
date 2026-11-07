@@ -1,0 +1,3 @@
+[alias]
+# `cargo ferritron bundle <package>` builds a plugin and packages it as a .vst3 bundle.
+ferritron = "run --quiet --package ferritron-cli --"

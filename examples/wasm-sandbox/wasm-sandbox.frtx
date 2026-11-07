@@ -1,0 +1,5 @@
+# Read by `cargo ferritron bundle`; the plugin itself is the WebAssembly
+# guest built from examples/wasm-crusher.
+[plugin]
+id   = "dev.ferritron.examples.wasm-crusher"
+name = "Ferritron Sandboxed Crusher"

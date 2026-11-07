@@ -1,0 +1,16 @@
+[plugin]
+id     = "dev.ferritron.examples.gpu-view"
+name   = "Ferritron GPU View"
+vendor = "Ztraqto"
+
+[params]
+gain = { type = "float", range = [-60, 12], default = 0, unit = "dB" }
+
+# The editor is drawn with wgpu by the `Editor` type in src/lib.rs.
+[view]
+backend   = "gpu"
+editor    = "Editor"
+size      = [480, 240]
+resizable = true
+min_size  = [240, 120]
+max_size  = [1600, 800]

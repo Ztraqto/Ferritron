@@ -1,0 +1,13 @@
+[package]
+name = "crash-fixture"
+description = "Test plugin that crashes on demand, for checking process isolation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron.workspace = true

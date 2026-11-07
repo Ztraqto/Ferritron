@@ -1,0 +1,14 @@
+[package]
+name = "gpu-chain"
+description = "Ferritron Chain example: modules in one graph, fused across their borders into one GPU round trip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron.workspace = true
+ferritron-gpu.workspace = true

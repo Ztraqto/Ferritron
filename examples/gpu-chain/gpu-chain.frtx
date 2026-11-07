@@ -1,0 +1,8 @@
+[plugin]
+id     = "dev.ferritron.examples.gpu-chain"
+name   = "Ferritron Chain"
+vendor = "Ztraqto"
+
+[params]
+tone   = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+volume = { type = "float", range = [-48, 6], default = -12, unit = "dB" }

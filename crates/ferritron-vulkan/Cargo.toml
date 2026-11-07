@@ -1,0 +1,14 @@
+[package]
+name = "ferritron-vulkan"
+description = "Native Vulkan backend of Ferritron: persistent kernels, Tensor cores (cooperative matrices) and RT cores (ray queries)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Loads the system's Vulkan loader at run time: no Vulkan SDK needed to build.
+ash = { version = "0.38", features = ["loaded"] }
+# f16 weights and samples for Tensor cores.
+half = "2"

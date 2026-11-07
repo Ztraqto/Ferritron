@@ -1,0 +1,8 @@
+[plugin]
+id     = "dev.ferritron.examples.slang-drive"
+name   = "Ferritron Slang Drive"
+vendor = "Ztraqto"
+
+[params]
+drive  = { type = "float", range = [0, 36], default = 12, unit = "dB" }
+output = { type = "float", range = [-24, 0], default = -6, unit = "dB" }

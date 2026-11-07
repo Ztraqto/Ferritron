@@ -1,0 +1,17 @@
+[package]
+name = "slang-drive"
+description = "Ferritron Slang example: a saturator whose kernel is written once in Slang for the CPU and the GPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron.workspace = true
+ferritron-gpu.workspace = true
+
+[build-dependencies]
+ferritron-slang.workspace = true

@@ -1,0 +1,37 @@
+[package]
+name = "ferritron-vst3"
+description = "VST3 format adapter of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# Links against `ferritron_plugin_entry`, which only plugin crates define.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ferritron-core.workspace = true
+
+[build-dependencies]
+cc = "1"
+ferritron-build.workspace = true
+
+# How `cargo ferritron bundle` packages this format. Any format crate can
+# declare this; the CLI has no format-specific code.
+[package.metadata.ferritron.format]
+name = "VST3"
+entry-symbol = "GetPluginFactory"
+root = "{name}.vst3"
+binary = "{name}.vst3/Contents/{arch}/{name}.{ext}"
+ext = { windows = "vst3", linux = "so" }
+arch = { windows-x86_64 = "x86_64-win", windows-aarch64 = "arm64-win", linux-x86_64 = "x86_64-linux", linux-aarch64 = "aarch64-linux" }
+install = { windows = "{COMMONPROGRAMFILES}/VST3", linux = "{HOME}/.vst3", macos = "{HOME}/Library/Audio/Plug-Ins/VST3" }
+
+# macOS: a bundle with Info.plist; one binary for every architecture.
+[package.metadata.ferritron.format.macos]
+binary = "{name}.vst3/Contents/MacOS/{name}"
+info-plist = "macos/Info.plist"

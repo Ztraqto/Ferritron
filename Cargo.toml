@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "examples/*", "tools/*"]
+
+[workspace.package]
+version = "1.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+authors = ["Ztraqto"]
+
+[workspace.dependencies]
+ferritron = { path = "crates/ferritron" }
+ferritron-core = { path = "crates/ferritron-core" }
+ferritron-build = { path = "crates/ferritron-build" }
+ferritron-macros = { path = "crates/ferritron-macros" }
+ferritron-manifest = { path = "crates/ferritron-manifest" }
+ferritron-vulkan = { path = "crates/ferritron-vulkan" }
+ferritron-vst3 = { path = "crates/ferritron-vst3" }
+ferritron-clap = { path = "crates/ferritron-clap" }
+ferritron-au = { path = "crates/ferritron-au" }
+ferritron-web = { path = "crates/ferritron-web" }
+ferritron-gpu-view = { path = "crates/ferritron-gpu-view" }
+ferritron-ara = { path = "crates/ferritron-ara" }
+ferritron-gpu = { path = "crates/ferritron-gpu" }
+ferritron-graph = { path = "crates/ferritron-graph" }
+ferritron-slang = { path = "crates/ferritron-slang" }
+ferritron-wasm = { path = "crates/ferritron-wasm" }
+ferritron-mcp = { path = "tools/ferritron-mcp" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

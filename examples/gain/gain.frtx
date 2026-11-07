@@ -1,0 +1,21 @@
+[plugin]
+id     = "dev.ferritron.examples.gain"
+name   = "Ferritron Gain"
+vendor = "Ztraqto"
+
+# Lets AI clients reach the plugin through the Ferritron MCP hub, while the
+# user turns its "AI Access" switch on (off by default).
+[mcp]
+
+[params]
+gain = { type = "float", range = [-60, 12], default = 0, unit = "dB" }
+
+[view]
+backend = "web"
+entry   = "ui"
+size    = [480, 240]
+resizable = true
+min_size  = [320, 200]
+max_size  = [1200, 600]
+# Painted until the page draws itself (the page's own background).
+background = "#16181d"

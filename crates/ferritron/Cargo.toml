@@ -1,0 +1,42 @@
+[package]
+name = "ferritron"
+description = "A simple, fast, extensible audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["vst3", "clap", "au"]
+vst3 = ["dep:ferritron-vst3"]
+clap = ["dep:ferritron-clap"]
+# Audio Unit v2; only builds anything on macOS.
+au = ["dep:ferritron-au"]
+# HTML/JS editors (`[view] backend = "web"`).
+web = ["dep:ferritron-web"]
+# Editors drawn with wgpu (`[view] backend = "gpu"`).
+gpu-view = ["dep:ferritron-gpu-view"]
+# ARA 2 (`[ara]`); needs your own ARA SDK (ARA_SDK_DIR).
+ara = ["dep:ferritron-ara"]
+
+# Links against `ferritron_plugin_entry`, which only plugin crates define.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ferritron-core.workspace = true
+ferritron-macros.workspace = true
+ferritron-web = { workspace = true, optional = true }
+ferritron-gpu-view = { workspace = true, optional = true }
+ferritron-ara = { workspace = true, optional = true }
+
+# Plugin formats are for native builds. A plugin built for WebAssembly is a
+# guest of `ferritron-wasm` (isolation Level 2), which carries the formats.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ferritron-vst3 = { workspace = true, optional = true }
+ferritron-clap = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ferritron-au = { workspace = true, optional = true }

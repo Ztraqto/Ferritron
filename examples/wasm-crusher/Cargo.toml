@@ -1,0 +1,13 @@
+[package]
+name = "wasm-crusher"
+description = "Ferritron isolation Level 2 example, guest side: a bit crusher built for WebAssembly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron.workspace = true

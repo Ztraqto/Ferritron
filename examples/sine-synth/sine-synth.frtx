@@ -1,0 +1,10 @@
+[plugin]
+id     = "dev.ferritron.examples.sine-synth"
+name   = "Ferritron Sine Synth"
+vendor = "Ztraqto"
+kind   = "instrument"
+
+[params]
+volume  = { type = "float", range = [-60, 0], default = -12, unit = "dB" }
+attack  = { type = "float", range = [1, 2000], default = 5, unit = "ms" }
+release = { type = "float", range = [1, 5000], default = 200, unit = "ms" }

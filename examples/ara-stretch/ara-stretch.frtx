@@ -1,0 +1,11 @@
+[plugin]
+id     = "dev.ferritron.examples.ara-stretch"
+name   = "Ferritron ARA Stretch"
+vendor = "Ztraqto"
+url    = "https://example.com/ferritron/ara-stretch"   # ARA requires a URL; put your own here
+
+[params]
+gain = { type = "float", range = [-60, 12], default = 0, unit = "dB" }
+
+# ARA 2: whole audio files, their notes, and regions stretched in time.
+[ara]

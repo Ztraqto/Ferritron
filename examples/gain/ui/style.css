@@ -1,0 +1,7 @@
+:root { color-scheme: dark; font-family: system-ui, "Segoe UI", "Yu Gothic UI", sans-serif; }
+html, body { margin: 0; height: 100%; background: #16181d; color: #e8e8ea; user-select: none; }
+main { height: 100%; display: grid; place-content: center; gap: 12px; text-align: center; }
+h1 { margin: 0 0 8px; font-size: 18px; font-weight: 600; letter-spacing: 0.04em; color: #f0a050; }
+label { font-size: 13px; color: #9aa0aa; }
+input[type=range] { width: 66vw; accent-color: #f0a050; }
+output { font-size: 28px; font-variant-numeric: tabular-nums; }

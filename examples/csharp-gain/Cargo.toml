@@ -1,0 +1,16 @@
+[package]
+name = "csharp-gain"
+description = "Ferritron C# example: a gain plugin written in C# and built with NativeAOT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Only the format adapters: the plugin itself is C# (plugin/Gain.cs).
+ferritron-core.workspace = true
+ferritron-vst3.workspace = true
+ferritron-clap.workspace = true

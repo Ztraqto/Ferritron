@@ -1,0 +1,17 @@
+[package]
+name = "ferritron-macros"
+description = "Procedural macros of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+ferritron-manifest.workspace = true
+fluent-syntax = "0.12"
+# preserve_order: parameters must appear in the host in the order they are declared.
+toml = { version = "1", features = ["preserve_order"] }

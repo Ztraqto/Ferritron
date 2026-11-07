@@ -1,0 +1,8 @@
+[plugin]
+id       = "dev.ferritron.bench.voices"
+name     = "Ferritron Bench Voices"
+kind     = "instrument"
+parallel = true
+
+[params]
+harmonics = { type = "int", range = [1, 256], default = 48 }

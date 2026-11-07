@@ -1,0 +1,19 @@
+[package]
+name = "cpp-gain"
+description = "Ferritron C++ example: a gain plugin written in C++ with ferritron.hpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Only the format adapters: the plugin itself is C++ (src/gain.cpp).
+ferritron-core.workspace = true
+ferritron-vst3.workspace = true
+ferritron-clap.workspace = true
+
+[build-dependencies]
+cc = "1"

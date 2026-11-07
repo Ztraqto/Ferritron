@@ -1,0 +1,10 @@
+[plugin]
+id     = "dev.ferritron.examples.gpu-modal"
+name   = "Ferritron GPU Modal"
+vendor = "Ztraqto"
+kind   = "instrument"
+
+[params]
+volume     = { type = "float", range = [-60, 0], default = -12, unit = "dB" }
+decay      = { type = "float", range = [0.2, 10], default = 3, unit = "s" }
+brightness = { type = "float", range = [0, 100], default = 50, unit = "%" }

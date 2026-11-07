@@ -1,0 +1,14 @@
+[package]
+name = "ara-reverse"
+description = "Ferritron example: an ARA 2 plugin that plays audio regions backwards"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Needs your own ARA SDK: set ARA_SDK_DIR (see the README).
+ferritron = { workspace = true, features = ["ara"] }

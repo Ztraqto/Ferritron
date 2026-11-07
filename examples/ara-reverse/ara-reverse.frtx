@@ -1,0 +1,12 @@
+[plugin]
+id     = "dev.ferritron.examples.ara-reverse"
+name   = "Ferritron ARA Reverse"
+vendor = "Ztraqto"
+url    = "https://example.com/ferritron/ara-reverse"   # ARA requires a URL; put your own here
+
+[params]
+reverse = { type = "bool", default = true }
+gain    = { type = "float", range = [-60, 12], default = 0, unit = "dB" }
+
+# ARA 2: the host hands over whole audio files and their regions.
+[ara]

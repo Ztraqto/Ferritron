@@ -1,0 +1,13 @@
+[package]
+name = "ferritron-manifest"
+description = "Project file (.frtx) location, parsing and validation, shared by the plugin macro and the Ferritron Editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# preserve_order: parameters must appear in the host in the order they are declared.
+toml = { version = "1", features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }

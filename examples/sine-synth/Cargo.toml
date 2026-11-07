@@ -1,0 +1,13 @@
+[package]
+name = "sine-synth"
+description = "Ferritron instrument example: a polyphonic sine synthesizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron.workspace = true

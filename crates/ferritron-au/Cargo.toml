@@ -1,0 +1,35 @@
+[package]
+name = "ferritron-au"
+description = "Audio Unit (AU v2, macOS) format adapter of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# Links against `ferritron_plugin_entry`, which only plugin crates define.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ferritron-core.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "objc2", "CFCGTypes"] }
+
+[build-dependencies]
+cc = "1"
+
+# How `cargo ferritron bundle` packages this format (macOS only: the entry
+# symbol exists only in macOS builds, so other platforms skip it).
+[package.metadata.ferritron.format]
+name = "AU"
+entry-symbol = "ferritron_au_factory"
+root = "{name}.component"
+binary = "{name}.component/Contents/MacOS/{name}"
+install = { macos = "{HOME}/Library/Audio/Plug-Ins/Components" }
+info-plist = "macos/Info.plist"

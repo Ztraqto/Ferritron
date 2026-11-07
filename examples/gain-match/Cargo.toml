@@ -1,0 +1,13 @@
+[package]
+name = "gain-match"
+description = "Ferritron DirectLink example: matches the level after an effect to the level before it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron.workspace = true

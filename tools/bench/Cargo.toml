@@ -1,0 +1,16 @@
+[package]
+name = "ferritron-bench"
+description = "Benchmarks of the Ferritron runtime (no plugin format needed)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# cdylib: loaded as a plugin library by `ferritron-testhost --shared-runtime`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# No formats: the benchmark drives the plugin through ferritron::testing.
+ferritron = { workspace = true, default-features = false }
+ferritron-gpu.workspace = true

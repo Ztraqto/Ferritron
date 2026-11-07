@@ -1,0 +1,17 @@
+[package]
+name = "gain"
+description = "Minimal Ferritron example: a stereo gain effect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron = { workspace = true, features = ["web"] }
+
+[dev-dependencies]
+ferritron-mcp.workspace = true
+serde_json = "1"

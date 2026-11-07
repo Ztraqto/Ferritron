@@ -1,0 +1,13 @@
+[package]
+name = "ferritron-wasm"
+description = "Isolation Level 2 of the Ferritron audio plugin framework: plugins in a WebAssembly sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ferritron-core.workspace = true
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "50", default-features = false, features = ["p1"] }

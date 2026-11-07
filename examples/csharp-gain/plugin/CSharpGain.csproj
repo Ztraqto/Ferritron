@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- A Ferritron plugin in C#: built with NativeAOT into a native library
+       (CSharpGain.dll) that exports ferritron_plugin_entry. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- Registering the plugin from a module initializer is intended. -->
+    <NoWarn>$(NoWarn);CA2255</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../../bindings/csharp/Ferritron.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,15 @@
+[package]
+name = "ferritron-gpu"
+description = "GPU compute backend of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ferritron-graph.workspace = true
+# Persistent kernels (native Vulkan): GPU banks without latency at small blocks.
+ferritron-vulkan.workspace = true
+wgpu = "30"
+pollster = "1"

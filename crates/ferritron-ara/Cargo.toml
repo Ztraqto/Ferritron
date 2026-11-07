@@ -1,0 +1,16 @@
+[package]
+name = "ferritron-ara"
+description = "ARA 2 (Audio Random Access) support of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[dependencies]
+ferritron-core.workspace = true
+
+[build-dependencies]
+cc = "1"
+ferritron-build.workspace = true

@@ -1,0 +1,5 @@
+# Read by `cargo ferritron bundle` for the bundle name. The plugin's
+# metadata and parameters live in src/gain.cpp.
+[plugin]
+id   = "dev.ferritron.examples.cpp-gain"
+name = "Ferritron C++ Gain"

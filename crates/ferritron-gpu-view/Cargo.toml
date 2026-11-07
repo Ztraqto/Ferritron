@@ -1,0 +1,21 @@
+[package]
+name = "ferritron-gpu-view"
+description = "GPU (wgpu) view backend of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ferritron-core.workspace = true
+wgpu = "30"
+
+# Embedding in the host's window; on Linux plugins build without an editor for now.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+raw-window-handle = "0.6"
+pollster = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "objc2", "CFCGTypes"] }

@@ -1,0 +1,11 @@
+[plugin]
+id     = "dev.ferritron.fixtures.crash"
+name   = "Ferritron Crash Fixture"
+vendor = "Ztraqto"
+
+[params]
+crash = { type = "bool" }    # turning it on makes the plugin crash for real
+level = { type = "float", range = [0, 1], default = 1 }
+
+[isolation]
+mode = "process"

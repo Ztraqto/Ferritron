@@ -1,0 +1,10 @@
+[plugin]
+id     = "dev.ferritron.examples.gain-match"
+name   = "Ferritron Gain Match"
+vendor = "Ztraqto"
+
+[params]
+# Put one instance before the effect ("Before") and one after it ("After")
+# with the same group: the second matches its level to the first's.
+mode  = { type = "enum", choices = ["Before", "After"], default = "Before" }
+group = { type = "int", range = [1, 16], default = 1 }

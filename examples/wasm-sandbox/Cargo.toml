@@ -1,0 +1,15 @@
+[package]
+name = "wasm-sandbox"
+description = "Ferritron isolation Level 2 example: runs examples/wasm-crusher in a WebAssembly sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron-wasm.workspace = true
+ferritron-vst3.workspace = true
+ferritron-clap.workspace = true

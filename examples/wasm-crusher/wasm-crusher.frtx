@@ -1,0 +1,9 @@
+[plugin]
+id     = "dev.ferritron.examples.wasm-crusher"
+name   = "Ferritron Sandboxed Crusher"
+vendor = "Ztraqto"
+
+[params]
+bits  = { type = "float", range = [2, 16], default = 6, unit = "bit" }
+crash = { type = "bool" }    # makes the plugin crash for real
+hang  = { type = "bool" }    # makes the plugin loop forever

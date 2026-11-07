@@ -1,0 +1,14 @@
+[package]
+name = "gpu-modal"
+description = "Ferritron GPU example: a modal synthesizer, 2,048 resonators on the GPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron.workspace = true
+ferritron-gpu.workspace = true

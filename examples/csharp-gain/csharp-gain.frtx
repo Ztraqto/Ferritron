@@ -1,0 +1,9 @@
+# Read by `cargo ferritron bundle`. The plugin's metadata and parameters
+# live in plugin/Gain.cs.
+[plugin]
+id   = "dev.ferritron.examples.csharp-gain"
+name = "Ferritron C# Gain"
+
+# Built by build.rs into OUT_DIR; bundled next to the plugin binary.
+[companion]
+files = ["managed/CSharpGain.dll"]
