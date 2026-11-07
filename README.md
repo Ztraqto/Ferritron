@@ -13,6 +13,46 @@ Rust で書かれた、シンプルで速く、拡張しやすいオーディオ
 > clap-validator（失敗 0）に合格しています。設計とロードマップは
 > [docs/architecture.md](docs/architecture.md) を参照してください。
 
+## 対応表
+
+| | Windows（x64） | macOS | Linux（x64） |
+|---|---|---|---|
+| VST3 | ✅ | 🚧 **macOS 開発者募集** | ✅ |
+| CLAP | ✅ | 🚧 **macOS 開発者募集** | ✅ |
+| Audio Unit（AU v2） | — | 🚧 **macOS 開発者募集** | — |
+| ARA 2（VST3 / CLAP の拡張） | ✅ | 🚧 **macOS 開発者募集** | ⚠️ |
+| エディタ（HTML/JS・GPU） | ✅ | 🚧 **macOS 開発者募集** | —（未対応） |
+| ホットリロード | ✅ | 🚧 **macOS 開発者募集** | ⚠️ |
+| プロセス分離 | ✅ | 🚧 **macOS 開発者募集** | ⚠️ |
+| Ferritron Editor | ✅ | — | ⚠️（ビルドとコマンドラインのみ確認） |
+| AAX / LV2 | 予定 | 予定 | 予定 |
+
+- ✅ 確認済み（VST3 は Steinberg 公式の validator、CLAP は clap-validator、ARA は ARA SDK の
+  `ARATestHost` に合格。Linux は Docker 上の Debian で確認）
+- 🚧 実装済み・型検査済みですが、Mac の実機ではまだビルドも実行もしていません
+  （[macOS 開発者募集](#macos-開発者募集)）
+- ⚠️ コードはありますが、確認していません
+- — 対応していません
+
+## macOS 開発者募集
+
+macOS 版（VST3 / CLAP / Audio Unit、エディタ、ARA、プロセス分離、ホットリロード）は
+コードを書き終え、型検査も通っていますが、Mac の実機での確認がまだです。**Mac を
+お持ちで、ビルドと動作確認、不具合の修正に協力してくださる開発者を募集しています。**
+
+- Mac 上で `cargo ferritron bundle` を実行し、`.vst3` / `.clap` / `.component` を作る
+- VST3 の validator、clap-validator、`auval` で検証する（CI の
+  `.github/workflows/macos.yml` が同じ手順です）
+- Logic Pro、Ableton Live、REAPER などの DAW で読み込み、エディタや ARA を試す
+
+参加方法は次の「[開発への参加](#開発への参加)」を参照してください。
+
+## 開発への参加
+
+Ferritron の開発に参加するには、**Discord サーバー（<https://discord.gg/HbvnNMpFdV>）への参加が必須です。**
+不具合の報告、機能の提案、プルリクエストの前に、Discord で参加の旨をお知らせください。
+macOS 版の開発への協力もこちらで受け付けています。
+
 ## プラグインの全体
 
 プロジェクトファイル `gain.ferritroject`（中身は TOML。パッケージごとに1つ、`Cargo.toml` の隣に置きます）:

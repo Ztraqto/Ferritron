@@ -13,6 +13,48 @@ A simple, fast and extensible audio plugin framework written in Rust.
 > clap-validator (0 failures). See [docs/architecture.md](docs/architecture.md)
 > (Japanese) for the design and roadmap.
 
+## Platforms and plugin formats
+
+| | Windows (x64) | macOS | Linux (x64) |
+|---|---|---|---|
+| VST3 | ✅ | 🚧 **macOS developers wanted** | ✅ |
+| CLAP | ✅ | 🚧 **macOS developers wanted** | ✅ |
+| Audio Unit (AU v2) | — | 🚧 **macOS developers wanted** | — |
+| ARA 2 (extension of VST3 / CLAP) | ✅ | 🚧 **macOS developers wanted** | ⚠️ |
+| Editors (HTML/JS, GPU) | ✅ | 🚧 **macOS developers wanted** | — (not yet) |
+| Hot reload | ✅ | 🚧 **macOS developers wanted** | ⚠️ |
+| Process isolation | ✅ | 🚧 **macOS developers wanted** | ⚠️ |
+| Ferritron Editor | ✅ | — | ⚠️ (build and command line only) |
+| AAX / LV2 | planned | planned | planned |
+
+- ✅ verified (VST3: Steinberg's official validator; CLAP: clap-validator; ARA:
+  the ARA SDK's `ARATestHost`; Linux in Docker on Debian)
+- 🚧 implemented and type-checked, but not yet built or run on a Mac
+  ([macOS developers wanted](#macos-developers-wanted))
+- ⚠️ the code exists but has not been checked
+- — not supported
+
+## macOS developers wanted
+
+The macOS port (VST3 / CLAP / Audio Unit, editors, ARA, process isolation, hot
+reload) is written and type-checked but has not been checked on a Mac yet.
+**We are looking for developers with a Mac to build it, test it and fix what
+they find.**
+
+- Run `cargo ferritron bundle` on a Mac to make `.vst3` / `.clap` / `.component` bundles
+- Check them with the VST3 validator, clap-validator and `auval` (the CI
+  workflow `.github/workflows/macos.yml` does the same)
+- Load them in DAWs such as Logic Pro, Ableton Live or REAPER; try the editors and ARA
+
+See [Contributing](#contributing) for how to join.
+
+## Contributing
+
+**Joining the Discord server (<https://discord.gg/HbvnNMpFdV>) is required to take part in
+Ferritron's development.** Please introduce yourself there before reporting
+bugs, proposing features or opening pull requests. Help with the macOS port is
+coordinated there too.
+
 ## A complete plugin
 
 `gain.ferritroject`, the project file (TOML inside; one per package, next to
