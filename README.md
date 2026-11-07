@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/ferritron-icon.png" width="128" alt="Ferritron"></p>
+
 # Ferritron
 
 [English](README.en.md) | **日本語**
