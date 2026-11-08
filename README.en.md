@@ -17,24 +17,34 @@ A simple, fast and extensible audio plugin framework written in Rust.
 
 ## Platforms and plugin formats
 
-| | Windows (x64) | macOS | Linux (x64) |
-|---|---|---|---|
-| VST3 | ✅ | 🚧 **macOS developers wanted** | ✅ |
-| CLAP | ✅ | 🚧 **macOS developers wanted** | ✅ |
-| Audio Unit (AU v2) | — | 🚧 **macOS developers wanted** | — |
-| ARA 2 (extension of VST3 / CLAP) | ✅ | 🚧 **macOS developers wanted** | ⚠️ |
-| Editors (HTML/JS, GPU) | ✅ | 🚧 **macOS developers wanted** | — (not yet) |
-| Hot reload | ✅ | 🚧 **macOS developers wanted** | ⚠️ |
-| Process isolation | ✅ | 🚧 **macOS developers wanted** | ⚠️ |
-| Ferritron Editor | ✅ | — | ⚠️ (build and command line only) |
-| AAX / LV2 | planned | planned | planned |
+| | Windows (x64) | macOS | Linux (x64) | iPhone / iPad | Android | Web |
+|---|---|---|---|---|---|---|
+| VST3 | ✅ | 🚧 | ✅ | — | — | — |
+| CLAP | ✅ | 🚧 | ✅ | — | — | — |
+| LV2 | ✅ | 🚧 | ⚠️ | — | — | — |
+| Audio Unit (AU v2) | — | 🚧 | — | — | — | — |
+| AUv3 (app extension) | — | 🚧 | — | 🚧 | — | — |
+| AAX (Pro Tools) | 🧪 | 🧪 | — | — | — | — |
+| WAM 2.0 (Web Audio Modules) | — | — | — | — | — | ✅ |
+| Standalone app | ✅ | 🚧 | ⚠️ (no editor) | 🚧 | ✅ (APK) | — |
+| ARA 2 (extension of VST3 / CLAP) | ✅ | 🚧 | ⚠️ | — | — | — |
+| Editors (HTML/JS, GPU) | ✅ | 🚧 | — (not yet) | — (not yet) | ✅ (HTML/JS) | ✅ (HTML/JS) |
+| Hot reload | ✅ | 🚧 | ⚠️ | — | — | — |
+| Process isolation | ✅ | 🚧 | ⚠️ | — | — | — |
+| Ferritron Editor | ✅ | — | ⚠️ (build and command line only) | — | — | — |
 
-- ✅ verified (VST3: Steinberg's official validator; CLAP: clap-validator; ARA:
-  the ARA SDK's `ARATestHost`; Linux in Docker on Debian)
-- 🚧 implemented and type-checked, but not yet built or run on a Mac
-  ([macOS developers wanted](#macos-developers-wanted))
-- ⚠️ the code exists but has not been checked
-- — not supported
+- ✅ Verified (VST3 passes Steinberg's validator, CLAP passes clap-validator,
+  ARA passes the ARA SDK's `ARATestHost`; Linux on Debian in Docker. LV2: the
+  generated Turtle read by an RDF parser and the binary run by a test host
+  for audio, MIDI and state, not yet in a DAW. WAM: audio, automation, MIDI,
+  state and editor in a browser. Android app: audio, editor and saving on
+  the emulator (x86_64, API 34), not yet on a phone)
+- 🚧 Written and type-checked, but never built or run on a Mac
+  ([macOS developers wanted](#macos-developers-wanted)); the same for iPhone / iPad
+- 🧪 Written against Avid's published API without the AAX SDK at hand; not
+  yet compiled (developers with the SDK: please try it)
+- ⚠️ The code exists but is not verified
+- — Not supported
 
 ## macOS developers wanted
 
@@ -810,6 +820,65 @@ for note in ctx.notes {
 }
 ```
 
+### Standalone apps, phones, the web, LV2, AAX
+
+Besides the DAW formats, one plugin also becomes an app of its own, an AUv3
+on iPhone and iPad, an Android app and a WAM in the browser. All of them use
+the same parameter keys, state, translations and (HTML/JS) editor.
+
+| Output | Command | Result |
+|---|---|---|
+| Standalone (Windows) | `cargo ferritron bundle gain` | `target/bundled/<Name>/<Name>.exe` |
+| Standalone + AUv3 (macOS) | `cargo ferritron bundle gain` (on a Mac) or `--target aarch64-apple-darwin` | `<Name>.app` (with `<Name> AUv3.appex` inside) |
+| iPhone / iPad (app + AUv3) | `cargo ferritron bundle gain --target ios` (needs a Mac with Xcode) | `<Name>.app` |
+| Android | `cargo ferritron bundle gain --target android` (`x86_64-linux-android` for the emulator) | `<Name>.apk` |
+| Web (WAM 2.0) | `cargo ferritron bundle gain --target web` | `<Name>.wam/` |
+| LV2 | `cargo ferritron bundle gain` | `<Name>.lv2/` |
+| AAX | `features = ["aax"]`, `AAX_SDK_DIR`, then `cargo ferritron bundle gain` | `<Name>.aaxplugin` |
+
+- **Standalone** (feature `standalone`, on by default): plays through the
+  default audio output (and input, for effects) and every MIDI input, with
+  the plugin's editor in a window. The state is kept in Ferritron's data
+  folder (`standalone/<plugin id>.state`) for the next start. The app's
+  executable is a small launcher `cargo ferritron` compiles (on Windows with
+  the C compiler of the Visual Studio Build Tools).
+- **Android**: an app playing through AAudio with low latency (Android 9 or
+  later). The editor runs in a WebView and pages see the same
+  `window.ferritron` as inside a DAW; plugins without an HTML/JS editor get
+  one made from their parameters (with a keyboard for instruments). MIDI
+  devices work too. Needs the Android NDK (`ANDROID_NDK_HOME`, or
+  `C:\Ferritron\SDK\ndk\<version>`), the Android SDK (`ANDROID_HOME`) and a
+  JDK 17 to 21 (one that d8 runs on is picked from `FERRITRON_ANDROID_JDK`,
+  `JAVA_HOME`, Android Studio's JDK and `PATH`), and
+  `rustup target add aarch64-linux-android`. APKs are signed with the debug
+  key; for release set `FERRITRON_ANDROID_KEYSTORE`,
+  `FERRITRON_ANDROID_KEYSTORE_PASS` and `FERRITRON_ANDROID_KEY_ALIAS`. No Gradle.
+- **iPhone / iPad**: an AUv3 (the only kind of plugin GarageBand, AUM,
+  Cubasis or Logic Pro for iPad load) and the app it lives in. The AUv3
+  registers the AU v2 code (`ferritron-au`) inside the app extension and
+  hands it out through `AUAudioUnitV2Bridge`. Apple licenses the iOS SDK for
+  Macs only, so these builds need a Mac with Xcode; installing on a device
+  needs a signing identity (`FERRITRON_CODESIGN_IDENTITY`) and a
+  provisioning profile.
+- **Web (WAM 2.0)**: the plugin compiled to WebAssembly (`wasm32-wasip1`;
+  `rustup target add wasm32-wasip1`) and run in an AudioWorklet as a Web
+  Audio Module. Put `<Name>.wam/` on any web server; WAM 2.0 hosts `import()`
+  its `index.js`. Its `index.html` is a page to try the plugin in a browser
+  (test tone, microphone, file; a keyboard for instruments). Automation and
+  MIDI arrive sample-accurately. Pages do not run from `file://`; serve them,
+  for example with `python -m http.server`.
+- **LV2** (feature `lv2`, on by default, no SDK): a control port per
+  parameter, MIDI, state, latency and freewheel (export). The Turtle files
+  (`manifest.ttl`, `plugin.ttl`) are generated from the project file. Editors
+  on Windows and macOS. Parameter changes the plugin makes by itself
+  (`InstanceHandle`, MCP) are not recorded by the host: LV2 control ports
+  belong to the host.
+- **AAX** (feature `aax`, off by default): Avid gives the AAX SDK to
+  registered developers only; get it and point `AAX_SDK_DIR` at it (without
+  it the build warns and leaves AAX out). Pro Tools loads only plugins
+  signed with PACE's wraptool (Pro Tools Developer also loads unsigned
+  ones). Not covered: AAX DSP, AudioSuite, side chains, buses wider than stereo.
+
 ### Testing without a DAW
 
 `ferritron::testing::Harness` runs a plugin through the same path hosts use
@@ -1154,6 +1223,21 @@ A format is one crate; neither Ferritron's core nor the CLI changes:
 3. **Linking**: built-in formats are features of the `ferritron` crate. A
    third-party format is linked from the plugin with `use ferritron_xyz as _;`.
 
+Format metadata may also use these keys (none of them makes the CLI know a format):
+
+| Key | Meaning |
+|---|---|
+| `files` | Files generated from the project file (templates with lists and conditions such as `{#params}...{/params}`: LV2's Turtle, WAM's `descriptor.json`) |
+| `assets` | Files copied as they are (WAM's JavaScript, Android's Java) |
+| `ui` | Where the plugin's HTML/JS editor folder goes |
+| `launcher` / `launcher-kind` | The app's executable (a launcher `cargo ferritron` compiles; `appex` for an Apple app extension) |
+| `package` | A step after the files are in place (`apk`: an Android APK) |
+| `symbol-values` | Template values from the binary's exported symbols (the AUv3 class name) |
+
+The C ABI gained `ferritron.describe.v1`: the parameters' keys, kinds,
+ranges and localized names and the editor's messages as JSON (used by the
+WAM and the Android app).
+
 `crates/ferritron-vst3` and `crates/ferritron-clap` are written exactly this way.
 
 ## Repository layout
@@ -1198,9 +1282,9 @@ A format is one crate; neither Ferritron's core nor the CLI changes:
 
 ## Versions
 
-All Ferritron crates share one version (currently **1.2.0**); see
+All Ferritron crates share one version (currently **1.3.0**); see
 [CHANGELOG.md](CHANGELOG.md). Pin it in a plugin with
-`ferritron = { path = "...", version = "1.2.0" }`; `ferritron::VERSION` and
+`ferritron = { path = "...", version = "1.3.0" }`; `ferritron::VERSION` and
 `cargo ferritron --version` report it.
 
 ## License

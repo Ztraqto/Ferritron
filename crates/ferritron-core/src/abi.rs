@@ -132,6 +132,24 @@ pub const EXT_ARA: &std::ffi::CStr = c"ferritron.ara.v1";
 pub const EXT_SLEEP: &std::ffi::CStr = c"ferritron.sleep.v1";
 pub const EXT_HOST2: &std::ffi::CStr = c"ferritron.host.v2";
 pub const EXT_TRACK: &std::ffi::CStr = c"ferritron.track.v1";
+pub const EXT_DESCRIBE: &std::ffi::CStr = c"ferritron.describe.v1";
+
+/// `ferritron_describe_api` (`ferritron.describe.v1`): the plugin as JSON
+/// (see the `describe` module): parameters with their keys, kinds, ranges
+/// and localized names, and the editor's messages.
+#[repr(C)]
+pub struct DescribeApi {
+    /// Writes the UTF-8 JSON into `buf` if it fits in `cap`; returns its full length.
+    pub describe: unsafe extern "C" fn(*mut u8, u32) -> u32,
+}
+
+unsafe extern "C" fn describe<P: Process + PluginMeta>(buf: *mut u8, cap: u32) -> u32 {
+    let json = guarded(crate::describe::json::<P>).unwrap_or_default();
+    if !buf.is_null() && json.len() <= cap as usize {
+        unsafe { std::ptr::copy_nonoverlapping(json.as_ptr(), buf, json.len()) };
+    }
+    json.len() as u32
+}
 
 /// `ferritron_sleep_api`: silence (see [`Tail`]). Shims report the tail to
 /// the host and tell it when the output is silence.
@@ -297,6 +315,10 @@ impl<P: Process> Latency<P> {
     const TRACK: TrackApi = TrackApi { set_track_info: set_track_info::<P> };
 }
 
+impl<P: Process + PluginMeta> Latency<P> {
+    const DESCRIBE: DescribeApi = DescribeApi { describe: describe::<P> };
+}
+
 unsafe extern "C" fn attach_host<P: Process>(ptr: *mut c_void, host: *const crate::instance::HostCallbacks) {
     let instance = unsafe { instance::<P>(ptr) };
     if let Some(host) = unsafe { host.as_ref() } {
@@ -455,6 +477,9 @@ pub(crate) unsafe extern "C" fn get_extension<P: Process + PluginMeta>(id: *cons
     }
     if id == EXT_TRACK {
         return &Latency::<P>::TRACK as *const TrackApi as *const c_void;
+    }
+    if id == EXT_DESCRIBE {
+        return &Latency::<P>::DESCRIBE as *const DescribeApi as *const c_void;
     }
     match P::view() {
         Some(view) if id == EXT_VIEW => crate::isolation::editor(view, P::VIEW_PROCESS),
@@ -793,6 +818,11 @@ pub(crate) unsafe extern "C" fn destroy<P: Process + PluginMeta>(ptr: *mut c_voi
 
 unsafe extern "C" fn param_count<P: Process + PluginMeta>() -> u32 {
     P::Params::infos().len() as u32 + 1 + P::MCP as u32 + P::QUALITY as u32
+}
+
+/// `param_info` of plugin `P` (for the description).
+pub(crate) unsafe fn param_info_of<P: Process + PluginMeta>(index: u32, out: *mut ParamInfoC) -> bool {
+    unsafe { param_info::<P>(index, out) }
 }
 
 unsafe extern "C" fn param_info<P: Process + PluginMeta>(index: u32, out: *mut ParamInfoC) -> bool {
@@ -1364,6 +1394,23 @@ mod tests {
             assert!((SLEEP_API.activate)(a, 48_000.0, BLOCK as u32));
             a
         }
+    }
+
+    #[test]
+    fn the_description_carries_keys_kinds_and_builtins() {
+        let ext = unsafe { (API.get_extension)(EXT_DESCRIBE.as_ptr()) } as *const DescribeApi;
+        let describe = unsafe { ext.as_ref() }.expect("ferritron.describe.v1").describe;
+        let len = unsafe { describe(std::ptr::null_mut(), 0) };
+        let mut buf = vec![0u8; len as usize];
+        assert_eq!(unsafe { describe(buf.as_mut_ptr(), len) }, len);
+        let json: serde_json::Value = serde_json::from_slice(&buf).expect("valid JSON");
+        assert_eq!(json["name"], "Doubler");
+        let params = json["params"].as_array().unwrap();
+        assert_eq!(params[0]["key"], "amount");
+        assert_eq!(params[0]["kind"], "float");
+        assert_eq!(params[0]["max"], 4.0);
+        assert_eq!(params[1]["key"], "ferritron.bypass");
+        assert_eq!(params[1]["flags"], PARAM_BYPASS);
     }
 
     #[test]

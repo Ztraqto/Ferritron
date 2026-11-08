@@ -227,18 +227,33 @@ mod imp {
     unsafe impl Send for Memory {}
     unsafe impl Sync for Memory {}
 
+    #[cfg(not(target_os = "android"))]
+    use libc::{shm_open, shm_unlink};
+
+    // Android has no POSIX shared memory: process isolation is not offered
+    // there (opening fails, the plugin runs in the app's process).
+    #[cfg(target_os = "android")]
+    unsafe fn shm_open(_name: *const libc::c_char, _flags: libc::c_int, _mode: libc::c_uint) -> libc::c_int {
+        -1
+    }
+
+    #[cfg(target_os = "android")]
+    unsafe fn shm_unlink(_name: *const libc::c_char) -> libc::c_int {
+        -1
+    }
+
     impl Memory {
         pub fn create(name: &str, len: usize) -> Option<Self> {
             let cname = shm_name(name);
             unsafe {
-                libc::shm_unlink(cname.as_ptr()); // a region left by a crashed host
-                let fd = libc::shm_open(cname.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint);
+                shm_unlink(cname.as_ptr()); // a region left by a crashed host
+                let fd = shm_open(cname.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600 as libc::c_uint);
                 if fd < 0 {
                     return None;
                 }
                 if libc::ftruncate(fd, len as libc::off_t) != 0 {
                     libc::close(fd);
-                    libc::shm_unlink(cname.as_ptr());
+                    shm_unlink(cname.as_ptr());
                     return None;
                 }
                 Self::map(fd, len, Some(cname))
@@ -248,7 +263,7 @@ mod imp {
         pub fn open(name: &str, len: usize) -> Option<Self> {
             let cname = shm_name(name);
             unsafe {
-                let fd = libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0o600 as libc::c_uint);
+                let fd = shm_open(cname.as_ptr(), libc::O_RDWR, 0o600 as libc::c_uint);
                 if fd < 0 {
                     return None;
                 }
@@ -261,7 +276,7 @@ mod imp {
             unsafe { libc::close(fd) };
             if ptr == libc::MAP_FAILED {
                 if let Some(name) = &owned {
-                    unsafe { libc::shm_unlink(name.as_ptr()) };
+                    unsafe { shm_unlink(name.as_ptr()) };
                 }
                 return None;
             }
@@ -278,7 +293,7 @@ mod imp {
             unsafe {
                 libc::munmap(self.ptr as *mut libc::c_void, self.len);
                 if let Some(name) = &self.owned {
-                    libc::shm_unlink(name.as_ptr());
+                    shm_unlink(name.as_ptr());
                 }
             }
         }
@@ -464,7 +479,12 @@ mod imp {
         unsafe { libc::__error() }
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(target_os = "android")]
+    unsafe fn errno() -> *mut libc::c_int {
+        unsafe { libc::__errno() }
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     unsafe fn errno() -> *mut libc::c_int {
         unsafe { libc::__errno_location() }
     }

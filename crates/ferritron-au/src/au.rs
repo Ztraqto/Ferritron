@@ -354,6 +354,7 @@ impl Unit {
         };
         unsafe { AUParameterListenerNotify(std::ptr::null_mut(), std::ptr::null_mut(), &any) };
         self.changed(kAudioUnitProperty_PresentPreset, kAudioUnitScope_Global, 0);
+        #[cfg(target_os = "macos")]
         crate::view::restored(self);
         noErr
     }
@@ -508,6 +509,7 @@ impl Unit {
                 request.outValue = unsafe { (self.api.to_plain)(request.inParamID, normalized) } as f32;
                 noErr
             }
+            #[cfg(target_os = "macos")]
             kAudioUnitProperty_CocoaUI => match crate::view::cocoa_view_info() {
                 Some(info) => put!(AudioUnitCocoaViewInfo, info),
                 None => kAudioUnitErr_InvalidProperty,
@@ -829,6 +831,7 @@ unsafe extern "C" fn close(this: *mut c_void) -> OSStatus {
     guard(|| {
         LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashSet::new).remove(&(this as usize));
         let unit = unsafe { Box::from_raw(this as *mut Unit) };
+        #[cfg(target_os = "macos")]
         crate::view::detach(&unit);
         let core = unit.core.swap(std::ptr::null_mut(), SeqCst);
         if !core.is_null() {

@@ -5,7 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
+mod package;
 mod template;
+pub use package::{Escape, HostParam, Scope, Value as TemplateValue, param_id, render};
 pub use template::{HOME_VARIABLE, Template, framework_dir, new_project};
 use toml::{Table, Value};
 
@@ -151,6 +153,8 @@ pub struct Manifest {
     /// `[quality]`: the plugin gets a "Quality" switch (Auto / Normal /
     /// Best) for `ctx.quality`; Auto picks Best while the host exports.
     pub quality: bool,
+    /// `[view]`: the plugin has an editor.
+    pub view: bool,
     pub name: String,
     pub vendor: String,
     pub version: String,
@@ -167,7 +171,7 @@ pub struct Manifest {
 }
 
 /// The SDK ids `[sdk]` may pin.
-pub const SDK_IDS: [&str; 4] = ["vst3", "clap", "ara", "xclang"];
+pub const SDK_IDS: [&str; 6] = ["vst3", "clap", "ara", "aax", "ndk", "xclang"];
 
 /// The three codes an Audio Unit is registered with (`AudioComponentDescription`).
 #[derive(Clone, Debug, PartialEq)]
@@ -209,11 +213,26 @@ impl Manifest {
             ("au.tag", if self.instrument { "Synthesizer" } else { "Effects" }.into()),
             // Sandboxed hosts cannot start the process an isolated plugin runs in.
             ("au.sandbox-safe", if self.isolate { "false" } else { "true" }.into()),
+            // The ID as a Java package / bundle identifier (Android, iOS).
+            ("id.package", java_package(&self.id)),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect()
     }
+}
+
+/// `dev.ferritron.examples.sine-synth` -> `dev.ferritron.examples.sine_synth`:
+/// every part a Java identifier (Android application IDs, iOS bundle IDs).
+pub fn java_package(id: &str) -> String {
+    id.split('.')
+        .filter(|p| !p.is_empty())
+        .map(|part| {
+            let clean: String = part.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+            if clean.starts_with(|c: char| c.is_ascii_digit()) { format!("_{clean}") } else { clean }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// A 4-character code from `[au]`, or `default`.
@@ -412,6 +431,7 @@ pub fn parse(text: &str) -> Result<Manifest, Error> {
         ara,
         mcp,
         quality,
+        view: root.contains_key("view"),
         name: string("name", None)?,
         vendor,
         version: string("version", Some(std::env::var("CARGO_PKG_VERSION").unwrap_or_default()))?,
@@ -637,7 +657,7 @@ clap = \"1.2.10\"")).unwrap();
         assert!(parse(GAIN).unwrap().sdk.is_empty());
         assert_eq!(parse(&format!("{GAIN}
 [sdk]
-aax = \"1\"")).err().unwrap().code, "unknown-key");
+vst2 = \"1\"")).err().unwrap().code, "unknown-key");
         assert_eq!(parse(&format!("{GAIN}
 [sdk]
 vst3 = 3")).err().unwrap().code, "not-string");

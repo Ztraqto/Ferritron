@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The AUv3 app extension. Filled in by `cargo ferritron bundle` from the project file. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>{file} AUv3</string>
+	<key>CFBundleIdentifier</key>
+	<string>{id.package}.auv3</string>
+	<key>CFBundleName</key>
+	<string>{name} AUv3</string>
+	<key>CFBundleDisplayName</key>
+	<string>{name}</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>{version}</string>
+	<key>CFBundleVersion</key>
+	<string>{version}</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.AudioUnit-UI</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>{auv3.class}</string>
+		<key>NSExtensionAttributes</key>
+		<dict>
+			<key>AudioComponents</key>
+			<array>
+				<dict>
+					<key>name</key>
+					<string>{vendor}: {name}</string>
+					<key>description</key>
+					<string>{name}</string>
+					<key>manufacturer</key>
+					<string>{au.manufacturer}</string>
+					<key>subtype</key>
+					<string>{au.subtype}</string>
+					<key>type</key>
+					<string>{au.type}</string>
+					<key>version</key>
+					<integer>{version.number}</integer>
+					<key>factoryFunction</key>
+					<string>{auv3.class}</string>
+					<key>sandboxSafe</key>
+					<true/>
+					<key>tags</key>
+					<array>
+						<string>{au.tag}</string>
+					</array>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+</dict>
+</plist>

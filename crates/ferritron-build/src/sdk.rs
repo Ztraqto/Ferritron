@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 /// An SDK or tool Ferritron can find.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Sdk {
-    /// `vst3`, `clap`, `ara`, `xclang`: the key in `sdk.toml`, `[sdk]` and
+    /// `vst3`, `clap`, `ara`, `aax`, `ndk`, `xclang`: the key in `sdk.toml`, `[sdk]` and
     /// the managed folder.
     pub id: &'static str,
     pub name: &'static str,
@@ -86,8 +86,27 @@ pub const XCLANG: Sdk = Sdk {
     source: "https://github.com/clice-io/xclang/releases",
 };
 
+/// Avid's AAX SDK: from Avid's developer site, after signing up (not
+/// fetched by Ferritron).
+pub const AAX: Sdk = Sdk {
+    id: "aax",
+    name: "AAX SDK",
+    var: "AAX_SDK_DIR",
+    probe: &["Interfaces/AAX.h"],
+    source: "https://developer.avid.com (sign up for the AAX SDK)",
+};
+
+/// The Android NDK, for Android apps (`--target aarch64-linux-android`).
+pub const NDK: Sdk = Sdk {
+    id: "ndk",
+    name: "Android NDK",
+    var: "ANDROID_NDK_HOME",
+    probe: &["meta/platforms.json"],
+    source: "https://developer.android.com/ndk/downloads (or Android Studio's SDK Manager)",
+};
+
 /// Every SDK and tool, in the order tools list them.
-pub const ALL: [&Sdk; 4] = [&VST3, &CLAP, &ARA, &XCLANG];
+pub const ALL: [&Sdk; 6] = [&VST3, &CLAP, &ARA, &AAX, &NDK, &XCLANG];
 
 /// The SDK with `id`.
 pub fn find(id: &str) -> Option<&'static Sdk> {

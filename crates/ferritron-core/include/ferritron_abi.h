@@ -110,6 +110,18 @@ typedef struct ferritron_event {
 #define FERRITRON_EXT_SLEEP "ferritron.sleep.v1"
 #define FERRITRON_EXT_HOST2 "ferritron.host.v2"
 #define FERRITRON_EXT_TRACK "ferritron.track.v1"
+#define FERRITRON_EXT_DESCRIBE "ferritron.describe.v1"
+
+/* FERRITRON_EXT_DESCRIBE: the plugin described as UTF-8 JSON, for shims
+   that show it by other means than this ABI's numbers (WAM in the browser,
+   the standalone apps on phones): the plugin's id, name, vendor, version,
+   kind and language, its parameters with their keys (stable, from the
+   project file), kinds, ranges, localized names and choices, and the
+   editor's messages. Writes the text into buf if it fits in cap and
+   returns its full length. */
+typedef struct ferritron_describe_api {
+    uint32_t (*describe)(char* buf, uint32_t cap); /* [main] */
+} ferritron_describe_api;
 
 /* FERRITRON_EXT_SLEEP: silence. A plugin stops processing (sleeps) once its
    input has been silent for as long as its output can go on; input, notes

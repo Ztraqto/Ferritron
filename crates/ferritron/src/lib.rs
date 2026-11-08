@@ -20,18 +20,26 @@
 pub use ferritron_core::*;
 pub use ferritron_macros::plugin;
 
-/// The Ferritron version this plugin is built with (e.g. `"1.2.0"`).
+/// The Ferritron version this plugin is built with (e.g. `"1.3.0"`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Plugin formats. Linking a format crate is all it takes to export that
 // format; each one is a feature here. Third-party formats are linked the same
 // way from the plugin crate: `use ferritron_aax as _;`.
-#[cfg(all(feature = "vst3", not(target_family = "wasm")))]
+#[cfg(all(feature = "vst3", not(any(target_family = "wasm", target_os = "android", target_os = "ios"))))]
 use ferritron_vst3 as _;
-#[cfg(all(feature = "clap", not(target_family = "wasm")))]
+#[cfg(all(feature = "clap", not(any(target_family = "wasm", target_os = "android", target_os = "ios"))))]
 use ferritron_clap as _;
 #[cfg(all(feature = "au", target_os = "macos"))]
 use ferritron_au as _;
+#[cfg(all(feature = "lv2", not(any(target_family = "wasm", target_os = "android", target_os = "ios"))))]
+use ferritron_lv2 as _;
+#[cfg(all(feature = "standalone", not(target_family = "wasm")))]
+use ferritron_standalone as _;
+#[cfg(all(feature = "auv3", any(target_os = "macos", target_os = "ios")))]
+use ferritron_auv3 as _;
+#[cfg(all(feature = "aax", any(windows, target_os = "macos")))]
+use ferritron_aax as _;
 
 #[cfg(feature = "web")]
 #[doc(hidden)]

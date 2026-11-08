@@ -1,7 +1,7 @@
 # Ferritron: guide for AI agents
 
-How to go from a clean checkout to a working **VST3 / CLAP / ARA 2** plugin
-with Ferritron. For details, the README is the reference ([README.en.md](README.en.md) in English,
+How to go from a clean checkout to a working **VST3 / CLAP / LV2 / AU / AUv3 /
+AAX / ARA 2** plugin, standalone app, Android app or **WAM** (web) with Ferritron. For details, the README is the reference ([README.en.md](README.en.md) in English,
 [README.md](README.md) in Japanese) and
 [docs/architecture.md](docs/architecture.md) (Japanese) is the design document.
 
@@ -11,9 +11,9 @@ file** (`<name>.ferritroject`, TOML) that declares everything static, and a **Ru
 the typed parameters, stable parameter IDs and the VST3/CLAP entry points from
 the project file.
 
-**Version: 1.2.0** (all crates share it; history in [CHANGELOG.md](CHANGELOG.md)).
+**Version: 1.3.0** (all crates share it; history in [CHANGELOG.md](CHANGELOG.md)).
 When you develop against Ferritron, state the version you target and pin it:
-`ferritron = { path = "...", version = "1.2.0" }`. `ferritron::VERSION` and
+`ferritron = { path = "...", version = "1.3.0" }`. `ferritron::VERSION` and
 `cargo ferritron --version` report the version in use.
 
 ## 1. Prerequisites
@@ -35,6 +35,8 @@ When you develop against Ferritron, state the version you target and pin it:
 | `VST3_SDK_DIR` | VST3 (default) | the one containing `pluginterfaces/` | Steinberg VST3 SDK |
 | `CLAP_SDK_DIR` | CLAP (default) | the one containing `include/clap/clap.h` | github.com/free-audio/clap |
 | `ARA_SDK_DIR` | ARA 2 (feature `ara`) | the one containing `ARA_API` and `ARA_Library` | `git clone --recursive https://github.com/Celemony/ARA_SDK` (Apache 2.0) |
+| `AAX_SDK_DIR` | AAX (feature `aax`) | the one containing `Interfaces/AAX.h` | Avid developer site (sign up; the user gets it) |
+| `ANDROID_NDK_HOME` | Android apps (`--target android`) | the NDK root (`meta/platforms.json`) | developer.android.com/ndk (also `C:\Ferritron\SDK\ndk\<version>`) |
 | `XCLANG_DIR` | macOS builds from Windows/Linux | the one containing `bin/xclang` | github.com/clice-io/xclang (Apache 2.0); Apple's macOS SDK through `cargo ferritron sdk fetch macos` (Apple's terms, the user's decision) |
 
 Set them as user environment variables, or in `.cargo/config.toml`:
@@ -220,6 +222,25 @@ Official validators:
   `validator -e "target/bundled/<Name>.vst3"`.
 - CLAP: `clap-validator validate "target/bundled/<Name>.clap"`.
 
+## 3b. Other outputs (1.3)
+
+```bash
+cargo ferritron bundle gain                     # + LV2 folder, standalone app (Windows .exe; macOS .app with AUv3)
+cargo ferritron bundle gain --target web        # WAM 2.0 folder (rustup target add wasm32-wasip1); serve over HTTP
+cargo ferritron bundle gain --target android    # APK (NDK, Android SDK, JDK 17-21); x86_64-linux-android for the emulator
+cargo ferritron bundle gain --target ios        # app + AUv3; needs a Mac with Xcode
+```
+
+- LV2, standalone and AUv3 are default features; AAX is `features = ["aax"]`
+  and needs the user's AAX SDK (the crate builds empty with a warning without it).
+- Phone and web editors are the plugin's HTML/JS editor with the same
+  `window.ferritron`; plugins without one get an editor made from their parameters.
+- Verified on this machine: LV2 (test host), standalone on Windows, WAM in a
+  browser, Android on the emulator. Not verified: macOS/iOS (type-checked
+  only), AAX (written without the SDK). Say so; do not claim otherwise.
+- Test LV2 bundles from `target/bundled`, never install them into `%APPDATA%\LV2`
+  while testing (same rule as VST3/CLAP).
+
 ## 4. ARA 2 plugin
 
 ARA hands the plugin whole audio files and their regions. Required changes to
@@ -295,7 +316,9 @@ sandboxing exist too; see the README sections of the same names.
 |---|---|
 | `crates/ferritron` | The crate plugins depend on (prelude, features) |
 | `crates/ferritron-core` / `-macros` / `-manifest` | Runtime, `#[plugin]` macro, `.ferritroject` parsing |
-| `crates/ferritron-vst3` / `-clap` / `-au` | Format adapters |
+| `crates/ferritron-vst3` / `-clap` / `-au` / `-lv2` / `-auv3` / `-aax` | Plugin format adapters |
+| `crates/ferritron-standalone` | Standalone apps (Windows, macOS, Linux, iOS, Android) |
+| `crates/ferritron-wam` | Web Audio Module (WAM 2.0) files for `--target web` |
 | `crates/ferritron-ara` | ARA 2 |
 | `crates/ferritron-web` / `-gpu-view` | HTML/JS and wgpu editors |
 | `crates/ferritron-gpu` / `-graph` / `-slang` / `-vulkan` | GPU processing |

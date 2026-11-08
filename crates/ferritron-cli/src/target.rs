@@ -14,6 +14,9 @@ use std::process::Command;
 /// xclang's own minimum; native Mac builds use the same.
 pub const MACOS_MINIMUM: &str = "13.0";
 
+/// The oldest iOS / iPadOS apps run on.
+pub const IOS_MINIMUM: &str = "15.0";
+
 /// Both architectures of a universal macOS build.
 pub const UNIVERSAL_PARTS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
 
@@ -33,6 +36,25 @@ impl Target {
             return Ok(Self { triple: None, os: std::env::consts::OS.into(), arch: std::env::consts::ARCH.into() });
         };
         let arch = triple.split('-').next().unwrap_or_default();
+        // The browser: WebAssembly with WASI's basics (a shim in the page provides them).
+        if matches!(triple, "web" | "wasm32-wasip1") {
+            return Ok(Self { triple: Some("wasm32-wasip1".into()), os: "web".into(), arch: "wasm32".into() });
+        }
+        // Phones and tablets: apps (standalone, and AUv3 on iOS).
+        let triple = match triple {
+            "android" => "aarch64-linux-android",
+            "ios" => "aarch64-apple-ios",
+            t => t,
+        };
+        if let Some(arch) = triple.strip_suffix("-linux-android") {
+            if !matches!(arch, "aarch64" | "x86_64") {
+                return Err(format!("unsupported target `{triple}` (aarch64-linux-android, x86_64-linux-android)"));
+            }
+            return Ok(Self { triple: Some(triple.into()), os: "android".into(), arch: arch.into() });
+        }
+        if matches!(triple, "aarch64-apple-ios" | "aarch64-apple-ios-sim") {
+            return Ok(Self { triple: Some(triple.into()), os: "ios".into(), arch: "aarch64".into() });
+        }
         let os = if triple.ends_with("-apple-darwin") {
             "macos"
         } else if triple.contains("-windows") {
@@ -40,7 +62,7 @@ impl Target {
         } else if triple.contains("-linux") {
             "linux"
         } else {
-            return Err(format!("unsupported target `{triple}` (e.g. aarch64-apple-darwin, x86_64-apple-darwin, universal-apple-darwin)"));
+            return Err(format!("unsupported target `{triple}` (e.g. web, android, ios, aarch64-apple-darwin, universal-apple-darwin)"));
         };
         if !matches!(arch, "x86_64" | "aarch64" | "universal") || (arch == "universal" && os != "macos") {
             return Err(format!("unsupported target `{triple}`"));
@@ -52,8 +74,24 @@ impl Target {
         self.os == "macos"
     }
 
+    /// macOS or Linux: bundles get the `ferritron-host` helper.
     pub fn is_unix(&self) -> bool {
-        self.os != "windows"
+        matches!(self.os.as_str(), "macos" | "linux")
+    }
+
+    /// iPhone, iPad or Android: apps only.
+    pub fn is_mobile(&self) -> bool {
+        matches!(self.os.as_str(), "ios" | "android")
+    }
+
+    /// Apple platforms: bundles are code-signed.
+    pub fn is_apple(&self) -> bool {
+        matches!(self.os.as_str(), "macos" | "ios")
+    }
+
+    /// The browser (`--target web`): a WAM, built for `wasm32-wasip1`.
+    pub fn is_web(&self) -> bool {
+        self.os == "web"
     }
 
     /// A macOS target built on another OS: through xclang.
@@ -149,9 +187,16 @@ pub fn sign_macos(root: &Path) -> Result<(), String> {
         return codesign(root);
     }
     if Command::new("rcodesign").arg("--version").output().is_ok_and(|o| o.status.success()) {
-        let status = Command::new("rcodesign").arg("sign").arg(root).status().map_err(|e| format!("cannot run rcodesign: {e}"))?;
-        if !status.success() {
-            return Err(format!("rcodesign failed for {}", root.display()));
+        for (target, entitlements) in nested_code(root) {
+            let mut cmd = Command::new("rcodesign");
+            cmd.arg("sign");
+            if let Some(entitlements) = &entitlements {
+                cmd.arg("--entitlements-xml-path").arg(entitlements);
+            }
+            let status = cmd.arg(&target).status().map_err(|e| format!("cannot run rcodesign: {e}"))?;
+            if !status.success() {
+                return Err(format!("rcodesign failed for {}", target.display()));
+            }
         }
         println!("Signed {} ad hoc with rcodesign", root.display());
         return Ok(());
@@ -164,17 +209,41 @@ pub fn sign_macos(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Code inside a bundle, innermost first, with the entitlements of each
+/// (an app extension's: `<out dir>/<extension name>.entitlements`), then the bundle.
+fn nested_code(root: &Path) -> Vec<(PathBuf, Option<PathBuf>)> {
+    let list = |dir: PathBuf| -> Vec<PathBuf> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        entries.sort();
+        entries
+    };
+    let contents = if root.join("Contents").is_dir() { root.join("Contents") } else { root.to_path_buf() };
+    let mut code: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    for item in list(contents.join("Frameworks")) {
+        code.push((item, None));
+    }
+    for appex in list(contents.join("PlugIns")).into_iter().filter(|p| p.extension().is_some_and(|e| e == "appex")) {
+        let entitlements = root.parent().zip(appex.file_stem()).map(|(dir, stem)| dir.join(format!("{}.entitlements", stem.to_string_lossy())));
+        code.push((appex, entitlements.filter(|e| e.is_file())));
+    }
+    code.push((contents.join("Helpers/ferritron-host"), None));
+    code.push((root.to_path_buf(), None));
+    code.into_iter().filter(|(p, _)| p.exists()).collect()
+}
+
 fn codesign(root: &Path) -> Result<(), String> {
     let identity = std::env::var("FERRITRON_CODESIGN_IDENTITY").unwrap_or_else(|_| "-".into());
-    let helper = root.join("Contents/Helpers/ferritron-host");
     // Nested code first, then the bundle.
-    for target in [helper.as_path(), root].into_iter().filter(|p| p.exists()) {
+    for (target, entitlements) in nested_code(root) {
         let mut cmd = Command::new("codesign");
         cmd.args(["--force", "--sign", &identity]);
         if identity != "-" {
             cmd.args(["--timestamp", "--options", "runtime"]);
         }
-        let status = cmd.arg(target).status().map_err(|e| format!("cannot run codesign: {e}"))?;
+        if let Some(entitlements) = &entitlements {
+            cmd.arg("--entitlements").arg(entitlements);
+        }
+        let status = cmd.arg(&target).status().map_err(|e| format!("cannot run codesign: {e}"))?;
         if !status.success() {
             return Err(format!("codesign failed for {}", target.display()));
         }
@@ -240,6 +309,13 @@ mod tests {
         assert_eq!(Target::parse(Some("x86_64-pc-windows-msvc")).unwrap().os, "windows");
         assert!(Target::parse(Some("universal-pc-windows-msvc")).is_err());
         assert!(Target::parse(Some("wasm32-unknown-unknown")).is_err());
+        let android = Target::parse(Some("android")).unwrap();
+        assert!(android.is_mobile() && android.cargo_triples() == ["aarch64-linux-android"] && !android.is_unix());
+        let ios = Target::parse(Some("ios")).unwrap();
+        assert!(ios.is_apple() && ios.is_mobile() && !ios.is_macos());
+        assert!(Target::parse(Some("armv7-linux-android")).is_err());
+        let web = Target::parse(Some("web")).unwrap();
+        assert!(web.is_web() && !web.is_unix() && web.cargo_triples() == ["wasm32-wasip1"]);
         let here = Target::parse(None).unwrap();
         assert!(here.cargo_triples().is_empty() && !here.crosses_to_macos());
     }

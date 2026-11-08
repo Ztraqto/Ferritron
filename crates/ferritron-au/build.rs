@@ -5,6 +5,13 @@
 fn main() {
     println!("cargo::rerun-if-changed=objc/view_factory.m");
     println!("cargo::rerun-if-env-changed=FERRITRON_SKIP_NATIVE");
+    // iOS: the v2 unit only (AUv3 builds on it); no Cocoa view.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        for framework in ["AudioToolbox", "CoreAudio", "CoreFoundation", "Foundation"] {
+            println!("cargo::rustc-link-lib=framework={framework}");
+        }
+        return;
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }

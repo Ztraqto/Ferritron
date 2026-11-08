@@ -121,11 +121,14 @@ impl InstanceId {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
         hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+        // WebAssembly has no process ids (std panics) and may have no clock.
         #[cfg(not(target_family = "wasm"))]
-        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            hasher.write_u128(now.as_nanos());
+        {
+            if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                hasher.write_u128(now.as_nanos());
+            }
+            hasher.write_u32(std::process::id());
         }
-        hasher.write_u32(std::process::id());
         Self(hasher.finish().max(1))
     }
 }

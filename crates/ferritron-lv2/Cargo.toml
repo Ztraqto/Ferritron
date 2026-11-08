@@ -1,0 +1,34 @@
+[package]
+name = "ferritron-lv2"
+description = "LV2 format adapter of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Links against `ferritron_plugin_entry`, which only plugin crates define.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ferritron-core.workspace = true
+
+# How `cargo ferritron bundle` packages this format: a folder with the
+# binary and its Turtle description, generated from the project file.
+[package.metadata.ferritron.format]
+name = "LV2"
+entry-symbol = "lv2_descriptor"
+root = "{name}.lv2"
+binary = "{name}.lv2/{name}.{ext}"
+ext = { windows = "dll", linux = "so", macos = "dylib" }
+install = { windows = "{APPDATA}/LV2", linux = "{HOME}/.lv2", macos = "{HOME}/Library/Audio/Plug-Ins/LV2" }
+files = { "{name}.lv2/manifest.ttl" = "lv2/manifest.ttl", "{name}.lv2/plugin.ttl" = "lv2/plugin.ttl" }
+
+# The editor's UI class differs per operating system (Linux has no editor yet).
+[package.metadata.ferritron.format.windows]
+files = { "{name}.lv2/manifest.ttl" = "lv2/manifest-windows.ttl", "{name}.lv2/plugin.ttl" = "lv2/plugin.ttl" }
+
+[package.metadata.ferritron.format.macos]
+files = { "{name}.lv2/manifest.ttl" = "lv2/manifest-macos.ttl", "{name}.lv2/plugin.ttl" = "lv2/plugin.ttl" }

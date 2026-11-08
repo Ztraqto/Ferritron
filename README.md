@@ -17,22 +17,31 @@ Rust で書かれた、シンプルで速く、拡張しやすいオーディオ
 
 ## 対応表
 
-| | Windows（x64） | macOS | Linux（x64） |
-|---|---|---|---|
-| VST3 | ✅ | 🚧 **macOS 開発者募集** | ✅ |
-| CLAP | ✅ | 🚧 **macOS 開発者募集** | ✅ |
-| Audio Unit（AU v2） | — | 🚧 **macOS 開発者募集** | — |
-| ARA 2（VST3 / CLAP の拡張） | ✅ | 🚧 **macOS 開発者募集** | ⚠️ |
-| エディタ（HTML/JS・GPU） | ✅ | 🚧 **macOS 開発者募集** | —（未対応） |
-| ホットリロード | ✅ | 🚧 **macOS 開発者募集** | ⚠️ |
-| プロセス分離 | ✅ | 🚧 **macOS 開発者募集** | ⚠️ |
-| Ferritron Editor | ✅ | — | ⚠️（ビルドとコマンドラインのみ確認） |
-| AAX / LV2 | 予定 | 予定 | 予定 |
+| | Windows（x64） | macOS | Linux（x64） | iPhone / iPad | Android | Web |
+|---|---|---|---|---|---|---|
+| VST3 | ✅ | 🚧 | ✅ | — | — | — |
+| CLAP | ✅ | 🚧 | ✅ | — | — | — |
+| LV2 | ✅ | 🚧 | ⚠️ | — | — | — |
+| Audio Unit（AU v2） | — | 🚧 | — | — | — | — |
+| AUv3（アプリ拡張） | — | 🚧 | — | 🚧 | — | — |
+| AAX（Pro Tools） | 🧪 | 🧪 | — | — | — | — |
+| WAM 2.0（Web Audio Modules） | — | — | — | — | — | ✅ |
+| スタンドアロンアプリ | ✅ | 🚧 | ⚠️（エディタなし） | 🚧 | ✅（APK） | — |
+| ARA 2（VST3 / CLAP の拡張） | ✅ | 🚧 | ⚠️ | — | — | — |
+| エディタ（HTML/JS・GPU） | ✅ | 🚧 | —（未対応） | —（未対応） | ✅（HTML/JS） | ✅（HTML/JS） |
+| ホットリロード | ✅ | 🚧 | ⚠️ | — | — | — |
+| プロセス分離 | ✅ | 🚧 | ⚠️ | — | — | — |
+| Ferritron Editor | ✅ | — | ⚠️（ビルドとコマンドラインのみ確認） | — | — | — |
 
 - ✅ 確認済み（VST3 は Steinberg 公式の validator、CLAP は clap-validator、ARA は ARA SDK の
-  `ARATestHost` に合格。Linux は Docker 上の Debian で確認）
+  `ARATestHost` に合格。Linux は Docker 上の Debian で確認。LV2 は生成した Turtle を RDF
+  パーサで読み、バイナリを読み込む検査用ホストで音・MIDI・状態を確認（DAW での確認はまだ）。
+  WAM はブラウザで音・オートメーション・MIDI・状態・エディタを確認。Android アプリは
+  エミュレータ（x86_64、API 34）で音・エディタ・保存を確認し、実機ではまだ）
 - 🚧 実装済み・型検査済みですが、Mac の実機ではまだビルドも実行もしていません
-  （[macOS 開発者募集](#macos-開発者募集)）
+  （[macOS 開発者募集](#macos-開発者募集)）。iPhone / iPad 向けも同じです
+- 🧪 Avid の AAX SDK が手元にないまま、公開されている API に沿って書いたコードです。
+  コンパイルもまだしていません（SDK を持つ開発者の確認を募集しています）
 - ⚠️ コードはありますが、確認していません
 - — 対応していません
 
@@ -784,6 +793,58 @@ for note in ctx.notes {
 }
 ```
 
+### スタンドアロンアプリ・スマートフォン・Web・LV2・AAX
+
+1つのプラグインが、DAW 向けの形式に加えて、それだけで動くアプリ、iPhone / iPad の
+AUv3、Android アプリ、ブラウザの WAM にもなります。どれも同じパラメータのキー・状態・
+翻訳・エディタ（HTML/JS）を使います。
+
+| 出力 | コマンド | 結果 |
+|---|---|---|
+| スタンドアロン（Windows） | `cargo ferritron bundle gain` | `target/bundled/<名前>/<名前>.exe` |
+| スタンドアロン + AUv3（macOS） | `cargo ferritron bundle gain`（Mac）または `--target aarch64-apple-darwin` | `<名前>.app`（中に `<名前> AUv3.appex`） |
+| iPhone / iPad（アプリ + AUv3） | `cargo ferritron bundle gain --target ios`（Mac と Xcode が必要） | `<名前>.app` |
+| Android | `cargo ferritron bundle gain --target android`（エミュレータは `x86_64-linux-android`） | `<名前>.apk` |
+| Web（WAM 2.0） | `cargo ferritron bundle gain --target web` | `<名前>.wam/` |
+| LV2 | `cargo ferritron bundle gain` | `<名前>.lv2/` |
+| AAX | `features = ["aax"]` と `AAX_SDK_DIR` を設定して `cargo ferritron bundle gain` | `<名前>.aaxplugin` |
+
+- **スタンドアロン**（機能 `standalone`、既定で有効）: 既定のオーディオ出力（エフェクトは
+  入力も）とすべての MIDI 入力で動き、プラグインのエディタをウィンドウに出します。状態は
+  Ferritron のデータフォルダの `standalone/<プラグイン ID>.state` に保存され、次回の起動で
+  戻ります。アプリの実行ファイルは `cargo ferritron` がコンパイルする小さなランチャーです
+  （Windows では Visual Studio Build Tools の C コンパイラを使います）。
+- **Android**: AAudio で低遅延に動くアプリです（Android 9 以上）。エディタは WebView の中で
+  動き、ページからは DAW の中と同じ `window.ferritron` が使えます。HTML/JS のエディタが
+  ないプラグインには、パラメータから作った画面（インストゥルメントは鍵盤つき）が出ます。
+  MIDI 機器も使えます。必要なもの: Android NDK（`ANDROID_NDK_HOME`、または
+  `C:\Ferritron\SDK\ndk\<版>`）、Android SDK（`ANDROID_HOME`）、JDK 17〜21（d8 が動く版を
+  `FERRITRON_ANDROID_JDK`・`JAVA_HOME`・Android Studio の JDK・`PATH` から選びます）。
+  `rustup target add aarch64-linux-android`。APK はデバッグ鍵で署名されます。公開用には
+  `FERRITRON_ANDROID_KEYSTORE` と `FERRITRON_ANDROID_KEYSTORE_PASS`、`FERRITRON_ANDROID_KEY_ALIAS`
+  を設定します。Gradle は使いません。
+- **iPhone / iPad**: AUv3（GarageBand、AUM、Cubasis、Logic Pro for iPad などが読み込む唯一の
+  形式）と、それを入れるアプリです。AUv3 は AU v2 と同じコード（`ferritron-au`）をアプリ拡張の
+  中に登録し、`AUAudioUnitV2Bridge` で渡します。Apple の iOS SDK は Mac でしか使えない規約の
+  ため、ビルドには Mac と Xcode が必要です。実機に入れるには署名用の ID
+  （`FERRITRON_CODESIGN_IDENTITY`）とプロビジョニングプロファイルが必要です。
+- **Web（WAM 2.0）**: プラグインを WebAssembly（`wasm32-wasip1`。
+  `rustup target add wasm32-wasip1`）にして、AudioWorklet で動かす Web Audio Module です。
+  `<名前>.wam/` を Web サーバーに置くと、WAM 2.0 のホストが `index.js` を `import()` して使えます。
+  同じフォルダの `index.html` はブラウザで試せるページです（テスト音・マイク・ファイル、
+  インストゥルメントは鍵盤）。オートメーションと MIDI はサンプル単位で届きます。ページは
+  `file://` では動かないので、`python -m http.server` などで開いてください。
+- **LV2**（機能 `lv2`、既定で有効。SDK 不要）: パラメータごとのコントロールポート、MIDI、
+  状態、レイテンシ、書き出し（freewheel）に対応します。Turtle（`manifest.ttl`、`plugin.ttl`）は
+  プロジェクトファイルから生成されます。エディタは Windows と macOS で出ます。プラグインが自分で
+  変えたパラメータ（`InstanceHandle`、MCP）はホストに記録されません（LV2 のコントロール
+  ポートはホストのものだからです）。
+- **AAX**（機能 `aax`、既定では無効）: Avid の AAX SDK は登録した開発者だけが入手できるため、
+  ご自身で入手して `AAX_SDK_DIR` に置いてください（見つからないときは警告を出し、AAX なしで
+  ビルドします）。Pro Tools は PACE の wraptool で署名したプラグインだけを読み込みます
+  （Pro Tools Developer は未署名でも読み込みます）。AAX DSP、AudioSuite、サイドチェーン、
+  ステレオより多いバスは対象外です。
+
 ### DAW なしでのテスト
 
 `ferritron::testing::Harness` は、ホストと同じ経路（サンプル単位のオートメーション、
@@ -1113,6 +1174,20 @@ cargo run -p ferritron-testhost -- "target/bundled/Ferritron Gain.vst3" --second
 3. **リンク**: 組み込みの形式は `ferritron` クレートの機能です。サードパーティの形式は、
    プラグインから `use ferritron_xyz as _;` でリンクします。
 
+形式のメタデータには、ほかに次のキーも書けます（どれも CLI に形式ごとのコードはありません）:
+
+| キー | 意味 |
+|---|---|
+| `files` | プロジェクトファイルから生成するファイル（テンプレート。`{#params}...{/params}` のような繰り返しと条件が使えます。LV2 の Turtle、WAM の `descriptor.json`） |
+| `assets` | そのままコピーするファイル（WAM の JavaScript、Android の Java） |
+| `ui` | プラグインの HTML/JS エディタのフォルダを置く場所 |
+| `launcher` / `launcher-kind` | アプリの実行ファイル（`cargo ferritron` がコンパイルするランチャー。`appex` は Apple のアプリ拡張） |
+| `package` | ファイルを置いた後の処理（`apk`: Android の APK） |
+| `symbol-values` | バイナリがエクスポートするシンボルから取るテンプレートの値（AUv3 のクラス名） |
+
+C ABI には `ferritron.describe.v1` が加わりました。パラメータのキー・種類・範囲・翻訳済みの
+名前と、エディタのメッセージを JSON で返します（WAM と Android アプリが使います）。
+
 `crates/ferritron-vst3` と `crates/ferritron-clap` はまさにこの方法で書かれています。
 
 ## リポジトリの構成
@@ -1157,9 +1232,9 @@ cargo run -p ferritron-testhost -- "target/bundled/Ferritron Gain.vst3" --second
 
 ## バージョン
 
-Ferritron のすべてのクレートは1つのバージョンを共有します（現在 **1.2.0**）。
+Ferritron のすべてのクレートは1つのバージョンを共有します（現在 **1.3.0**）。
 [CHANGELOG.md](CHANGELOG.md) を参照してください。プラグインでは
-`ferritron = { path = "...", version = "1.2.0" }` で固定できます。`ferritron::VERSION` と
+`ferritron = { path = "...", version = "1.3.0" }` で固定できます。`ferritron::VERSION` と
 `cargo ferritron --version` で確認できます。
 
 ## ライセンス

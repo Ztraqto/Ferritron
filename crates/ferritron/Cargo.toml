@@ -8,11 +8,19 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = ["vst3", "clap", "au"]
+default = ["vst3", "clap", "au", "lv2", "standalone", "auv3"]
 vst3 = ["dep:ferritron-vst3"]
 clap = ["dep:ferritron-clap"]
 # Audio Unit v2; only builds anything on macOS.
 au = ["dep:ferritron-au"]
+# LV2 (Windows, macOS, Linux); needs no SDK.
+lv2 = ["dep:ferritron-lv2"]
+# Standalone apps: Windows, macOS, Linux, iPhone/iPad, Android.
+standalone = ["dep:ferritron-standalone"]
+# AUv3 (macOS, iPhone/iPad): an app extension inside the standalone app.
+auv3 = ["dep:ferritron-auv3", "standalone"]
+# AAX (Pro Tools); needs Avid's AAX SDK (AAX_SDK_DIR), so it is off by default.
+aax = ["dep:ferritron-aax"]
 # HTML/JS editors (`[view] backend = "web"`).
 web = ["dep:ferritron-web"]
 # Editors drawn with wgpu (`[view] backend = "gpu"`).
@@ -32,11 +40,28 @@ ferritron-web = { workspace = true, optional = true }
 ferritron-gpu-view = { workspace = true, optional = true }
 ferritron-ara = { workspace = true, optional = true }
 
-# Plugin formats are for native builds. A plugin built for WebAssembly is a
-# guest of `ferritron-wasm` (isolation Level 2), which carries the formats.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# The browser: built for WebAssembly, every plugin is also a Web Audio
+# Module (`cargo ferritron bundle <package> --target web`).
+[target.'cfg(target_family = "wasm")'.dependencies]
+ferritron-wam.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies.ferritron-standalone]
+workspace = true
+optional = true
+
+# Plugin formats are for desktop builds. A plugin built for WebAssembly is a
+# guest of `ferritron-wasm` (isolation Level 2), which carries the formats,
+# or a WAM. Phones get apps (standalone, AUv3).
+[target.'cfg(not(any(target_family = "wasm", target_os = "android", target_os = "ios")))'.dependencies]
 ferritron-vst3 = { workspace = true, optional = true }
 ferritron-clap = { workspace = true, optional = true }
+ferritron-lv2 = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ferritron-au = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+ferritron-auv3 = { workspace = true, optional = true }
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+ferritron-aax = { workspace = true, optional = true }

@@ -92,5 +92,9 @@ mod tests {
         assert_ne!(param_id("gain"), param_id("mix"));
         assert!(param_id("gain") < 0x8000_0000);
         assert_ne!(class_id("com.example.a"), class_id("com.example.b"));
+        // Packaging computes ids from the project file (LV2 ports, WAM keys): same function.
+        for key in ["gain", "ferritron.bypass", "ferritron.quality", "ferritron.mcp", "some_long_parameter_key_42"] {
+            assert_eq!(param_id(key), ferritron_manifest::param_id(key), "{key}");
+        }
     }
 }

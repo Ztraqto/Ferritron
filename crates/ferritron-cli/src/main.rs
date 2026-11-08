@@ -1,7 +1,9 @@
 //! `cargo ferritron`: builds Ferritron plugins and packages them for hosts.
 
+mod android;
 mod exports;
 mod formats;
+mod launcher;
 mod i18n;
 mod new;
 mod sdk;
@@ -31,7 +33,8 @@ Options:
               `cargo build -p <package>` updates the plugin inside the running host
   --install   Also copy the results to each format's system folder
               (may need administrator rights)
-  --target T  Build for another target: aarch64-apple-darwin,
+  --target T  Build for another target: web (a Web Audio Module, WAM 2.0;
+              needs `rustup target add wasm32-wasip1`), aarch64-apple-darwin,
               x86_64-apple-darwin, universal-apple-darwin (both in one).
               From Windows or Linux, macOS builds go through xclang
               (`cargo ferritron sdk fetch xclang`, then `... fetch macos`).
@@ -138,14 +141,22 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let manifest = project(&artifact.manifest_dir, &metadata)?;
     let name = manifest.name.clone();
-    let values = manifest.template_values();
+    let scope = manifest.template_scope();
+    let ui_dir = web_ui_dir(&artifact.manifest_dir);
     let file_name: String = name.chars().map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
     // target/<profile>/<lib> -> target/bundled/
     let out_dir = artifact.library.parent().and_then(Path::parent).ok_or("unexpected build output location")?.join("bundled");
 
     let companions = companions(&artifact)?;
+    let mut made: Vec<PathBuf> = Vec::new();
     for format in &formats {
-        let (root, binary) = format.package(&artifact.library, &out_dir, &file_name, &values)?;
+        let keep_root = made.contains(&format.root(&out_dir, &file_name)?);
+        let inputs = formats::Inputs { name: &file_name, scope: &scope, ui: ui_dir.as_deref(), keep_root, exports: &exported };
+        let (root, binary) = format.package(&artifact.library, &out_dir, &inputs)?;
+        made.push(root.clone());
+        if let Some(path) = format.launcher(&out_dir, &file_name)? {
+            launcher::build(&target, &path, &binary, format.launcher_kind.as_deref() == Some("appex"))?;
+        }
         // Companion libraries (C# and other language hosts) go next to the binary.
         let beside = binary.parent().ok_or("unexpected bundle layout")?;
         for companion in &companions {
@@ -158,14 +169,20 @@ fn run(args: &[String]) -> Result<(), String> {
             // A marker left by an earlier dev build would make this release package hot reload.
             let _ = std::fs::remove_file(formats::with_suffix(&binary, HOT_RELOAD_MARKER_SUFFIX));
         }
-        if root.is_dir() && target.is_unix() {
+        if format.package.as_deref() == Some("apk") {
+            let apk = android::package(&root, &manifest, &file_name)?;
+            println!("Bundled {} ({})", apk.display(), format.name);
+            continue;
+        }
+        if root.is_dir() && target.is_unix() && !target.is_mobile() {
             // Isolated plugins run in a child process started by this helper.
             let helper = host_helper(&out_dir, &target)?;
             let helpers = root.join("Contents/Helpers");
             std::fs::create_dir_all(&helpers).map_err(|e| format!("cannot create {}: {e}", helpers.display()))?;
             std::fs::copy(&helper, helpers.join("ferritron-host")).map_err(|e| format!("cannot copy the ferritron-host helper: {e}"))?;
         }
-        if target.is_macos() && root.is_dir() {
+        // Apps are signed once, after every format inside them is in place.
+        if target.is_apple() && root.is_dir() && !formats.iter().skip_while(|f| f.name != format.name).skip(1).any(|f| f.root(&out_dir, &file_name).ok().as_ref() == Some(&root)) {
             target::sign_macos(&root)?;
         }
         println!("Bundled {} ({})", root.display(), format.name);
@@ -277,6 +294,20 @@ fn build_one(package: &str, release: bool, target: &target::Target, triple: Opti
     if let Some(minimum) = target.deployment_target() {
         cmd.env("MACOSX_DEPLOYMENT_TARGET", minimum);
     }
+    if target.is_web() {
+        // The browser side calls the plugin's functions through its table.
+        cmd.env("CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS", "-Clink-arg=--export-table");
+    }
+    if let (true, Some(triple)) = (target.os == "android", triple) {
+        // The NDK's clang links (and compiles any C), for the oldest Android supported.
+        let (clang, ar) = android::ndk_tools(triple)?;
+        let var = triple.replace('-', "_");
+        cmd.env(format!("CARGO_TARGET_{}_LINKER", var.to_ascii_uppercase()), &clang);
+        cmd.env(format!("CC_{var}"), &clang).env(format!("AR_{var}"), &ar);
+    }
+    if target.os == "ios" {
+        cmd.env("IPHONEOS_DEPLOYMENT_TARGET", target::IOS_MINIMUM);
+    }
     let dir = package_dir(&cargo, package);
     if let Some(dir) = &dir {
         cmd.env("FERRITRON_ASSETS_STAMP", assets_stamp(dir));
@@ -314,7 +345,7 @@ fn build_one(package: &str, release: bool, target: &target::Target, triple: Opti
             .into_iter()
             .flatten()
             .filter_map(|f| f.as_str())
-            .find(|f| [".dll", ".so", ".dylib"].iter().any(|ext| f.ends_with(ext)));
+            .find(|f| [".dll", ".so", ".dylib", ".wasm"].iter().any(|ext| f.ends_with(ext)));
         let manifest = msg["manifest_path"].as_str();
         if let (Some(library), Some(manifest)) = (library, manifest) {
             let manifest_dir = Path::new(manifest).parent().unwrap().to_path_buf();
@@ -377,6 +408,17 @@ fn assets_stamp(package_dir: &Path) -> String {
     walk(&package_dir.join(&ui), &ui, &mut files);
     files.sort();
     files.join(";")
+}
+
+/// The plugin's web editor folder (`[view] backend = "web"`, `entry`), if it has one.
+fn web_ui_dir(package_dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(ferritron_manifest::locate(package_dir).ok()?).ok()?;
+    let view = text.parse::<toml::Table>().ok()?.get("view")?.as_table()?.clone();
+    if view.get("backend").and_then(|b| b.as_str()) != Some("web") {
+        return None;
+    }
+    let dir = package_dir.join(view.get("entry").and_then(|e| e.as_str()).unwrap_or("ui"));
+    dir.join("index.html").is_file().then_some(dir)
 }
 
 /// The project file, with the package's version when it names none.

@@ -6,7 +6,9 @@ use std::path::Path;
 
 pub fn exported_names(path: &Path) -> Result<Vec<String>, String> {
     let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let names = if data.starts_with(b"ELF") {
+    let names = if data.starts_with(b"\0asm") {
+        parse_wasm(&data)
+    } else if data.starts_with(b"\x7fELF") {
         parse_elf(&data)
     } else if data.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) || data.starts_with(&[0xca, 0xfe, 0xba, 0xbe]) {
         parse_macho(&data)
@@ -14,6 +16,53 @@ pub fn exported_names(path: &Path) -> Result<Vec<String>, String> {
         parse(&data)
     };
     names.ok_or_else(|| format!("{} is not a valid plugin library", path.display()))
+}
+
+/// A LEB128 unsigned number at `*at`, advancing it.
+fn leb(d: &[u8], at: &mut usize) -> Option<u64> {
+    let (mut value, mut shift) = (0u64, 0);
+    loop {
+        let b = *d.get(*at)?;
+        *at += 1;
+        value |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+/// Exported function names of a WebAssembly module (its export section).
+fn parse_wasm(d: &[u8]) -> Option<Vec<String>> {
+    const EXPORT_SECTION: u8 = 7;
+    const FUNCTION: u8 = 0;
+    let mut at = 8; // magic and version
+    let mut names = Vec::new();
+    while at < d.len() {
+        let id = *d.get(at)?;
+        at += 1;
+        let size = leb(d, &mut at)? as usize;
+        let end = at.checked_add(size)?;
+        if id == EXPORT_SECTION {
+            let mut p = at;
+            for _ in 0..leb(d, &mut p)? {
+                let len = leb(d, &mut p)? as usize;
+                let name = std::str::from_utf8(d.get(p..p + len)?).ok()?.to_string();
+                p += len;
+                let kind = *d.get(p)?;
+                p += 1;
+                leb(d, &mut p)?;
+                if kind == FUNCTION {
+                    names.push(name);
+                }
+            }
+        }
+        at = end;
+    }
+    Some(names)
 }
 
 fn u64_at(d: &[u8], at: usize) -> Option<u64> {

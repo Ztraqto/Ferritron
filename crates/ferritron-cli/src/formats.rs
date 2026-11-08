@@ -18,8 +18,35 @@
 //!
 //! `info-plist` is written to `<root>/Contents/Info.plist` with `{key}`
 //! placeholders filled from the project file (see
-//! `ferritron_manifest::Manifest::template_values`) and `{executable}`, the
-//! binary's file name.
+//! `ferritron_manifest::Manifest::template_scope`) and `{executable}` /
+//! `{binary}`, the binary's file name.
+//!
+//! More files a format may need:
+//!
+//! ```toml
+//! # Generated: templates (relative to the format crate) filled like the
+//! # Info.plist, with lists and sections (see `ferritron_manifest::render`).
+//! files = { "{name}.lv2/manifest.ttl" = "lv2/manifest.ttl" }
+//! # Copied as they are.
+//! assets = { "{name}.wam/index.js" = "web/index.js" }
+//! # The plugin's web editor folder (`[view] entry`), copied here if it has one.
+//! ui = "{name}.wam/gui"
+//! # An executable that loads the binary and calls the entry symbol (apps),
+//! # compiled by `cargo ferritron`; "appex" for an Apple app extension.
+//! launcher = "{name}/{name}.exe"
+//! launcher-kind = "appex"
+//! # Packaging after the files are in place: "apk" (Android).
+//! package = "apk"
+//! # Template values from the binary's exported symbols: the first symbol
+//! # starting with the prefix, without anything up to its last `$_`
+//! # (`OBJC_CLASS_$_Name` -> `Name`).
+//! symbol-values = { "auv3.class" = "OBJC_CLASS_$_FerritronAUv3_" }
+//! ```
+//!
+//! Templates also get `{file}`: the plugin's name as a file name.
+//!
+//! Formats may share a root (an app and the AUv3 extension inside it): a
+//! root made earlier in the same run is kept.
 //!
 //! The CLI knows no format itself: a new format only needs a crate with this
 //! table, linked into the plugin.
@@ -37,6 +64,33 @@ pub struct Format {
     install: BTreeMap<String, String>,
     /// Info.plist template (macOS bundles).
     plist: Option<PathBuf>,
+    /// Generated files: destination template -> template file.
+    files: BTreeMap<String, PathBuf>,
+    /// Copied files: destination template -> source file.
+    assets: BTreeMap<String, PathBuf>,
+    /// Where the plugin's web editor folder goes.
+    ui: Option<String>,
+    /// The app's executable, compiled by `cargo ferritron`.
+    launcher: Option<String>,
+    /// `appex`: the launcher starts an Apple app extension.
+    pub launcher_kind: Option<String>,
+    /// A packaging step after the files are in place (`apk`).
+    pub package: Option<String>,
+    /// Template values from exported symbols: value name -> symbol prefix.
+    symbol_values: BTreeMap<String, String>,
+}
+
+/// What a package is made from, besides the library.
+pub struct Inputs<'a> {
+    /// The plugin's name as a file name.
+    pub name: &'a str,
+    pub scope: &'a ferritron_manifest::Scope,
+    /// The plugin's web editor folder, if it has one.
+    pub ui: Option<&'a Path>,
+    /// The root was made by another format in this run: add to it.
+    pub keep_root: bool,
+    /// The binary's exported symbols.
+    pub exports: &'a [String],
 }
 
 /// Every format declared by a package in the plugin's dependency graph.
@@ -54,8 +108,9 @@ pub fn discover(metadata: &serde_json::Value) -> Result<Vec<Format>, String> {
         let pick = |key: &str| over[key].as_str().or(spec[key].as_str()).map(str::to_string);
         let field = |key: &str| pick(key).ok_or_else(|| format!("{crate_name}: format metadata needs `{key}`"));
         let table = |key: &str| -> BTreeMap<String, String> {
-            spec[key]
+            over[key]
                 .as_object()
+                .or(spec[key].as_object())
                 .into_iter()
                 .flatten()
                 .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
@@ -70,6 +125,14 @@ pub fn discover(metadata: &serde_json::Value) -> Result<Vec<Format>, String> {
             ext: table("ext"),
             install: table("install"),
             plist: pick("info-plist").map(|p| crate_dir.join(p)),
+            files: table("files").into_iter().map(|(k, v)| (k, crate_dir.join(v))).collect(),
+            assets: table("assets").into_iter().map(|(k, v)| (k, crate_dir.join(v))).collect(),
+            ui: pick("ui"),
+            // An empty value under an OS turns a general key off there.
+            launcher: pick("launcher").filter(|l| !l.is_empty()),
+            launcher_kind: pick("launcher-kind"),
+            package: pick("package"),
+            symbol_values: table("symbol-values"),
         });
     }
     formats.sort_by(|a, b| a.name.cmp(&b.name));
@@ -106,24 +169,58 @@ impl Format {
         Ok(out)
     }
 
-    /// Writes the package into `out_dir`; returns its root and the binary
-    /// inside. `values` fill the Info.plist template.
-    pub fn package(&self, library: &Path, out_dir: &Path, name: &str, values: &[(String, String)]) -> Result<(PathBuf, PathBuf), String> {
+    /// The package's root in `out_dir`.
+    pub fn root(&self, out_dir: &Path, name: &str) -> Result<PathBuf, String> {
+        Ok(out_dir.join(self.expand(&self.root, name)?))
+    }
+
+    /// The launcher's path in `out_dir`, if the format has one.
+    pub fn launcher(&self, out_dir: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+        self.launcher.as_ref().map(|l| Ok(out_dir.join(self.expand(l, name)?))).transpose()
+    }
+
+    /// Writes the package into `out_dir`; returns its root and the binary inside.
+    pub fn package(&self, library: &Path, out_dir: &Path, inputs: &Inputs) -> Result<(PathBuf, PathBuf), String> {
+        let name = inputs.name;
         let root = out_dir.join(self.expand(&self.root, name)?);
         let binary = out_dir.join(self.expand(&self.binary, name)?);
-        if root.is_dir() {
+        if root.is_dir() && !inputs.keep_root {
             std::fs::remove_dir_all(&root).map_err(|e| format!("cannot replace {}: {e}", root.display()))?;
         }
         let parent = binary.parent().ok_or("invalid binary path")?;
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         std::fs::copy(library, &binary).map_err(|e| format!("cannot copy {} to {}: {e}", library.display(), binary.display()))?;
+        let executable = binary.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut scope = inputs.scope.clone();
+        scope.text("file", name.to_string());
+        for (key, prefix) in &self.symbol_values {
+            let symbol = inputs.exports.iter().find(|s| s.starts_with(prefix.as_str())).ok_or_else(|| {
+                format!("{}: the binary exports no symbol starting with `{prefix}` (was its native part built?)", self.name)
+            })?;
+            let value = symbol.rsplit_once("$_").map_or(symbol.as_str(), |(_, v)| v);
+            scope.text(key, value.to_string());
+        }
+        scope.text("binary.uri", uri_path(&executable)).text("executable", executable.clone()).text("binary", executable);
+        let mut generated: Vec<(PathBuf, &PathBuf)> =
+            self.files.iter().map(|(to, from)| Ok((out_dir.join(self.expand(to, name)?), from))).collect::<Result<_, String>>()?;
         if let Some(template) = &self.plist {
+            generated.push((root.join("Contents/Info.plist"), template));
+        }
+        for (to, template) in generated {
             let text = std::fs::read_to_string(template).map_err(|e| format!("cannot read {}: {e}", template.display()))?;
-            let executable = binary.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let mut values = values.to_vec();
-            values.push(("executable".into(), executable));
-            let plist = root.join("Contents/Info.plist");
-            std::fs::write(&plist, fill_xml(&text, &values)?).map_err(|e| format!("cannot write {}: {e}", plist.display()))?;
+            let file_name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let filled = ferritron_manifest::render(&text, &scope, ferritron_manifest::Escape::for_file(&file_name))
+                .map_err(|e| format!("{}: {e}", template.display()))?;
+            write(&to, filled.as_bytes())?;
+        }
+        for (to, from) in &self.assets {
+            let to = out_dir.join(self.expand(to, name)?);
+            let bytes = std::fs::read(from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
+            write(&to, &bytes)?;
+        }
+        if let (Some(to), Some(ui)) = (&self.ui, inputs.ui) {
+            let to = out_dir.join(self.expand(to, name)?);
+            copy_dir(ui, &to).map_err(|e| format!("cannot copy {} to {}: {e}", ui.display(), to.display()))?;
         }
         Ok((root, binary))
     }
@@ -157,21 +254,25 @@ impl Format {
     }
 }
 
-/// Fills `{key}` placeholders in an XML template, escaping the values.
-fn fill_xml(template: &str, values: &[(String, String)]) -> Result<String, String> {
-    let escape = |v: &str| v.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find('{') {
-        let end = rest[start..].find('}').ok_or("unclosed { in an Info.plist template")? + start;
-        let key = &rest[start + 1..end];
-        let value = values.iter().find(|(k, _)| k == key).map(|(_, v)| v).ok_or_else(|| format!("unknown placeholder {{{key}}} in an Info.plist template"))?;
-        out.push_str(&rest[..start]);
-        out.push_str(&escape(value));
-        rest = &rest[end + 1..];
+/// A file name as a relative URI (`My Plugin.dll` -> `My%20Plugin.dll`).
+fn uri_path(name: &str) -> String {
+    let mut out = String::new();
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
     }
-    out.push_str(rest);
-    Ok(out)
+    out
+}
+
+/// Writes a file, creating its folder.
+fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -256,10 +357,31 @@ mod tests {
     }
 
     #[test]
-    fn plist_values_are_escaped() {
-        let values = vec![("name".to_string(), "A & <B>".to_string())];
-        assert_eq!(fill_xml("<string>{name}</string>", &values).unwrap(), "<string>A &amp; &lt;B&gt;</string>");
-        assert!(fill_xml("{nope}", &values).is_err());
+    fn generated_files_assets_and_ui_are_written() {
+        let dir = std::env::temp_dir().join(format!("ferritron-formats-{}", std::process::id()));
+        let crate_dir = dir.join("crate");
+        std::fs::create_dir_all(crate_dir.join("t")).unwrap();
+        std::fs::create_dir_all(dir.join("ui/img")).unwrap();
+        std::fs::write(crate_dir.join("t/info.ttl"), "<{binary}> {#params}{symbol} {/params}").unwrap();
+        std::fs::write(crate_dir.join("t/run.js"), "export const x = {name};").unwrap();
+        std::fs::write(dir.join("ui/img/a.svg"), "<svg/>").unwrap();
+        std::fs::write(dir.join("lib.bin"), "lib").unwrap();
+        let metadata = serde_json::json!({ "packages": [
+            { "name": "ferritron-x", "manifest_path": crate_dir.join("Cargo.toml").to_string_lossy(), "metadata": { "ferritron": { "format": {
+                "name": "X", "entry-symbol": "x", "root": "{name}.x", "binary": "{name}.x/{name}.bin",
+                "files": { "{name}.x/info.ttl": "t/info.ttl" }, "assets": { "{name}.x/run.js": "t/run.js" }, "ui": "{name}.x/gui"
+            }}}}
+        ]});
+        let f = &discover(&metadata).unwrap()[0];
+        let manifest = ferritron_manifest::parse("[plugin]\nid = \"a.b\"\nname = \"G\"\n[params]\ng = { type = \"bool\" }").unwrap();
+        let scope = manifest.template_scope();
+        let out = dir.join("out");
+        let inputs = Inputs { name: "G", scope: &scope, ui: Some(&dir.join("ui")), keep_root: false, exports: &[] };
+        let (root, _) = f.package(&dir.join("lib.bin"), &out, &inputs).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("info.ttl")).unwrap(), "<G.bin> g ferritron_bypass ");
+        assert_eq!(std::fs::read_to_string(root.join("run.js")).unwrap(), "export const x = {name};");
+        assert!(root.join("gui/img/a.svg").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Ferritron アーキテクチャ設計書
 
-> ステータス: **確定 v1.41**（2026-11-07）／ Ferritron **1.2.0**
+> ステータス: **確定 v1.42**（2026-11-08）／ Ferritron **1.3.0**
 > 以降の変更は第17章「改訂履歴」に記録し、バージョンを上げて行う。
 > コードネーム: ProjectRvst / 正式名称: **Ferritron**
 
@@ -1083,3 +1083,4 @@ V3（実測）：一般的な 1 GbE / 2.5 GbE / Wi-Fi での往復時間と揺�
 | v1.39 | 2026-11-07 | オープンソース化：公開範囲を決定（D37）。Ferritron Editor とプロジェクトのロックをクローズドソースにし、テンプレートを `ferritron-manifest` に移動。リリースの配布物（本体、Editor、スターターキット） |
 | v1.40 | 2026-11-07 | Ferritron 1.2.0：インスタンスハンドル（ID、トラック情報、通知つき編集、Wake、ストア、Web メッセージ、インスタンス一覧）、`hidden` / `automatable`、プロジェクトファイルの既定の拡張子を `.ferritroject` に（`.frtx` も読む）。C ABI に `ferritron.host.v2` と `ferritron.track.v1`。FDE（拡張開発キット）は作らないと決定：本体はソース配布なので、拡張は crate と公開フックで足りる |
 | v1.41 | 2026-11-07 | Ferritron 1.2.0：SDK の解決規則と管理フォルダ（D38）、`cargo ferritron sdk`、`--target` と xclang によるクロスビルド、公証、macOS の CI（D39）。Editor の SDK 設定・更新確認・自動アップデートと Inno Setup 版スターターキット |
+| v1.42 | 2026-11-08 | Ferritron 1.3.0：全プラットフォーム対応。LV2（Rust、SDK 不要、Turtle はプロジェクトファイルから生成）、スタンドアロンアプリ（ランチャーを CLI がコンパイル）、Android（Sonore と同じくアプリ型。AAudio、WebView のエディタ、Gradle なしの APK）、AUv3（AU v2 をアプリ拡張内で登録し AUAudioUnitV2Bridge で渡す。iPhone / iPad も）、AAX（AAX_CMonolithicParameters 上の C++ シム。SDK は利用者が用意、なければ空でビルド）、WAM 2.0（wasm32-wasip1 のプラグインを AudioWorklet で駆動）。C ABI に `ferritron.describe.v1`。形式メタデータに `files`・`assets`・`ui`・`launcher`・`package`・`symbol-values`（CLI は引き続き形式を知らない） |

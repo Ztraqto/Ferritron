@@ -7,6 +7,7 @@ pub mod abi;
 #[cfg(any(windows, unix))]
 pub mod companion;
 mod audio;
+mod describe;
 #[cfg(any(windows, unix))]
 pub mod directlink;
 pub mod i18n;

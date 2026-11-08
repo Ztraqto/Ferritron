@@ -1,0 +1,39 @@
+[package]
+name = "ferritron-auv3"
+description = "AUv3 (macOS, iOS) format adapter of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# Links against `ferritron_plugin_entry`, which only plugin crates define.
+[lib]
+test = false
+doctest = false
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+ferritron-au.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+# How `cargo ferritron bundle` packages it: an app extension inside the
+# standalone app (both share the root, `<Name>.app`). The launcher is the
+# extension's executable; it loads the plugin from the app's Frameworks.
+# `{auv3.class}` is the principal class, read from the binary's exports.
+[package.metadata.ferritron.format]
+name = "AUv3"
+entry-symbol = "ferritron_auv3_factory"
+root = "{name}.app"
+binary = "{name}.app/Contents/Frameworks/{name}.dylib"
+launcher = "{name}.app/Contents/PlugIns/{name} AUv3.appex/Contents/MacOS/{name} AUv3"
+launcher-kind = "appex"
+symbol-values = { "auv3.class" = "OBJC_CLASS_$_FerritronAUv3_" }
+files = { "{name}.app/Contents/PlugIns/{name} AUv3.appex/Contents/Info.plist" = "apple/macos-appex.plist", "{name} AUv3.entitlements" = "apple/macos-appex.entitlements" }
+
+[package.metadata.ferritron.format.ios]
+binary = "{name}.app/Frameworks/{name}.framework/{name}"
+launcher = "{name}.app/PlugIns/{name} AUv3.appex/{name} AUv3"
+files = { "{name}.app/PlugIns/{name} AUv3.appex/Info.plist" = "apple/ios-appex.plist" }

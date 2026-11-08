@@ -1,0 +1,70 @@
+[package]
+name = "ferritron-standalone"
+description = "Standalone apps (Windows, macOS, Linux, iOS, Android) of the Ferritron audio plugin framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Links against `ferritron_plugin_entry`, which only plugin crates define.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ferritron-core.workspace = true
+
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+cpal = "0.15"
+midir = "0.10"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "objc2", "CFCGTypes"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }
+
+# How `cargo ferritron bundle` packages the app. `launcher` is the app's
+# executable: a small program `cargo ferritron` compiles, which loads the
+# binary and calls the entry symbol.
+[package.metadata.ferritron.format]
+name = "Standalone"
+entry-symbol = "ferritron_standalone_main"
+root = "{name}"
+binary = "{name}/{name}.dll"
+launcher = "{name}/{name}.exe"
+
+[package.metadata.ferritron.format.linux]
+binary = "{name}/lib/{name}.so"
+launcher = "{name}/{name}"
+
+# macOS: an app; it also holds the AUv3 extension when `auv3` is on.
+[package.metadata.ferritron.format.macos]
+root = "{name}.app"
+binary = "{name}.app/Contents/Frameworks/{name}.dylib"
+launcher = "{name}.app/Contents/MacOS/{name}"
+info-plist = "apple/macos-app.plist"
+
+# iPhone, iPad: the plugin as a framework inside the app.
+[package.metadata.ferritron.format.ios]
+root = "{name}.app"
+binary = "{name}.app/Frameworks/{name}.framework/{name}"
+launcher = "{name}.app/{name}"
+files = { "{name}.app/Info.plist" = "apple/ios-app.plist", "{name}.app/Frameworks/{name}.framework/Info.plist" = "apple/ios-framework.plist" }
+ui = "{name}.app/ui"
+
+# Android: an APK (the Java activity, the plugin as libferritron_app.so, the
+# web editor as assets), compiled and signed by `cargo ferritron`.
+[package.metadata.ferritron.format.android]
+root = "{name}.android"
+binary = "{name}.android/lib/{arch}/libferritron_app.so"
+arch = { android-aarch64 = "arm64-v8a", android-x86_64 = "x86_64" }
+package = "apk"
+launcher = ""
+files = { "{name}.android/AndroidManifest.xml" = "android/AndroidManifest.xml" }
+assets = { "{name}.android/java/dev/ferritron/app/FerritronActivity.java" = "android/FerritronActivity.java", "{name}.android/assets/ferritron/bridge.js" = "android/bridge.js", "{name}.android/assets/ferritron/editor.html" = "android/editor.html" }
+ui = "{name}.android/assets/ui"

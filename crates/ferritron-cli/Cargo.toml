@@ -15,6 +15,8 @@ path = "src/main.rs"
 ferritron-build.workspace = true
 ferritron-manifest.workspace = true
 ferritron-sdk.workspace = true
+# Finds MSVC to compile app launchers on Windows.
+cc = "1"
 fluent-syntax = "0.12"
 serde_json = "1"
 toml = "1"

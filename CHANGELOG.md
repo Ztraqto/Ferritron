@@ -3,8 +3,77 @@
 All notable changes to Ferritron. Versions follow [Semantic Versioning](https://semver.org/):
 every crate of the workspace shares one version (`[workspace.package]` in
 `Cargo.toml`). A plugin can pin it with
-`ferritron = { path = "...", version = "1.2.0" }`, and read it at run time as
+`ferritron = { path = "...", version = "1.3.0" }`, and read it at run time as
 `ferritron::VERSION`.
+
+## 1.3.0 — 2026-11-08
+
+Every platform: LV2, AUv3, AAX, standalone apps, iPhone and iPad, Android,
+and the web (WAM 2.0), from the same plugin. Plugins built with 1.2 build
+unchanged; parameter IDs and saved state stay valid. New default features
+(`lv2`, `standalone`, `auv3`) add formats; `default-features = false` keeps
+a plugin to the ones it lists.
+
+### Added
+- **LV2** (`ferritron-lv2`, feature `lv2`, default; Windows, macOS, Linux):
+  written in Rust, no SDK. A control port per parameter (plain values,
+  toggles, enumerations with their choices, units), MIDI for instruments
+  (sample-accurate), state (one `atom:Chunk`), latency, freewheel (export
+  quality), blocks of any length. The editor embeds through `ui:parent`
+  (Windows, macOS), with `instance-access` for `ferritron.instance`. The
+  Turtle files are generated from the project file. Plugin URI:
+  `urn:ferritron:<plugin id>`.
+- **Standalone apps** (`ferritron-standalone`, feature `standalone`,
+  default): the plugin on its own with the computer's audio and MIDI
+  (Windows: WASAPI and midir; macOS: Core Audio and Core MIDI; Linux: ALSA,
+  no editor yet), its editor in the app's window, its state kept between
+  runs. The app's executable is a launcher `cargo ferritron` compiles.
+- **Android** (`--target android` / `aarch64-linux-android` /
+  `x86_64-linux-android`): an APK built with the Android SDK's tools and a
+  JDK (no Gradle): AAudio, `android.media.midi`, the plugin's HTML/JS editor
+  in a WebView with the same `window.ferritron`, or an editor made from the
+  parameters (with a keyboard for instruments). Signed with the debug key,
+  or a release key (`FERRITRON_ANDROID_KEYSTORE`). Needs the Android NDK
+  (new SDK id `ndk`, `ANDROID_NDK_HOME`).
+- **AUv3** (`ferritron-auv3`, feature `auv3`, default; macOS, iPhone, iPad):
+  an app extension inside the standalone app. It registers the AU v2 code
+  in the extension and hands hosts an `AUAudioUnitV2Bridge` of it; on macOS
+  the view is the plugin's editor. **iPhone / iPad** (`--target ios`): the
+  app (RemoteIO, Core MIDI) with the AUv3; needs a Mac with Xcode.
+- **AAX** (`ferritron-aax`, feature `aax`, off by default): a C++ shim on
+  `AAX_CMonolithicParameters`, compiled with the developer's AAX SDK
+  (new SDK id `aax`, `AAX_SDK_DIR`): parameters with the plugin's own text,
+  Master Bypass, state as one chunk, MIDI for instruments, latency, the
+  plugin's editor. Without the SDK the crate builds empty with a warning.
+- **WAM 2.0** (`ferritron-wam`, `--target web`): the plugin as WebAssembly
+  in an AudioWorklet, as a Web Audio Module any WAM 2.0 host loads, with
+  sample-accurate automation and MIDI, state, latency, parameter info with
+  keys and localized names, the plugin's web editor (or one made from the
+  parameters) and a page to try it (`index.html`).
+- C ABI: `ferritron.describe.v1`, the plugin as JSON (parameter keys,
+  kinds, ranges, localized names and choices, editor messages).
+- `cargo ferritron bundle --target web | android | ios` (and the full
+  triples); format metadata keys `files` (templates with lists and
+  sections), `assets`, `ui`, `launcher` / `launcher-kind`, `package` and
+  `symbol-values`; templates get `{file}`, `{binary.uri}`, `{id.package}`.
+- `ferritron_manifest`: `Manifest::host_params`, `template_scope`,
+  `render`, `param_id` (the same as the core's, pinned by a test),
+  `java_package`; `Manifest::view`.
+- `ferritron_au::factory` (and `editor_view` on macOS) for adapters built on
+  the AU v2; `ferritron-au` also builds for iOS (without the Cocoa view).
+
+### Fixed
+- WebAssembly: creating an instance no longer panics (no process ids there),
+  which also broke isolation Level 2 guests built with 1.2.
+- Android builds of the core (no POSIX shared memory: process isolation is
+  not offered there).
+- Mach-O bundles: nested code (frameworks, app extensions with their
+  entitlements, the helper) is signed before the bundle.
+
+### Not verified
+- macOS and iOS (standalone, AUv3, and the AU v2 changes) are type-checked
+  only; AAX was written without the SDK and is not compiled; LV2 was checked
+  with a test host, not yet in a DAW; Android on the emulator, not on a phone.
 
 ## 1.2.0 — 2026-11-07
 

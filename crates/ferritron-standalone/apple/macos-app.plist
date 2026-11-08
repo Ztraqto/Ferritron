@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The standalone app (and the AUv3 container). Filled in by `cargo ferritron bundle` from the project file. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>{file}</string>
+	<key>CFBundleIdentifier</key>
+	<string>{id.package}</string>
+	<key>CFBundleName</key>
+	<string>{name}</string>
+	<key>CFBundleDisplayName</key>
+	<string>{name}</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>{version}</string>
+	<key>CFBundleVersion</key>
+	<string>{version}</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.music</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>{vendor}</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>{name} processes the sound from your microphone or line input.</string>
+</dict>
+</plist>

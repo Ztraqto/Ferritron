@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{name}</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --panel: #ffffff; --line: #d9d9d4; --accent: #c2410c; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ececea; --muted: #a2a29c; --panel: #222220; --line: #3a3a37; --accent: #fb923c; } }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
+  button, select { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #gui { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; min-height: 80px; }
+  #status { color: var(--muted); min-height: 1.5em; }
+  .keys { display: flex; gap: 2px; margin-top: 16px; user-select: none; touch-action: none; }
+  .keys button { flex: 1; min-width: 0; height: 96px; padding: 0; border-radius: 0 0 6px 6px; background: #fafaf8; color: #1d1d1b; border-color: #c9c9c4; }
+  .keys button.black { background: #1d1d1b; color: #ececea; height: 64px; }
+  .keys button.on { background: var(--accent); color: #fff; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>{name}</h1>
+  <p class="sub">{vendor} · {version} · <span data-t="sub">Web Audio Module (WAM 2.0)</span></p>
+  <div class="bar">
+    <button class="primary" id="start" data-t="start">開始</button>
+    {#effect}<label><span data-t="source">入力</span>
+      <select id="source">
+        <option value="tone" data-t="tone">テスト音</option>
+        <option value="noise" data-t="noise">ノイズ</option>
+        <option value="mic" data-t="mic">マイク</option>
+        <option value="file" data-t="file">ファイル…</option>
+      </select></label>
+    <input type="file" id="file" accept="audio/*" hidden>{/effect}
+    <span id="status" role="status"></span>
+  </div>
+  <div id="gui"></div>
+  {#instrument}<div class="keys" id="keys" aria-label="Keyboard"></div>{/instrument}
+</main>
+<script type="module">
+const EN = { sub: "Web Audio Module (WAM 2.0)", start: "Start", source: "Input", tone: "Test tone", noise: "Noise", mic: "Microphone", file: "File…",
+  loading: "Loading…", ready: "Running", error: "Could not start: ", stop: "Stop", keys: "Play with the keys or A–K on your keyboard" };
+const JA = { loading: "読み込み中…", ready: "動作中", error: "開始できませんでした: ", stop: "停止", keys: "鍵盤か PC キーボードの A〜K で演奏できます" };
+const ja = (navigator.language || "").startsWith("ja");
+const t = (k) => (ja ? JA[k] : EN[k]) ?? EN[k] ?? k;
+if (!ja) { document.documentElement.lang = "en"; for (const el of document.querySelectorAll("[data-t]")) if (EN[el.dataset.t]) el.textContent = EN[el.dataset.t]; }
+
+const status = document.getElementById("status");
+let context = null, wam = null, source = null;
+
+async function start() {
+  status.textContent = t("loading");
+  context = new AudioContext({ latencyHint: "interactive" });
+  const { default: Plugin } = await import("./index.js");
+  wam = await Plugin.createInstance("ferritron-demo", context);
+  wam.audioNode.connect(context.destination);
+  document.getElementById("gui").replaceChildren(await wam.createGui());
+  if (!wam.descriptor.isInstrument) await setSource(document.getElementById("source").value);
+  else keyboard();
+  status.textContent = t("ready");
+}
+
+async function setSource(kind) {
+  source?.disconnect();
+  source?.stop?.();
+  source?.mediaStream?.getTracks().forEach((track) => track.stop());
+  source = null;
+  if (kind === "tone") {
+    source = new OscillatorNode(context, { type: "sawtooth", frequency: 220 });
+    const level = new GainNode(context, { gain: 0.2 });
+    source.connect(level).connect(wam.audioNode);
+    source.start();
+    source.level = level;
+  } else if (kind === "noise") {
+    const buffer = new AudioBuffer({ length: context.sampleRate * 2, numberOfChannels: 2, sampleRate: context.sampleRate });
+    for (let c = 0; c < 2; c++) { const d = buffer.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * 0.2; }
+    source = new AudioBufferSourceNode(context, { buffer, loop: true });
+    source.connect(wam.audioNode);
+    source.start();
+  } else if (kind === "mic") {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    source = new MediaStreamAudioSourceNode(context, { mediaStream: stream });
+    source.connect(wam.audioNode);
+  } else if (kind === "file") {
+    document.getElementById("file").click();
+  }
+}
+
+function keyboard() {
+  const keys = document.getElementById("keys");
+  const letters = "awsedftgyhujk";
+  const send = (bytes) => wam.audioNode.scheduleEvents({ type: "wam-midi", time: context.currentTime, data: { bytes } });
+  const held = new Set();
+  const on = (n, el) => { if (held.has(n)) return; held.add(n); el?.classList.add("on"); send([0x90, n, 100]); };
+  const off = (n, el) => { if (!held.delete(n)) return; el?.classList.remove("on"); send([0x80, n, 0]); };
+  const buttons = {};
+  for (let i = 0; i < 13; i++) {
+    const n = 60 + i;
+    const b = document.createElement("button");
+    b.className = [1, 3, 6, 8, 10].includes(i % 12) ? "black" : "";
+    b.textContent = letters[i].toUpperCase();
+    b.onpointerdown = (e) => { b.setPointerCapture(e.pointerId); on(n, b); };
+    b.onpointerup = b.onpointercancel = () => off(n, b);
+    buttons[letters[i]] = [n, b];
+    keys.append(b);
+  }
+  status.title = t("keys");
+  addEventListener("keydown", (e) => { if (!e.repeat && buttons[e.key]) on(...buttons[e.key]); });
+  addEventListener("keyup", (e) => { if (buttons[e.key]) off(...buttons[e.key]); });
+}
+
+document.getElementById("start").onclick = async (e) => {
+  const button = e.currentTarget;
+  if (context) { await context.close(); context = null; document.getElementById("gui").replaceChildren(); button.textContent = ja ? "開始" : EN.start; status.textContent = ""; return; }
+  try { await start(); button.textContent = t("stop"); } catch (err) { status.textContent = t("error") + (err?.message ?? err); console.error(err); }
+};
+document.getElementById("source")?.addEventListener("change", (e) => context && setSource(e.target.value));
+document.getElementById("file")?.addEventListener("change", async (e) => {
+  const f = e.target.files?.[0];
+  if (!f || !context) return;
+  const buffer = await context.decodeAudioData(await f.arrayBuffer());
+  source = new AudioBufferSourceNode(context, { buffer, loop: true });
+  source.connect(wam.audioNode);
+  source.start();
+});
+</script>
+</body>
+</html>
