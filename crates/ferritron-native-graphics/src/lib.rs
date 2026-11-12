@@ -41,7 +41,7 @@ pub use image::ImageStore;
 pub use path::{FillRule, Flat, Path, Verb};
 pub use raster::{Mask, Rasterizer};
 pub use render::RenderOptions;
-pub use scene::{ImageId, LayerId, MAX_STOPS, Paint, Sampling, Scene, ShadowStyle, Stops};
+pub use scene::{ImageId, LayerId, MAX_STOPS, Paint, Picture, Sampling, Scene, ShadowStyle, Stops};
 pub use stroke::{Cap, Dash, Join, Stroke};
 pub use text::{Align, Hit, Layout, TextStyle};
 

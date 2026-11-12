@@ -270,3 +270,45 @@ fn reference_text() {
     // changes the picture, so the allowed difference is generous.
     check_reference("text", &render_text(&s, 1.0), 255, 1.5);
 }
+
+#[test]
+fn letter_spacing_widens_by_the_gaps_between_characters() {
+    let Some((fonts, chain)) = setup() else { return };
+    let plain = Layout::new(&fonts, "PANSTUDIO", &style(&chain, 12.0));
+    let spaced = Layout::new(&fonts, "PANSTUDIO", &style(&chain, 12.0).with_letter_spacing(3.0));
+    // nine characters: eight gaps, none after the last one
+    assert!((spaced.width() - plain.width() - 8.0 * 3.0).abs() < 0.01, "{} {}", plain.width(), spaced.width());
+}
+
+#[test]
+fn fit_cuts_with_an_ellipsis_and_keeps_text_that_fits() {
+    let Some((mut fonts, chain)) = setup() else { return };
+    let st = style(&chain, 12.0);
+    assert_eq!(fonts.fit("Kick", &st, 200.0), "Kick");
+    let long = "トラックの名前がとても長い Lead Vocal";
+    let cut = fonts.fit(long, &st, 80.0);
+    assert!(cut.ends_with('…') && cut.chars().count() < long.chars().count(), "{cut}");
+    assert!(fonts.layout(&cut, &st).width() <= 80.0);
+    // one more character would not fit
+    let kept = cut.trim_end_matches('…');
+    let next: String = long.chars().take(kept.chars().count() + 1).collect();
+    assert!(fonts.layout(&format!("{}…", next.trim_end()), &st).width() > 80.0);
+    assert_eq!(fonts.fit(long, &st, 1.0), "…");
+}
+
+#[test]
+fn text_line_puts_the_baseline_at_y_and_aligns_at_x() {
+    let Some((mut fonts, chain)) = setup() else { return };
+    let l = fonts.layout("Pan", &style(&chain, 20.0));
+    assert!(l.baseline() > 10.0 && l.baseline() < l.height());
+    let mut s = Scene::new();
+    assert_eq!(s.text_line(&l, Point::new(100.0, 50.0), Align::Start, Color::WHITE), 100.0);
+    assert!((s.text_line(&l, Point::new(100.0, 50.0), Align::End, Color::WHITE) - (100.0 - l.width())).abs() < 1e-4);
+    assert!((s.text_line(&l, Point::new(100.0, 50.0), Align::Center, Color::WHITE) - (100.0 - l.width() / 2.0)).abs() < 1e-4);
+    // drawn: ink above the baseline at y = 50, little below it
+    let mut one = Scene::new();
+    one.text_line(&l, Point::new(10.0, 50.0), Align::Start, Color::WHITE);
+    let img = CpuRenderer::new().render(&one, (120, 80), 1.0);
+    let ink = |y0: u32, y1: u32| (y0..y1).flat_map(|y| (0..120).map(move |x| (x, y))).filter(|&(x, y)| img.pixel(x, y)[3] > 128).count();
+    assert!(ink(36, 50) > 40 && ink(51, 80) == 0, "{} {}", ink(36, 50), ink(51, 80));
+}

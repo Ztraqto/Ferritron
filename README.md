@@ -259,6 +259,18 @@ impl GpuEditor for Editor {
 5 秒ごとに試します。`FERRITRON_GPU_VIEW=cpu` を設定すると、最初から CPU で描きます。GPU が必要なエディタは、
 GPU がないと開きません。
 
+FNG で描くエディタに便利なもの:
+
+- **記録の使い回し**: `fng::Picture::record(|s| ..)` で一度記録した絵を、`scene.draw_picture(&picture)` で何度でも
+  置けます（今の変換・クリップ・不透明度が掛かります）。描き直さない部分を毎フレーム組み直すときは
+  `scene.draw_scene(&kept)` で、手元に残した `Scene` をそのまま置けます。
+- **内側の影**: `scene.inner_shadow(rect, radius, ShadowStyle { .. })`（へこんだ面。CSS の `inset` と同じ向き）。
+- **文字**: `scene.text_line(&layout, Point::new(x, baseline), Align::End, color)` でベースラインと左右の揃えを
+  指定して置けます。`fonts.fit(text, &style, width)` は幅に入るよう「…」で切り、
+  `TextStyle::with_letter_spacing(px)` は字間を空けます。
+- **独自の GPU 描画を挟む**: `FngEditor::render_gpu` に自分の wgpu の描画（`LoadOp::Load` で重ねる）を書くと、
+  `draw` の絵の上、`draw_over` の絵の下に入ります。CPU で描くときは代わりに `draw_without_gpu` が呼ばれます。
+
 ### 無音時の停止と書き出し時の音質
 
 **待機中のプラグインは負荷ゼロ。** プラグインの入力が無音（-120 dBFS 未満）のまま、

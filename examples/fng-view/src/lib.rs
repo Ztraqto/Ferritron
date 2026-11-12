@@ -130,4 +130,66 @@ mod tests {
         assert_eq!(at(2, 2), &[0x1b, 0x1c, 0x20], "the background");
         assert_eq!(at(240, 120 - 4), &[0x4f, 0x9d, 0xff], "the filled part of the track");
     }
+
+    /// An editor with its own GPU drawing between two FNG scenes (it counts the GPU passes).
+    struct Layered {
+        gpu_passes: u32,
+    }
+
+    impl FngEditor for Layered {
+        fn new(_ui: &Ui) -> Self {
+            Self { gpu_passes: 0 }
+        }
+        fn draw(&mut self, scene: &mut Scene, _ui: &Ui) {
+            scene.fill_rect(Rect::new(0.0, 0.0, 60.0, 20.0), Color::hex(0xff0000));
+        }
+        fn render_gpu(&mut self, _gpu: &ferritron::gpu_view::Gpu, _frame: &ferritron::gpu_view::Frame, _ui: &Ui) {
+            self.gpu_passes += 1;
+        }
+        fn draw_without_gpu(&mut self, scene: &mut Scene, _ui: &Ui) {
+            scene.fill_rect(Rect::new(20.0, 0.0, 20.0, 20.0), Color::hex(0x00ff00));
+        }
+        fn draw_over(&mut self, scene: &mut Scene, _ui: &Ui) {
+            scene.fill_rect(Rect::new(0.0, 0.0, 10.0, 20.0), Color::hex(0x0000ff));
+        }
+    }
+
+    #[test]
+    fn draw_over_comes_after_the_editors_gpu_pass_on_both_backends() {
+        let ui = Ui::for_tests::<FngGain>(60.0, 20.0);
+        // CPU: draw, the stand-in for the GPU pass, then draw_over.
+        let mut cpu = <FngAdapter<Layered> as ferritron::gpu_view::GpuEditor>::new_cpu(&ui).unwrap();
+        let mut out = Vec::new();
+        assert!(ferritron::gpu_view::GpuEditor::render_cpu(&mut cpu, &ui, (60, 20), 1.0, &mut out));
+        let bgra = |x: usize| &out[(10 * 60 + x) * 4..(10 * 60 + x) * 4 + 3];
+        assert_eq!(bgra(5), &[0xff, 0, 0], "draw_over (blue) on top");
+        assert_eq!(bgra(30), &[0, 0xff, 0], "the stand-in (green)");
+        assert_eq!(bgra(50), &[0, 0, 0xff], "draw (red)");
+        assert_eq!(cpu.editor.gpu_passes, 0);
+
+        // GPU: draw, the editor's pass (counted), then draw_over over it, not cleared.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 60, height: 20, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let gpu = ferritron::gpu_view::Gpu { device, queue, format };
+        let mut editor = <FngAdapter<Layered> as ferritron::gpu_view::GpuEditor>::new(&gpu, &ui);
+        let frame = ferritron::gpu_view::Frame::new(texture.create_view(&Default::default()), 60, 20, 1.0);
+        ferritron::gpu_view::GpuEditor::render(&mut editor, &gpu, &frame, &ui);
+        let pixels = fng::gpu::read_texture_rgba8(&gpu.device, &gpu.queue, &texture, (60, 20));
+        let rgb = |x: usize| &pixels[(10 * 60 + x) * 4..(10 * 60 + x) * 4 + 3];
+        assert_eq!(rgb(5), &[0, 0, 0xff], "draw_over on top");
+        assert_eq!(rgb(30), &[0xff, 0, 0], "no stand-in on the GPU; draw's picture kept");
+        assert_eq!(editor.editor.gpu_passes, 1);
+    }
 }

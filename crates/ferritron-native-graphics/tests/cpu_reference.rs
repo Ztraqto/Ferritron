@@ -221,3 +221,44 @@ fn dashes_leave_gaps() {
     assert_eq!(img.pixel(6, 2)[3], 0);
     assert_eq!(img.pixel(10, 2)[3], 255);
 }
+
+#[test]
+fn an_inner_shadow_darkens_the_lit_side_inside_the_shape_only() {
+    let mut s = Scene::new();
+    s.fill_round_rect(Rect::new(20.0, 20.0, 80.0, 60.0), 10.0, Color::WHITE);
+    s.inner_shadow(Rect::new(20.0, 20.0, 80.0, 60.0), 10.0, ShadowStyle { blur: 8.0, offset: Point::new(3.0, 3.0), color: Color::BLACK });
+    let img = CpuRenderer::new().render(&s, (120, 100), 1.0);
+    let lum = |x: u32, y: u32| img.pixel(x, y)[0] as i32;
+    // along the top and left edges (offset down-right) it is dark, along the bottom and right light
+    assert!(lum(60, 22) < 150, "top {}", lum(60, 22));
+    assert!(lum(22, 50) < 150, "left {}", lum(22, 50));
+    assert!(lum(60, 78) > 220, "bottom {}", lum(60, 78));
+    assert!(lum(98, 50) > 220, "right {}", lum(98, 50));
+    assert!(lum(60, 50) > 240, "middle {}", lum(60, 50));
+    // nothing outside the shape
+    assert_eq!(img.pixel(10, 10)[3], 0);
+    assert_eq!(img.pixel(110, 90)[3], 0);
+}
+
+#[test]
+fn a_picture_draws_like_the_same_commands_in_place() {
+    let draw = |s: &mut Scene| {
+        s.fill_round_rect(Rect::new(4.0, 4.0, 30.0, 20.0), 6.0, Color::hex(0x4f9dff));
+        s.stroke_circle(Point::new(20.0, 14.0), 8.0, &Stroke::width(2.0), Color::WHITE);
+    };
+    let picture = Picture::record(draw);
+    let mut direct = Scene::new();
+    let mut placed = Scene::new();
+    for (dx, dy, o) in [(0.0, 0.0, 1.0), (40.0, 10.0, 0.5)] {
+        for (s, via) in [(&mut direct, false), (&mut placed, true)] {
+            s.push_transform(Affine::translate(dx, dy));
+            s.push_opacity(o);
+            if via { s.draw_picture(&picture) } else { draw(s) }
+            s.pop_opacity();
+            s.pop_transform();
+        }
+    }
+    let a = CpuRenderer::new().render(&direct, (90, 50), 1.0);
+    let b = CpuRenderer::new().render(&placed, (90, 50), 1.0);
+    assert_eq!(a.data, b.data);
+}

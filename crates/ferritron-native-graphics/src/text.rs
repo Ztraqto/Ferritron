@@ -37,11 +37,14 @@ pub struct TextStyle {
     pub align: Align,
     /// Wrap lines wider than this (logical pixels). `None`: only newlines break lines.
     pub max_width: Option<f32>,
+    /// Extra space after each character but the last of a line (logical pixels; spaced
+    /// capitals in titles, for example). 0 by default.
+    pub letter_spacing: f32,
 }
 
 impl TextStyle {
     pub fn new(font: FontChain, size: f32) -> TextStyle {
-        TextStyle { font, size, line_height: 1.3, align: Align::Start, max_width: None }
+        TextStyle { font, size, line_height: 1.3, align: Align::Start, max_width: None, letter_spacing: 0.0 }
     }
     pub fn with_max_width(mut self, w: f32) -> TextStyle {
         self.max_width = Some(w);
@@ -49,6 +52,10 @@ impl TextStyle {
     }
     pub fn with_align(mut self, a: Align) -> TextStyle {
         self.align = a;
+        self
+    }
+    pub fn with_letter_spacing(mut self, spacing: f32) -> TextStyle {
+        self.letter_spacing = spacing;
         self
     }
     pub fn with_line_height(mut self, lh: f32) -> TextStyle {
@@ -160,6 +167,10 @@ impl Layout {
     }
     pub fn height(&self) -> f32 {
         self.height
+    }
+    /// The baseline of the first line, from the top of the layout (0 for an empty layout).
+    pub fn baseline(&self) -> f32 {
+        self.lines.first().map_or(0.0, |l| l.baseline)
     }
     pub fn lines(&self) -> &[Line] {
         &self.lines
@@ -403,6 +414,14 @@ fn shape_paragraph(
             _ => cls.push(Cl { g0: gi, g1: gi + 1, start: g.cluster, advance: g.advance, space: false }),
         }
     }
+    // letter spacing: after each cluster (the last glyph of the cluster carries it)
+    let spacing = style.letter_spacing;
+    if spacing != 0.0 {
+        for c in &mut cls {
+            c.advance += spacing;
+            glyphs[c.g1 - 1].advance += spacing;
+        }
+    }
     let para_end_byte = (para_off + para.len()) as u32;
     // glyph order may be non-monotonic in clusters only for RTL; we shape LTR, so clusters grow.
     for i in 0..cls.len() {
@@ -458,7 +477,8 @@ fn shape_paragraph(
                 pen += g.advance;
             }
             if !c.space {
-                width_no_trailing = pen;
+                // the spacing after the last character is not part of the width
+                width_no_trailing = pen - spacing;
             }
         }
         let start_byte = cls.get(a).map_or(para_off as u32, |c| c.start);
@@ -503,6 +523,7 @@ fn style_hash(text: &str, style: &TextStyle) -> u64 {
     style.line_height.to_bits().hash(&mut h);
     style.align.hash(&mut h);
     style.max_width.map(f32::to_bits).hash(&mut h);
+    style.letter_spacing.to_bits().hash(&mut h);
     h.finish()
 }
 
@@ -529,6 +550,31 @@ impl Fonts {
         }
         self.layouts.map.insert(key, CacheEntry { text: text.to_string(), style: style.clone(), layout: layout.clone(), used: stamp });
         layout
+    }
+
+    /// `text` as it fits in `max_width` on one line: the whole text when it fits, else the
+    /// longest start of it followed by an ellipsis ("…") that fits (just "…" when nothing does).
+    pub fn fit(&mut self, text: &str, style: &TextStyle, max_width: f32) -> String {
+        if self.layout(text, style).width() <= max_width {
+            return text.to_string();
+        }
+        // the longest char prefix whose "prefix…" fits (binary search over char boundaries)
+        let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).skip(1).chain(std::iter::once(text.len())).collect();
+        let fits = |fonts: &mut Fonts, n: usize| -> bool {
+            let candidate = format!("{}\u{2026}", text[..if n == 0 { 0 } else { ends[n - 1] }].trim_end());
+            fonts.layout(&candidate, style).width() <= max_width
+        };
+        let (mut lo, mut hi) = (0usize, ends.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if fits(self, mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let cut = if lo == 0 { 0 } else { ends[lo - 1] };
+        format!("{}\u{2026}", text[..cut].trim_end())
     }
 
     /// Number of cached layouts.

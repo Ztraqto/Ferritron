@@ -132,3 +132,34 @@ cargo がその一覧を受け付けないときは、今までどおり feature
 ### 確かめていないこと
 
 - 4096 を超える幅のマスク（4K 以上の画面で窓いっぱいの影など）。これまでどおり置けず、そのマスクは描かれない。
+
+---
+
+## X4. PanStudio の描画の独自処理を FNG と `FngEditor` に入れる
+
+- **日付**: 2026-11-12
+- **きっかけ**: PanStudio の開発者からの要望。PanStudio のエディタを FNG に移したとき、FNG にないために PanStudio 側で書いた処理（描いた絵の使い回し、内側の影、ベースラインで置く文字・「…」で切る・字間、FNG の層の間に入れる独自の GPU 描画）を、Ferritron 2.0.0 の機能にした。
+- **変更した人**: PanStudio 側の作業（Claude Code のセッション）。監査（f1〜f11）の担当ではない。
+- **基準**: ブランチ `ferritron-2.0`、`b97b103`。
+
+### 追加したもの
+
+- `fng::Picture`（`Picture::new(scene)`、`Picture::record(|s| ..)`）と `Scene::draw_picture`: 記録した絵を、今の変換・クリップ・不透明度の下に何度でも置く。中身はシーンに写すだけで（パス、塗り、線、文字の並び、クリップ）、パスのキャッシュの鍵はそのままなので、マスクは使い回される。絵の中のレイヤーは、その大きさで切り抜いてその場に描く。`Scene::draw_scene` は手元に残した `Scene` を同じように置く。
+- `Scene::inner_shadow(rect, radius, ShadowStyle)`: へこんだ面の影。ずらした形のまわりの 4 本の帯の影を、形で切り抜いて描く（ぼかしの中で内側の角は四角くなる）。
+- `Scene::text_line(layout, Point(x, ベースライン), Align, paint)`、`Layout::baseline()`、`Fonts::fit(text, style, width)`（二分探索で「…」の位置を探す）、`TextStyle::letter_spacing` と `with_letter_spacing`（行の最後の文字の後には空けない）。**`TextStyle` を構造体の式で作っているコードは、新しいフィールドが必要**（`TextStyle::new` を使うコードは変更不要）。
+- `FngEditor::render_gpu`（`draw` の絵の上に自分の wgpu の描画を重ねる。GPU のときだけ）、`draw_without_gpu`（CPU で描くときの代わり）、`draw_over`（その上に描く 2 枚目の FNG のシーン）。既定は何もしないので、今までのエディタはそのまま動く。
+
+### PanStudio 側
+
+- `GpuEditor` を自分で実装するのをやめ、`FngAdapter<Editor>` にした（`src/gpu.rs` を削除）。ヒートマップも FNG で描く（3D 表示は正射影なので、床は単位正方形のアフィン変換で置ける）。GPU が使えないときは FNG が CPU で描く。
+- tiny-skia と ab_glyph への依存がなくなった。
+
+### 確かめたこと（Windows）
+
+- `cargo test -p ferritron-native-graphics`（新しく: Picture の写し、Picture と同じ命令をその場に描いた絵が一致する、内側の影の向きと形の外に出ないこと、字間、「…」で切る、ベースラインと揃え）、`-p fng-view`（`draw` → 独自の GPU 描画 → `draw_over` の順と、CPU のときの代わりの描画）、`-p ferritron-gpu-view --features fng`: 合格。
+- PanStudio: 単体テスト 40 件、スナップショット、`ferritron-testhost` での GPU と `FERRITRON_GPU_VIEW=cpu` の両方の表示（同じ絵になった）。
+
+### 確かめていないこと
+
+- macOS / Linux（FNG 自体が Windows でしか動かしていない）。
+- 実際の DAW での表示。`render_gpu` を使う実際のエディタ（テストは呼ばれた回数と前後の絵だけを見ている）。

@@ -396,6 +396,20 @@ impl Scene {
     // ---- text ------------------------------------------------------------------------------
 
     /// Draw a laid-out text with its top-left corner at `origin`.
+    /// Draw the first line of `layout` with its baseline at `at.y`, anchored at `at.x` by
+    /// `align` (`Start`: `at.x` is the left edge, `Center`: the middle, `End`: the right edge).
+    /// Returns the left edge it was drawn at.
+    pub fn text_line(&mut self, layout: &crate::text::Layout, at: Point, align: crate::text::Align, paint: impl Into<Paint>) -> f32 {
+        let w = layout.width();
+        let x = match align {
+            crate::text::Align::Start => at.x,
+            crate::text::Align::Center => at.x - w * 0.5,
+            crate::text::Align::End => at.x - w,
+        };
+        self.text(layout, Point::new(x, at.y - layout.baseline()), paint);
+        x
+    }
+
     pub fn text(&mut self, layout: &crate::text::Layout, origin: Point, paint: impl Into<Paint>) {
         let paint = self.paint_id(paint.into());
         let gl = layout.glyphs();
@@ -419,6 +433,25 @@ impl Scene {
     /// A soft shadow of a rounded rectangle (draw it before the shape that casts it).
     pub fn shadow(&mut self, rect: Rect, radius: f32, style: ShadowStyle) {
         self.ops.push(Op::Shadow { rect, radius, style });
+    }
+
+    /// A shadow inside a rounded rectangle, cast by its edge (a sunken surface). `style.offset`
+    /// moves the light: an offset down and to the right puts the shadow along the top and left
+    /// edges, as CSS `inset` does. Drawn as blurred bands around the moved shape, clipped to
+    /// the shape, so the inner corners of the shadow are square under the blur.
+    pub fn inner_shadow(&mut self, rect: Rect, radius: f32, style: ShadowStyle) {
+        if rect.w <= 0.0 || rect.h <= 0.0 || style.color.a <= 0.0 {
+            return;
+        }
+        let m = style.blur * 2.0 + style.offset.x.abs().max(style.offset.y.abs()) + 2.0;
+        let hole = rect.translate(style.offset);
+        let band = ShadowStyle { offset: Point::new(0.0, 0.0), ..style };
+        self.push_clip_round_rect(rect, radius);
+        self.shadow(Rect::new(hole.x - m, hole.y - m, hole.w + 2.0 * m, m), 0.0, band);
+        self.shadow(Rect::new(hole.x - m, hole.bottom(), hole.w + 2.0 * m, m), 0.0, band);
+        self.shadow(Rect::new(hole.x - m, hole.y, m, hole.h), 0.0, band);
+        self.shadow(Rect::new(hole.right(), hole.y, m, hole.h), 0.0, band);
+        self.pop_clip();
     }
 
     /// Draw an image stretched over `dst` (bilinear).
@@ -478,6 +511,65 @@ impl Scene {
         self.ops.push(Op::PopOpacity);
     }
 
+    /// Draw a recorded [`Picture`] here, under the current transform, clip and opacity. The
+    /// picture's commands are copied into this scene (nothing is drawn again on the CPU side:
+    /// paths keep their cache keys, so their masks are reused). A layer inside the picture is
+    /// drawn in place, clipped to its size.
+    pub fn draw_picture(&mut self, picture: &Picture) {
+        self.append(&picture.0);
+    }
+
+    /// Like [`draw_picture`](Scene::draw_picture), for a scene kept by the caller (for example
+    /// one rebuilt only when what it shows changes).
+    pub fn draw_scene(&mut self, other: &Scene) {
+        self.append(other);
+    }
+
+    fn append(&mut self, o: &Scene) {
+        let paint0 = self.paints.len() as u32;
+        self.paints.extend_from_slice(&o.paints);
+        let stroke0 = self.strokes.len() as u32;
+        self.strokes.extend_from_slice(&o.strokes);
+        let (v0, p0) = (self.verbs.len() as u32, self.pts.len() as u32);
+        self.verbs.extend_from_slice(&o.verbs);
+        self.pts.extend_from_slice(&o.pts);
+        let g0 = self.glyphs.len() as u32;
+        self.glyphs.extend_from_slice(&o.glyphs);
+        let run0 = self.runs.len() as u32;
+        self.runs.extend(o.runs.iter().map(|r| GlyphRun { font: r.font.clone(), size: r.size, g0: r.g0 + g0, g1: r.g1 + g0 }));
+        let path = |p: PathRef| PathRef { v0: p.v0 + v0, v1: p.v1 + v0, p0: p.p0 + p0, p1: p.p1 + p0, hash: p.hash };
+        for op in &o.ops {
+            let op = match *op {
+                Op::Rect { rect, paint } => Op::Rect { rect, paint: paint + paint0 },
+                Op::RoundRect { rect, radius, paint } => Op::RoundRect { rect, radius, paint: paint + paint0 },
+                Op::Ellipse { center, rx, ry, paint } => Op::Ellipse { center, rx, ry, paint: paint + paint0 },
+                Op::Line { a, b, width, cap, paint } => Op::Line { a, b, width, cap, paint: paint + paint0 },
+                Op::Polyline { p0: a, p1: b, width, cap, paint } => Op::Polyline { p0: a + p0, p1: b + p0, width, cap, paint: paint + paint0 },
+                Op::FillPath { path: p, rule, paint } => Op::FillPath { path: path(p), rule, paint: paint + paint0 },
+                Op::StrokePath { path: p, stroke, paint } => Op::StrokePath { path: path(p), stroke: stroke + stroke0, paint: paint + paint0 },
+                Op::Glyphs { run, paint } => Op::Glyphs { run: run + run0, paint: paint + paint0 },
+                Op::PushClipPath { path: p, rule } => Op::PushClipPath { path: path(p), rule },
+                Op::Layer(i) => {
+                    let l = &o.layers[i as usize];
+                    self.ops.push(Op::PushClipRect(Rect::new(0.0, 0.0, l.size.0, l.size.1)));
+                    self.append(&l.scene);
+                    self.ops.push(Op::PopClip);
+                    continue;
+                }
+                other @ (Op::Shadow { .. }
+                | Op::Image { .. }
+                | Op::PushClipRect(_)
+                | Op::PushClipRoundRect { .. }
+                | Op::PopClip
+                | Op::PushTransform(_)
+                | Op::PopTransform
+                | Op::PushOpacity(_)
+                | Op::PopOpacity) => other,
+            };
+            self.ops.push(op);
+        }
+    }
+
     /// A cached layer of `size` logical pixels (its content is in local coordinates
     /// `0..size`; it is placed by the current transform). `f` runs only when `version` (or
     /// `size`) differs from the last time this `id` was recorded; otherwise the renderer reuses
@@ -513,9 +605,63 @@ impl Scene {
     }
 }
 
+/// A recorded drawing, kept and placed any number of times with [`Scene::draw_picture`]
+/// (for example a control drawn once and stamped wherever it appears). Cheap to clone and
+/// `Send + Sync`: record it on any thread.
+#[derive(Clone, Default)]
+pub struct Picture(std::sync::Arc<Scene>);
+
+impl Picture {
+    /// The picture of `scene` as recorded.
+    pub fn new(scene: Scene) -> Picture {
+        Picture(std::sync::Arc::new(scene))
+    }
+
+    /// Records a picture.
+    pub fn record(f: impl FnOnce(&mut Scene)) -> Picture {
+        let mut scene = Scene::new();
+        f(&mut scene);
+        Picture::new(scene)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Number of recorded commands.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_is_copied_with_its_paths_paints_and_strokes() {
+        let mut path = Path::new();
+        path.move_to(Point::new(0.0, 0.0)).line_to(Point::new(4.0, 0.0)).line_to(Point::new(0.0, 4.0)).close();
+        let picture = Picture::record(|s| {
+            s.fill_path(&path, FillRule::NonZero, Color::BLACK);
+            s.stroke_path(&path, &Stroke::width(2.0), Color::WHITE);
+            s.layer(LayerId(1), (5.0, 5.0), 1, |l| l.fill_rect(Rect::new(0.0, 0.0, 5.0, 5.0), Color::WHITE));
+        });
+        let mut s = Scene::new();
+        s.fill_rect(Rect::new(0.0, 0.0, 1.0, 1.0), Color::WHITE);
+        s.draw_picture(&picture);
+        s.draw_picture(&picture);
+        // 1 + 2 x (fill, stroke, clip, the layer's rect, pop)
+        assert_eq!(s.len(), 11);
+        let Op::FillPath { path: first, .. } = s.ops[1] else { panic!("{:?}", s.ops[1]) };
+        let Op::FillPath { path: second, paint, .. } = s.ops[6] else { panic!("{:?}", s.ops[6]) };
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(&s.pts[second.p0 as usize..second.p1 as usize], &s.pts[first.p0 as usize..first.p1 as usize]);
+        assert_eq!(s.paints[paint as usize], Paint::Solid(Color::BLACK));
+        let Op::StrokePath { stroke, .. } = s.ops[7] else { panic!("{:?}", s.ops[7]) };
+        assert_eq!(s.strokes[stroke as usize].width, 2.0);
+        assert!(matches!(s.ops[8], Op::PushClipRect(r) if r.w == 5.0));
+    }
 
     #[test]
     fn scene_is_send() {

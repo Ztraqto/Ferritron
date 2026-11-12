@@ -268,6 +268,21 @@ stays lost after three attempts in a row (Windows only). The GPU is tried again
 every five seconds. `FERRITRON_GPU_VIEW=cpu` takes the CPU mode from the start.
 Editors that need the GPU still do not open without one.
 
+Helpers for editors drawn with FNG:
+
+- **Reusing drawings**: `fng::Picture::record(|s| ..)` records a drawing once;
+  `scene.draw_picture(&picture)` places it any number of times (under the current
+  transform, clip and opacity). `scene.draw_scene(&kept)` places a `Scene` you keep
+  and rebuild only when what it shows changes.
+- **Inner shadows**: `scene.inner_shadow(rect, radius, ShadowStyle { .. })` (a sunken
+  surface; the offset points the way CSS `inset` does).
+- **Text**: `scene.text_line(&layout, Point::new(x, baseline), Align::End, color)`
+  places a line by its baseline and an alignment; `fonts.fit(text, &style, width)`
+  cuts text with "…" to fit; `TextStyle::with_letter_spacing(px)` spaces letters.
+- **Your own GPU drawing in between**: `FngEditor::render_gpu` runs your wgpu work
+  (load the target, do not clear it) over `draw`'s picture and under `draw_over`'s.
+  On the CPU, `draw_without_gpu` stands in for it.
+
 ### Silence and export quality
 
 **Idle plugins cost nothing.** When a plugin's input has been silent (below
