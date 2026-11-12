@@ -185,7 +185,7 @@ impl Atlas {
         // best shelf: the shortest one that fits the height and has room
         let mut best: Option<usize> = None;
         for (i, s) in self.shelves.iter().enumerate() {
-            if s.h >= h && s.h <= h + h / 2 + 2 && self.size - s.x >= w && best.is_none_or(|b| s.h < self.shelves[b].h) {
+            if s.h >= h && s.h <= h + h / 2 + 2 && s.x + w <= self.size && best.is_none_or(|b| s.h < self.shelves[b].h) {
                 best = Some(i);
             }
         }
@@ -195,7 +195,9 @@ impl Atlas {
             s.x += w;
             return Some(p);
         }
-        if self.next_y + h <= self.size {
+        // A new shelf spans the atlas: the mask must fit its width too (a wider one waits for
+        // the atlas to grow).
+        if w <= self.size && self.next_y + h <= self.size {
             let y = self.next_y;
             let index = self.shelves.len() as u32;
             self.shelves.push(Shelf { y, h, x: w, used: self.frame });
@@ -279,6 +281,22 @@ mod tests {
         assert!(n >= 12, "a 4096 atlas holds at least 16 masks of 1000x1000 ({n})");
         a.clear();
         assert!(a.insert(MaskKey::glyph(999, 0, 0, 0), &mask(1000, 1000, 1), 0, 0).is_ok());
+    }
+
+    /// A mask wider than the atlas makes it grow; the shelves never reach past its edge.
+    #[test]
+    fn a_mask_wider_than_the_atlas_grows_it() {
+        let mut a = Atlas::new();
+        let wide = a.insert(MaskKey::glyph(1, 0, 0, 0), &mask(MIN_SIZE + 500, 20, 7), 0, 0).ok().unwrap();
+        assert!(a.size > MIN_SIZE);
+        assert!(wide.x + wide.w <= a.size);
+        for n in 2..40u64 {
+            let e = a.insert(MaskKey::glyph(n, 0, 0, 0), &mask(323, 20, 1), 0, 0).ok().unwrap();
+            assert!(e.x + e.w <= a.size, "mask {n} at x {} of {}", e.x, a.size);
+        }
+        for s in &a.shelves {
+            assert!(s.x <= a.size);
+        }
     }
 
     /// Fill a maximum-size atlas with 1000 x 1000 masks, one per frame-1 key (4 per shelf).

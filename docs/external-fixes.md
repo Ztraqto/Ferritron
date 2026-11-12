@@ -104,3 +104,31 @@ cargo がその一覧を受け付けないときは、今までどおり feature
 - macOS / Linux のシンボリックリンク（ビルドもしていない）。
 - 管理者のシェルでの自動インストール。
 - Ferritron Editor（非公開）が `[bundle]` を表示・編集できるか。`parse` は通るので、開いても壊れないはず。
+
+---
+
+## X3. FNG のマスクのアトラスが、幅の広いマスクでテクスチャの外に書き込む
+
+- **日付**: 2026-11-12
+- **見つけた所**: PanStudio のエディタを FNG（Ferritron Native Graphics）に移したとき。`ferritron-testhost` でエディタを開くと、毎フレーム `Queue::write_texture` の検証エラー（「Copy of X 8205..8528 would end up overrunning the bounds of the Destination texture of X size 2048」）が出て、GPU のデバイスが作り直され続けた。
+- **修正した人**: PanStudio 側の作業（Claude Code のセッション）。監査（f1〜f11）の担当ではない。
+- **基準**: ブランチ `ferritron-2.0`、`35542ef`。
+- **変更したファイル**: `crates/ferritron-native-graphics/src/atlas.rs`。
+
+### 原因
+
+`Atlas::alloc` は、新しい棚（シェルフ）を作るときに、高さが空いているかしか見ていなかった。アトラスより幅の広いマスク（PanStudio では窓の幅いっぱいの影など。拡大した画面で 2048 ピクセルを超える）が来ると、幅がはみ出した棚ができ、その棚の `x` がアトラスの幅を超える。次に既存の棚を探すときの `self.size - s.x >= w` は `u32` の引き算なので、`s.x` が幅を超えていると桁あふれして大きな値になり、条件が通ってしまう。以後、その棚には `x` がアトラスの外の位置でマスクが置かれ続けた。
+
+### 修正
+
+- 既存の棚の空きは `s.x + w <= self.size` で調べる（引き算をしない）。
+- 新しい棚は、マスクの幅がアトラスの幅に収まるときだけ作る。収まらなければ `None` を返し、呼び出し側がアトラスを大きくしてから置き直す（最大 4096。それより広いマスクはこれまでどおり `Full`）。
+
+### 確かめたこと（Windows）
+
+- 追加したテスト `a_mask_wider_than_the_atlas_grows_it`（最小の 1024 より 500 広いマスクの後に 323 幅のマスクを 38 個置き、どれもアトラスの中に収まる）と、`cargo test -p ferritron-native-graphics` のすべて: 合格。
+- PanStudio を `ferritron-testhost` で開き、検証エラーが出ず、画面が正しく描かれることをスクリーンショットで確かめた。
+
+### 確かめていないこと
+
+- 4096 を超える幅のマスク（4K 以上の画面で窓いっぱいの影など）。これまでどおり置けず、そのマスクは描かれない。
