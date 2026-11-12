@@ -1,0 +1,10 @@
+{
+  "plugin": "dev.ferritron.examples.gpu-view",
+  "ferritron": "1.4.0",
+  "class_id": "ef1167e320a887f5dee8976cf59c64ab",
+  "params": [
+    {"index": 0, "id": 248864332, "name": "Gain", "flags": 0, "default": 0.8333333333333334, "value": 0.20999999999999996},
+    {"index": 1, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1}
+  ],
+  "state": "4652544e01000000040000004c5ed50e713d0ad7a37046c000000040000000000000f03f030000400000800afc4cdb41040000400000c0cea163d241"
+}

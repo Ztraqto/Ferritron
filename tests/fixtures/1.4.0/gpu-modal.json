@@ -1,0 +1,12 @@
+{
+  "plugin": "dev.ferritron.examples.gpu-modal",
+  "ferritron": "1.4.0",
+  "class_id": "8565704e7114851dd59b7c30cc819afb",
+  "params": [
+    {"index": 0, "id": 1089540391, "name": "音量", "flags": 0, "default": 0.8, "value": 0.21000000000000002},
+    {"index": 1, "id": 1295617320, "name": "減衰時間", "flags": 0, "default": 0.2857142857142857, "value": 0.58},
+    {"index": 2, "id": 1671060519, "name": "明るさ", "flags": 0, "default": 0.5, "value": 0.95},
+    {"index": 3, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 0}
+  ],
+  "state": "4652544e01000000060000002711f1403333333333b347c0288d394df0a7c64b37891740275c9a630000000000c0574000000040000000000000000003000040000080dc6591e84104000040000060c317f4e841"
+}

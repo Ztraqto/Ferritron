@@ -1,0 +1,11 @@
+[package]
+name = "ferritron-dsp"
+description = "Ferritron DSP building blocks: SIMD, smoothing, filters, delay lines, fast math (X5/X7 of the 2.0 plan)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]

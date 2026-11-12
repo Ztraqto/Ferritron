@@ -1,0 +1,3 @@
+ui-title = スペクトラム
+ui-waiting = 音を待っています...
+param-floor = 下限

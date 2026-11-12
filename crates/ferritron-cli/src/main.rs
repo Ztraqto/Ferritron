@@ -1,12 +1,18 @@
 //! `cargo ferritron`: builds Ferritron plugins and packages them for hosts.
 
 mod android;
+mod check;
+mod compat;
 mod exports;
 mod formats;
 mod launcher;
 mod i18n;
+mod lang;
 mod new;
+mod pgo;
 mod sdk;
+mod shortcut;
+mod sizes;
 mod target;
 
 use std::path::{Path, PathBuf};
@@ -20,9 +26,16 @@ Usage:
   cargo ferritron new <name> [--template instrument]   Create a plugin project
   cargo ferritron bundle <package> [options]    Build and package a plugin
   cargo ferritron i18n check <package>          List untranslated strings
+  cargo ferritron check <package>               Look a plugin over: reported vs. measured latency, a leftover .frtx, a 1.x plugin
+  cargo ferritron migrate-frtx <package>        Rename the old <name>.frtx project file to <name>.ferritroject
   cargo ferritron notarize <bundle>             Notarize a signed macOS bundle (on a Mac)
   cargo ferritron sdk ...                       SDKs: status, list, available, fetch, use, source, remove
   cargo ferritron --version                     Print the Ferritron version
+
+Options of `bundle`: --dev, --install, --no-install, --shortcuts, --no-shortcuts, --target <triple>, --size,
+--pgo <scenario> and --features <list>
+(passed to `cargo build`: a feature of the plugin that turns on a format that is off
+by default, such as VST 2 or AAX).
 
 `bundle` packages <package> for every plugin format it was built with
 (e.g. VST3 bundle, CLAP file) in target/bundled/. Formats are declared by
@@ -33,6 +46,15 @@ Options:
               `cargo build -p <package>` updates the plugin inside the running host
   --install   Also copy the results to each format's system folder
               (may need administrator rights)
+  --no-install    Do not install this time, even with `[bundle] install = true`
+  --shortcuts     Put a shortcut to each format's system folder next to the bundles
+                  (`_VST3 Plugins`, ...; `[bundle] shortcuts = true` does it every time)
+  --no-shortcuts  Do not make them this time, even with `[bundle] shortcuts = true`
+  --size      At the end, print the size of the code (.text) of each bundled binary
+  --pgo S     Profile-guided build: an instrumented build is played by the scenario S
+              (`testhost`, or `cmd:<command with {bundle}>`), the profiles are merged
+              with llvm-profdata (`rustup component add llvm-tools`, never installed by
+              this tool) and the real build uses them. Release builds for this computer only.
   --target T  Build for another target: web (a Web Audio Module, WAM 2.0;
               needs `rustup target add wasm32-wasip1`), aarch64-apple-darwin,
               x86_64-apple-darwin, universal-apple-darwin (both in one).
@@ -92,6 +114,17 @@ fn run(args: &[String]) -> Result<(), String> {
             let dir = package_dir(&cargo, package).ok_or_else(|| format!("package `{package}` not found"))?;
             return i18n::check(&dir);
         }
+        Some("check") => {
+            let package = args.get(1).ok_or_else(|| format!("missing <package>\n\n{USAGE}"))?;
+            return check::run(package);
+        }
+        Some("migrate-frtx") => {
+            let package = args.get(1).ok_or_else(|| format!("missing <package>\n\n{USAGE}"))?;
+            let dir = package_dir(&cargo_program(), package).ok_or_else(|| format!("package `{package}` not found"))?;
+            let (old, new) = ferritron_manifest::migrate_frtx(&dir)?;
+            println!("{} {} -> {}", lang::tr("名前を変更しました:", "Renamed:"), old.display(), new.display());
+            return Ok(());
+        }
         Some("sdk") => return sdk::run(&args[1..]),
         Some("notarize") => {
             let bundle = args.get(1).ok_or_else(|| format!("missing <bundle>\n\n{USAGE}"))?;
@@ -108,27 +141,114 @@ fn run(args: &[String]) -> Result<(), String> {
         Some(other) => return Err(format!("unknown command `{other}`\n\n{USAGE}")),
     }
     let mut package = None;
-    let (mut dev, mut install, mut triple) = (false, false, None);
+    let mut o = BundleOptions::default();
+    let mut features: Option<String> = None;
     let mut rest = args[1..].iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
-            "--dev" => dev = true,
-            "--install" => install = true,
-            "--target" => triple = Some(rest.next().ok_or("--target needs a target triple")?.clone()),
+            "--dev" => o.dev = true,
+            "--install" => o.install = true,
+            "--no-install" => o.no_install = true,
+            "--shortcuts" => o.shortcuts = Some(true),
+            "--no-shortcuts" => o.shortcuts = Some(false),
+            "--size" => o.size = true,
+            "--pgo" => o.pgo = Some(rest.next().ok_or("--pgo needs a scenario (testhost or cmd:<command>)")?.clone()),
+            "--features" => features = Some(rest.next().ok_or("--features needs a list")?.clone()),
+            "--target" => o.triple = Some(rest.next().ok_or("--target needs a target triple")?.clone()),
             flag if flag.starts_with('-') => return Err(format!("unknown option `{flag}`\n\n{USAGE}")),
             name => package = Some(name.to_string()),
         }
     }
-    let package = package.ok_or_else(|| format!("missing <package>\n\n{USAGE}"))?;
-    let target = target::Target::parse(triple.as_deref())?;
-    if target.triple.is_some() && (dev || install) {
+    o.package = package.ok_or_else(|| format!("missing <package>\n\n{USAGE}"))?;
+    if let Some(list) = &features {
+        // Read by `build_one`; set before anything runs in parallel.
+        unsafe { std::env::set_var("FERRITRON_BUNDLE_FEATURES", list) };
+    }
+    bundle_command(&o)
+}
+
+#[derive(Default)]
+struct BundleOptions {
+    package: String,
+    dev: bool,
+    install: bool,
+    /// `--no-install`: not even when the project file's `[bundle] install` is true.
+    no_install: bool,
+    /// `--shortcuts` / `--no-shortcuts`; `None` follows `[bundle] shortcuts`.
+    shortcuts: Option<bool>,
+    triple: Option<String>,
+    /// `--size`: print the code size of each binary at the end.
+    size: bool,
+    /// `--pgo <scenario>`.
+    pgo: Option<String>,
+}
+
+/// What a bundling run made: the bundle roots and the plugin binaries inside them.
+#[derive(Default)]
+struct Bundled {
+    roots: Vec<PathBuf>,
+    binaries: Vec<PathBuf>,
+}
+
+fn bundle_command(o: &BundleOptions) -> Result<(), String> {
+    let target = target::Target::parse(o.triple.as_deref())?;
+    if o.install && o.no_install {
+        return Err("--install and --no-install together".into());
+    }
+    if target.triple.is_some() && (o.dev || o.install) {
         return Err("--dev and --install build for this computer; leave out --target".into());
     }
+    if o.pgo.is_some() && (target.triple.is_some() || o.dev || o.install) {
+        return Err(lang::tr(
+            "--pgo はこのコンピューター向けのリリースビルドだけに使えます（--dev・--install・--target と一緒には使えません）",
+            "--pgo is for release builds for this computer (not with --dev, --install or --target)",
+        )
+        .into());
+    }
+    let cargo = cargo_program();
+    let metadata = cargo_metadata(&cargo, false).ok_or("`cargo metadata` failed")?;
+    // T1: a 2.x tool does not handle 1.x plugins as they are.
+    if let Some(version) = compat::plugin_framework_version(&metadata)
+        && let Some(note) = compat::legacy_plugin_notice(env!("CARGO_PKG_VERSION"), &version)
+    {
+        return Err(note);
+    }
+    let bundled = match &o.pgo {
+        None => bundle_once(o, &target)?,
+        Some(scenario) => {
+            let target_directory = PathBuf::from(metadata["target_directory"].as_str().ok_or("`cargo metadata` has no target_directory")?);
+            let last = std::cell::RefCell::new(Bundled::default());
+            pgo::run(scenario, &target_directory, &mut || {
+                let made = bundle_once(o, &target)?;
+                let roots = made.roots.clone();
+                *last.borrow_mut() = made;
+                Ok(roots)
+            })?;
+            last.into_inner()
+        }
+    };
+    if o.size {
+        println!("{}", lang::tr("コードのサイズ (.text):", "Code size (.text):"));
+        for binary in &bundled.binaries {
+            let shown = match sizes::text_size(binary)? {
+                Some(bytes) => sizes::show(bytes),
+                None => lang::tr("不明な形式", "unknown format").to_string(),
+            };
+            println!("  {}: {shown}", binary.display());
+        }
+    }
+    Ok(())
+}
+
+/// Builds and packages once, with the environment as it is.
+fn bundle_once(o: &BundleOptions, target: &target::Target) -> Result<Bundled, String> {
+    let (package, dev) = (o.package.clone(), o.dev);
+    let mut bundled = Bundled::default();
     formats::set_target(&target.os, &target.arch);
 
     let cargo = cargo_program();
-    let artifact = build(&package, !dev, &target)?;
-    let metadata = cargo_metadata(&cargo, false).ok_or("`cargo metadata` failed")?;
+    let artifact = build(&package, !dev, target)?;
+    let metadata = format_metadata(&cargo).ok_or("`cargo metadata` failed")?;
     warn_on_version_mismatch(&metadata);
     let exported = exports::exported_names(&artifact.library)?;
     let formats: Vec<formats::Format> = formats::discover(&metadata)?
@@ -147,6 +267,13 @@ fn run(args: &[String]) -> Result<(), String> {
     // target/<profile>/<lib> -> target/bundled/
     let out_dir = artifact.library.parent().and_then(Path::parent).ok_or("unexpected build output location")?.join("bundled");
 
+    let settings = bundle_settings(&artifact.manifest_dir)?;
+    // `[bundle] install`: for this computer only, and not for the profiling pass of --pgo.
+    let auto_install = settings.install && !o.install && !o.no_install;
+    if auto_install && (target.triple.is_some() || o.pgo.is_some()) {
+        println!("{}", lang::tr("[bundle] install: --target・--pgo のビルドはインストールしません", "[bundle] install: builds with --target or --pgo are not installed"));
+    }
+    let install = o.install || (auto_install && target.triple.is_none() && o.pgo.is_none());
     let companions = companions(&artifact)?;
     let mut made: Vec<PathBuf> = Vec::new();
     for format in &formats {
@@ -154,8 +281,9 @@ fn run(args: &[String]) -> Result<(), String> {
         let inputs = formats::Inputs { name: &file_name, scope: &scope, ui: ui_dir.as_deref(), keep_root, exports: &exported };
         let (root, binary) = format.package(&artifact.library, &out_dir, &inputs)?;
         made.push(root.clone());
+        bundled.binaries.push(binary.clone());
         if let Some(path) = format.launcher(&out_dir, &file_name)? {
-            launcher::build(&target, &path, &binary, format.launcher_kind.as_deref() == Some("appex"))?;
+            launcher::build(target, &path, &binary, format.launcher_kind.as_deref() == Some("appex"))?;
         }
         // Companion libraries (C# and other language hosts) go next to the binary.
         let beside = binary.parent().ok_or("unexpected bundle layout")?;
@@ -176,7 +304,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         if root.is_dir() && target.is_unix() && !target.is_mobile() {
             // Isolated plugins run in a child process started by this helper.
-            let helper = host_helper(&out_dir, &target)?;
+            let helper = host_helper(&out_dir, target)?;
             let helpers = root.join("Contents/Helpers");
             std::fs::create_dir_all(&helpers).map_err(|e| format!("cannot create {}: {e}", helpers.display()))?;
             std::fs::copy(&helper, helpers.join("ferritron-host")).map_err(|e| format!("cannot copy the ferritron-host helper: {e}"))?;
@@ -186,8 +314,19 @@ fn run(args: &[String]) -> Result<(), String> {
             target::sign_macos(&root)?;
         }
         println!("Bundled {} ({})", root.display(), format.name);
-        if install {
-            let installed = format.install(&root, &[HOT_RELOAD_MARKER_SUFFIX])?;
+        if install && format.install_folder().is_none() {
+            println!("{}", lang::tr(&format!("{} はインストール先がないのでインストールしません", format.name), &format!("{} has no install folder: not installed", format.name)));
+        } else if install {
+            let installed = match format.install(&root, &[HOT_RELOAD_MARKER_SUFFIX]) {
+                Ok(installed) => installed,
+                // Installing because of the project file: a folder that needs administrator
+                // rights does not fail the bundle.
+                Err(e) if !o.install => {
+                    eprintln!("warning: {e}");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             // A single-file format (CLAP): its companions go into the same folder.
             if installed.is_file() {
                 for companion in &companions {
@@ -198,10 +337,35 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("Installed {}", installed.display());
         }
     }
+    let shortcuts = o.shortcuts.unwrap_or(settings.shortcuts);
+    if shortcuts && target.triple.is_some() {
+        println!("{}", lang::tr("ショートカット: --target のビルドには作りません（このコンピューターのフォルダを指すため）", "Shortcuts: not made for --target builds (they point to this computer's folders)"));
+    } else if shortcuts {
+        let mut links = Vec::new();
+        for format in &formats {
+            let Some(folder) = format.install_folder() else { continue };
+            let folder = folder?;
+            let link = out_dir.join(format!("{}{} Plugins", settings.shortcut_prefix, format.name));
+            if !links.iter().any(|(_, f): &(PathBuf, PathBuf)| *f == folder) {
+                links.push((link, folder));
+            }
+        }
+        for (link, folder) in shortcut::make(&links)? {
+            println!("Shortcut {} -> {}", link.display(), folder.display());
+        }
+    }
     if dev {
         println!("Hot reload: rebuild with `cargo build -p {package}` and the running plugin updates itself.");
     }
-    Ok(())
+    bundled.roots = made;
+    Ok(bundled)
+}
+
+/// The `[bundle]` section of the package's project file.
+fn bundle_settings(manifest_dir: &Path) -> Result<ferritron_manifest::BundleSettings, String> {
+    let path = ferritron_manifest::locate(manifest_dir)?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    ferritron_manifest::bundle_settings(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Companion libraries from `[companion] files` in the project file, relative
@@ -291,6 +455,9 @@ fn build_one(package: &str, release: bool, target: &target::Target, triple: Opti
     if let Some(triple) = triple {
         cmd.args(["--target", triple]);
     }
+    if let Ok(list) = std::env::var("FERRITRON_BUNDLE_FEATURES") {
+        cmd.args(["--features", &list]);
+    }
     if let Some(minimum) = target.deployment_target() {
         cmd.env("MACOSX_DEPLOYMENT_TARGET", minimum);
     }
@@ -359,6 +526,11 @@ fn build_one(package: &str, release: bool, target: &target::Target, triple: Opti
 /// Ferritron does: say so instead of failing in odd ways.
 fn warn_on_version_mismatch(metadata: &serde_json::Value) {
     let ours = env!("CARGO_PKG_VERSION");
+    if let Some(old) = metadata["packages"].as_array().and_then(|p| p.iter().find(|p| p["name"] == "ferritron")).and_then(|p| p["version"].as_str()).filter(|v| is_deprecated(v)) {
+        eprintln!(
+            "warning: this plugin uses Ferritron {old}, which is deprecated (1.4.x and older get no fixes). Move it to 2.0.0: see docs/migration-2.0.md and \"Moving up from 1.4.x\" in CHANGELOG.md"
+        );
+    }
     let framework = metadata["packages"].as_array().and_then(|p| p.iter().find(|p| p["name"] == "ferritron")).and_then(|p| p["version"].as_str());
     if let Some(framework) = framework
         && framework != ours
@@ -369,6 +541,13 @@ fn warn_on_version_mismatch(metadata: &serde_json::Value) {
     }
 }
 
+/// Ferritron 1.4.x and older are deprecated (2.0.0 is current).
+fn is_deprecated(version: &str) -> bool {
+    let mut parts = version.split(['.', '-', '+']).map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    (major, minor) < (2, 0)
+}
+
 fn cargo_metadata(cargo: &str, no_deps: bool) -> Option<serde_json::Value> {
     let mut cmd = Command::new(cargo);
     cmd.args(["metadata", "--format-version", "1"]);
@@ -376,6 +555,24 @@ fn cargo_metadata(cargo: &str, no_deps: bool) -> Option<serde_json::Value> {
         cmd.arg("--no-deps");
     }
     serde_json::from_slice(&cmd.stderr(Stdio::inherit()).output().ok()?.stdout).ok()
+}
+
+/// `cargo metadata` for finding the plugin formats. Formats that are off by default (VST 2,
+/// AAX) are turned on with `--features`; `cargo metadata` without the same features leaves their
+/// crates out of the dependency graph of a plugin outside the Ferritron workspace, so they were
+/// built but never packaged. The list is passed here as it is passed to `cargo build`; if cargo
+/// refuses it, the plain metadata is used (as before).
+fn format_metadata(cargo: &str) -> Option<serde_json::Value> {
+    let Ok(list) = std::env::var("FERRITRON_BUNDLE_FEATURES") else {
+        return cargo_metadata(cargo, false);
+    };
+    let mut cmd = Command::new(cargo);
+    cmd.args(["metadata", "--format-version", "1", "--features", &list]);
+    let out = cmd.stderr(Stdio::inherit()).output().ok()?;
+    match serde_json::from_slice(&out.stdout) {
+        Ok(metadata) if out.status.success() => Some(metadata),
+        _ => cargo_metadata(cargo, false),
+    }
 }
 
 /// Finds the directory of `package` in the current workspace.

@@ -7,7 +7,7 @@ use ferritron_core::abi::ViewHost;
 use ferritron_core::{ParamInfo, ParamSet, Process};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use wry::http::{Request, Response};
@@ -164,11 +164,42 @@ struct View {
     instance: Option<ferritron_core::InstanceHandle>,
     /// Its revision as last shown to the page.
     revision: u64,
+    /// The data streams of `[streams]`, sent to the page when they have new values.
+    streams: Vec<(&'static str, ferritron_core::StreamReader)>,
+    stream_values: Vec<f32>,
+    /// `ferritron.settings` lives in the plugin's settings file (R4); changes
+    /// from other editors and processes wait here for the next refresh.
+    settings: ferritron_core::Settings,
+    settings_changed: std::sync::Arc<std::sync::Mutex<Vec<(String, Option<serde_json::Value>)>>>,
+    _settings_watch: ferritron_core::settings::Watch,
+    refreshes: u32,
+    /// A file dialog is open (`dialog:`): it runs inside a message of this view, so the
+    /// refresh timer must not touch the view until it closes (see `handle_message`).
+    in_dialog: Cell<bool>,
+}
+
+/// Holds `in_dialog` for the duration of a file dialog, also when it unwinds.
+struct DialogOpen<'a>(&'a Cell<bool>);
+
+impl<'a> DialogOpen<'a> {
+    fn new(flag: &'a Cell<bool>) -> Self {
+        flag.set(true);
+        Self(flag)
+    }
+}
+
+impl Drop for DialogOpen<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 impl View {
     /// Pushes parameters that changed since the last refresh to the page.
     fn refresh(&mut self) {
+        if self.in_dialog.get() {
+            return;
+        }
         let mut script = String::new();
         for (slot, &(index, info)) in self.params.iter().enumerate() {
             let normalized = unsafe { (self.host.get_param)(self.host.ctx, info.id) };
@@ -189,6 +220,21 @@ impl View {
                 script.push_str(&format!("ferritron._message({});", json_str(&message)));
             }
         }
+        for (name, reader) in &mut self.streams {
+            if reader.read_new(&mut self.stream_values) {
+                script.push_str(&super::stream_script(name, &self.stream_values));
+            }
+        }
+        // Another process's changes: look at the file about once a second.
+        self.refreshes = self.refreshes.wrapping_add(1);
+        if self.refreshes % (1000 / REFRESH_MS).max(1) == 0 {
+            self.settings.refresh();
+        }
+        let changed = std::mem::take(&mut *self.settings_changed.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        for (key, value) in changed {
+            let value = value.map_or("undefined".to_string(), |v| v.to_string());
+            script.push_str(&format!("ferritron._setting({},{value});", json_str(&key)));
+        }
         if !script.is_empty() {
             let _ = self.webview.evaluate_script(&script);
         }
@@ -198,6 +244,30 @@ impl View {
         if let Some(json) = message.strip_prefix("msg:") {
             if let Some(instance) = &self.instance {
                 instance.deliver_message(json);
+            }
+            return;
+        }
+        if let Some(json) = message.strip_prefix("settings:") {
+            // [key, value] sets, [key] removes.
+            if let Ok(serde_json::Value::Array(entry)) = serde_json::from_str::<serde_json::Value>(json)
+                && let Some(key) = entry.first().and_then(|k| k.as_str())
+            {
+                match entry.get(1) {
+                    Some(value) => self.settings.set(key, value.clone()),
+                    None => self.settings.remove(key),
+                };
+            }
+            return;
+        }
+        if let Some(rest) = message.strip_prefix("dialog:") {
+            if let Some(request) = super::dialog::parse(rest) {
+                // Modal, owned by the host's window; the page waits for the promise. The
+                // dialog runs a nested message loop, in which the refresh timer may fire.
+                let path = {
+                    let _open = DialogOpen::new(&self.in_dialog);
+                    super::dialog::ask(&request, self.parent)
+                };
+                let _ = self.webview.evaluate_script(&super::dialog::answer_script(request.id, path.as_deref()));
             }
             return;
         }
@@ -252,11 +322,18 @@ fn create<P: Process + PluginMeta + WebAssets>(parent: *mut c_void, host: ViewHo
     };
     let localized = P::localized();
     let messages: Vec<String> = localized.ui_messages().iter().map(|(k, v)| format!("{}:{}", json_str(k), json_str(v))).collect();
-    let bridge = BRIDGE
+    let settings = ferritron_core::settings::<P>();
+    let initial: serde_json::Map<String, serde_json::Value> =
+        settings.keys().into_iter().filter_map(|k| Some((k.clone(), settings.get(&k)?))).collect();
+    let bridge = format!("{BRIDGE}
+{}
+ferritron._settingsHost({});", super::EXTRAS, serde_json::Value::Object(initial));
+    let bridge = bridge
         .replace("__PARAMS__", &json(&|index| index < own))
         .replace("__BUILTINS__", &json(&|index| index >= own))
         .replace("__MESSAGES__", &format!("{{{}}}", messages.join(",")))
         .replace("__LANGUAGE__", &json_str(&localized.language))
+        .replace("__PLUGIN__", &format!("{{\"id\":{},\"name\":{},\"vendor\":{}}}", json_str(P::INFO.id), json_str(P::INFO.name), json_str(P::INFO.vendor)))
         .replace("__INSTANCE__", &super::instance_json(instance.as_ref()));
 
     let view_cell: std::rc::Rc<RefCell<*const View>> = std::rc::Rc::new(RefCell::new(std::ptr::null()));
@@ -276,6 +353,11 @@ fn create<P: Process + PluginMeta + WebAssets>(parent: *mut c_void, host: ViewHo
                 trace(started, "page loaded");
             }
         })
+        // The bridge (window.ferritron) is injected into every page: never leave the plugin's own pages.
+        .with_navigation_handler(|url: String| {
+            url.starts_with("http://ferritron.localhost") || url.starts_with("https://ferritron.localhost") || url.starts_with("ferritron:") || url == "about:blank"
+        })
+        .with_new_window_req_handler(|_, _| wry::NewWindowResponse::Deny)
         .with_url(START_URL)
         .with_bounds(bounds(width, height));
     // Painted until the page draws itself: no white flash in a dark editor.
@@ -292,11 +374,57 @@ fn create<P: Process + PluginMeta + WebAssets>(parent: *mut c_void, host: ViewHo
         let _ = webview.zoom(zoom);
     }
 
-    let mut view = Box::new(View { timer: None, webview, parent, zoom, _context: context, host, params, last, describe: param_json::<P>, instance, revision });
+    if let Some(i) = &instance {
+        i.editor_opened(true);
+    }
+    let streams = instance
+        .as_ref()
+        .map(|i| {
+            i.streams()
+                .into_iter()
+                .filter(|(_, _, kind)| *kind == ferritron_core::StreamKind::Data)
+                .filter_map(|(name, _, _)| Some((name, i.stream(name)?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let settings_changed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let queue = settings_changed.clone();
+    let settings_watch = settings.on_change(move |key, value| {
+        queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((key.to_string(), value.cloned()));
+    });
+    let mut view = Box::new(View {
+        timer: None,
+        webview,
+        parent,
+        zoom,
+        _context: context,
+        host,
+        params,
+        last,
+        describe: param_json::<P>,
+        instance,
+        revision,
+        streams,
+        stream_values: Vec::new(),
+        settings,
+        settings_changed,
+        _settings_watch: settings_watch,
+        refreshes: 0,
+        in_dialog: Cell::new(false),
+    });
     *view_cell.borrow_mut() = &*view;
     let target: *mut View = &mut *view;
     // SAFETY: the timer is the view's first field: it stops before the view goes.
-    view.timer = UiTimer::new(REFRESH_MS, Box::new(move || unsafe { (*target).refresh() }));
+    // While a file dialog is open the view is borrowed by its message handler: the flag is
+    // read through the raw pointer first, so no `&mut View` is made in that case.
+    view.timer = UiTimer::new(
+        REFRESH_MS,
+        Box::new(move || unsafe {
+            if !(*target).in_dialog.get() {
+                (*target).refresh();
+            }
+        }),
+    );
     Some(view)
 }
 
@@ -342,4 +470,12 @@ pub(crate) unsafe extern "C" fn close(view: *mut c_void) {
     view.timer = None;
     let _ = catch_unwind(AssertUnwindSafe(move || drop(view)));
     release();
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        if let Some(i) = &self.instance {
+            i.editor_opened(false);
+        }
+    }
 }

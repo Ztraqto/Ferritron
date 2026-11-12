@@ -325,6 +325,7 @@ fn table(original: &'static PluginApi) -> PluginApi {
         save_state,
         load_state,
         get_extension,
+        reset,
     }
 }
 
@@ -537,16 +538,21 @@ unsafe extern "C" fn activate(ptr: *mut c_void, sample_rate: f64, max_block_size
     unsafe { with_slot(ptr, |s| (s.loaded.api.activate)(s.core, sample_rate, max_block_size)) }
 }
 
-unsafe extern "C" fn process(
-    ptr: *mut c_void,
-    channels: *const *mut f32,
-    num_channels: u32,
-    frames: u32,
-    events: *const Event,
-    num_events: u32,
-    executor: *const Executor,
-) -> bool {
-    unsafe { with_slot(ptr, |s| (s.loaded.api.process)(s.core, channels, num_channels, frames, events, num_events, executor)) }
+/// Forwards `reset` to the current library. Libraries built before 2.0.1 have no `reset` in their
+/// table (smaller `struct_size`): nothing to clear there.
+unsafe extern "C" fn reset(ptr: *mut c_void) {
+    unsafe {
+        with_slot(ptr, |s| {
+            let api = s.loaded.api;
+            if api.struct_size as usize >= std::mem::offset_of!(PluginApi, reset) + size_of::<usize>() {
+                (api.reset)(s.core);
+            }
+        })
+    }
+}
+
+unsafe extern "C" fn process(ptr: *mut c_void, data: *const crate::abi::ProcessData) -> bool {
+    unsafe { with_slot(ptr, |s| (s.loaded.api.process)(s.core, data)) }
 }
 
 unsafe extern "C" fn save_state(ptr: *mut c_void, buf: *mut u8, cap: u32) -> u32 {

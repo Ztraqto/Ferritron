@@ -10,11 +10,11 @@ struct CrashFixture;
 #[ferritron::plugin]
 impl Process for CrashFixture {
     fn process(&mut self, ctx: &mut Context) {
-        if ctx.params.crash.value() {
+        if ctx.params().crash.value() {
             // A real crash: Rust's panic guard cannot catch this.
             unsafe { std::ptr::null_mut::<u32>().write_volatile(0xDEAD) };
         }
-        let level = ctx.params.level.value();
-        ctx.io.for_each_sample(|s| *s *= level);
+        let level = ctx.params().level.value();
+        ctx.io().for_each_sample(|s| *s *= level);
     }
 }

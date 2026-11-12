@@ -1,0 +1,11 @@
+{
+  "plugin": "dev.ferritron.examples.ara-reverse",
+  "ferritron": "1.4.0",
+  "class_id": "a6b0e6bbbe988a2eed465eb416051838",
+  "params": [
+    {"index": 0, "id": 2067306362, "name": "Reverse", "flags": 0, "default": 1, "value": 0},
+    {"index": 1, "id": 248864332, "name": "Gain", "flags": 0, "default": 0.8333333333333334, "value": 0.58},
+    {"index": 2, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1}
+  ],
+  "state": "4652544e01000000050000007a97387b00000000000000004c5ed50e3e0ad7a3703d32c000000040000000000000f03f03000040000020a7974ee54104000040000000ffb8a6b141"
+}

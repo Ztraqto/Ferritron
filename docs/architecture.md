@@ -1,6 +1,6 @@
 # Ferritron アーキテクチャ設計書
 
-> ステータス: **確定 v1.42**（2026-11-08）／ Ferritron **1.3.0**
+> ステータス: **確定 v1.42**（2026-11-08）／ Ferritron **2.0.0**
 > 以降の変更は第17章「改訂履歴」に記録し、バージョンを上げて行う。
 > コードネーム: ProjectRvst / 正式名称: **Ferritron**
 
@@ -103,8 +103,8 @@ struct Gain;
 #[ferritron::plugin]
 impl Process for Gain {
     fn process(&mut self, ctx: &mut Context) {
-        let gain = db_to_gain(ctx.params.gain.value());   // プロジェクトファイルから自動生成された型付きパラメータ
-        ctx.io.for_each_sample(|s| *s *= gain);
+        let gain = db_to_gain(ctx.params().gain.value());   // プロジェクトファイルから自動生成された型付きパラメータ
+        ctx.io().for_each_sample(|s| *s *= gain);
     }
 }
 ```
@@ -822,9 +822,24 @@ JUCE の DSP 自体は遅くない。Ferritron が差をつけるのは次の点
 ### 12.1 動的パフォーマンス（1.1.0）
 
 - **無音時のスリープ**：入力が無音（-120 dBFS 未満）のまま、出力が続きうる長さ（`Process::tail`）が過ぎると、Runtime は `process` を呼ばずに無音を出す。入力・ノートオン・値の変わったパラメータで同じブロックから再開する。`Tail::Auto`（既定）は入力と出力がともに無音で、押さえたノートがない状態が 2 秒続いたとき。`Tail::Samples(n)` は宣言した長さ（レイテンシを加算）、`Tail::Infinite` は止めない。宣言がどうであれ、出力に音が残っている間は止めない。ホストにも伝える（VST3 の silence flags と tail samples、CLAP の `CLAP_PROCESS_SLEEP` と tail 拡張。ABI 拡張 `ferritron.sleep.v1`）。判定は Runtime が行うので、全形式・全プラグインで同じに働く。
-- **音質の切り替え**：`ctx.quality` は書き出し（オフラインレンダリング）中は `Quality::Best`、演奏・編集中は `Quality::Normal`。VST3 はブロックごとの process mode を渡すので、そのブロックから切り替わる。`[quality]` を書くと組み込みの「音質」スイッチ（自動 / 標準 / 最高）が付き、ユーザーが手動で固定できる。各段階で何を変えるか（オーバーサンプリング、フィルタ長など）はプラグインが決める。
+- **音質の切り替え**：`ctx.quality()` は書き出し（オフラインレンダリング）中は `Quality::Best`、演奏・編集中は `Quality::Normal`。VST3 はブロックごとの process mode を渡すので、そのブロックから切り替わる。`[quality]` を書くと組み込みの「音質」スイッチ（自動 / 標準 / 最高）が付き、ユーザーが手動で固定できる。各段階で何を変えるか（オーバーサンプリング、フィルタ長など）はプラグインが決める。
 - **エディタの事前起動**：Windows では WebView2 のブラウザプロセスの起動に 300 ms 以上かかる（直前のプロセスの終了と重なると数秒）。最初のインスタンスの生成時に非同期で起動し（ホストのメッセージループで完了するので待たない）、非表示の空のビューで生かしておく。全エディタが 1 つの環境を共有し、表示は約 60〜80 ms。データフォルダはホストのプログラムごとに分ける（オプションの違うプロセスが同じフォルダを使うと WebView2 が開けないため）。
 - **起動の短縮**：WebAssembly のゲストはコンパイル結果をディスクに置く（約 190 ms → 約 2 ms）。GPU はまず Vulkan（Apple では Metal）だけを起動する（全バックエンドの起動に数百 ms かかっていた。約 790 ms → 約 400 ms）。
+
+### 12.2 2.0.0 の処理経路
+
+2.0.0 で、1 ブロックの処理は次のように流れる（`crates/ferritron-core/src/abi.rs` の `process` / `process_with`）。測定は `docs/performance.md`。
+
+1. **シムがイベントを集めて並べる。** 形式ごとのシムは、パラメータの点・ノート・MIDI を 1 本の配列にまとめ、`ferritron_sort_events`（`ferritron_events.h`、C / C++ のシム）または `abi::sort_events`（Rust のシム: LV2・AU）で時刻順に並べる。どちらも安定（同じ時刻の順序を保つ）、O(n log n)、並んでいれば 1 回の走査、割り当てなし（作業領域はシムが事前に持つ）。CLAP はホストが時刻順に渡すので並べない。
+2. **C ABI v2 で渡す。** `process` は `ferritron_process_data*` を受け取る（`size` で版を見分ける。チャンネル、イベント、エグゼキュータ、出力イベントのバッファ）。
+3. **起こすかを決める。** 一括設定（プリセット・状態）を反映し、無音でスリープ中なら、値の変わるイベント・ノート・入力の音がなければ `process` を呼ばない（64 サンプルごとの早期終了）。
+4. **区間に分けて呼ぶ。** `[process] automation` に従う。`"control"`（既定）は制御周期（既定 32 サンプル）の先頭で値を反映し、値の変わらない周期をつないで 1 回の `process` にする。`"sample"` は値の変わる点ごとに分け（1.x と同じ）、`"events"` は分けずに `ctx.param_events()` で渡す。平滑化（`smooth`）があるパラメータが動いている間は周期ごとに分け、`ctx.ramp` がサンプルごとの値を出す。区間のノートと MIDI は、ブロックごとのスタック上の未初期化の領域に書いた分だけを渡す（以前は 24 KB を毎ブロック初期化しており、それだけで約 1 µs かかっていた）。
+5. **出力イベント。** `ctx.set_param` / `ctx.midi_out` は、呼び出し側（シム）が貸した `out_events` のバッファへ直接書く。インスタンスはバッファを持たない。足りなければ捨てて数える。
+6. **組み込みバイパス。** 切り替えの 10 ms はプラグインの出力と、レイテンシ分遅らせた入力をクロスフェードする。入力の写しは `activate` で最大ブロック × チャンネル数を確保する（2.0.0 でインスタンスあたりのメモリが増えた主な理由。`Harness::memory_report`）。完全にバイパス中は `process` を呼ばない。
+7. **オーディオスレッドの外。** ワーカー（`Worker`）は Ferritron のスレッドで `params_changed` / `tick` を受け、`[streams]` でエディタへ値を送る。設定（`ferritron::settings`）はプラグイン ID ごとの JSON ファイルで、ロックファイルで複数プロセスの書き込みを調停する。
+8. **隔離（`[isolation] mode = "process"`）。** 制御用の共有メモリ（約 33 KB）とは別に、音声用の共有メモリを `activate` のたびに必要なら作り直す（チャンネル数 × 最大ブロック長 × 2〈主バスとサイドチェーン〉）。子プロセスは世代番号で新しい領域を開く。ホストが最大ブロック長を超えて渡したブロックは分割して子へ送る。
+
+DSP 部品（SIMD、フィルタ、FFT など）は `ferritron-dsp` に置き、コアは依存しない（`ferritron::dsp`、feature `dsp`）。
 
 ---
 
@@ -879,7 +894,7 @@ Phase 1 のうち **Windows 向けの範囲は完了**。Gain（エフェクト�
 | 組み込みバイパス | ✅ | 全プラグインに自動で付与（VST3 `kIsBypass` / CLAP `IS_BYPASS`） |
 | 開発ツール | ✅ | `cargo ferritron new` / `bundle [--dev] [--install]` / `i18n check` |
 | macOS 対応 | ✅（実機未確認） | **コードは揃い、Windows から型検査済み。Mac の実機でのビルド・動作確認はまだ**（`FERRITRON_SKIP_NATIVE=1 cargo check/clippy --workspace --target aarch64-apple-darwin`・`x86_64-apple-darwin` が警告なしで通る。C/C++ シムの macOS 分岐は clang で構文だけ確認）。**バンドル**：規格メタデータに OS 別の上書き（`[package.metadata.ferritron.format.macos]`）と Info.plist のテンプレート（プロジェクトファイルの値で埋める）を追加し、`.vst3`・`.clap`・`.component` を `Contents/MacOS` 形式で作る。CLI は Mach-O（ユニバーサルバイナリも）の公開シンボルを読む。署名はアドホック、`FERRITRON_CODESIGN_IDENTITY` で証明書。インストール先は `~/Library/Audio/Plug-Ins/`。**シム**：VST3 は `bundleEntry`/`bundleExit` と `kPlatformTypeNSView`、CLAP は `cocoa`。macOS のサイズはポイントで渡し、描画の倍率はビューが自分で扱う。プラグイン自身の編集（MCP）はメインのディスパッチキューでホストへ渡す。**ホットリロード**：`dlopen` 版のローダー（`module.rs`、Windows 版と同じ形）。**エディタ**：Web は WKWebView（wry）、GPU は NSView のサブクラス（実行時に登録し、ライブラリごとに別名）に Metal で描く。マウス・ホイール・キー（Command は ctrl 扱い）・フォーカス・Retina に対応。UI スレッドのタイマーは `CFRunLoopTimer`。IME の変換中の文字は未対応 |
-| インストゥルメント（ノート入力） | ✅ | `kind = "instrument"`。VST3 イベントバス、CLAP note-ports（MIDI も可）。`ctx.notes` |
+| インストゥルメント（ノート入力） | ✅ | `kind = "instrument"`。VST3 イベントバス、CLAP note-ports（MIDI も可）。`ctx.notes()` |
 | テストハーネス | ✅ | `ferritron::testing::Harness`：DAW なしでホストと同じ処理経路を試験できる |
 | GUI：Web バックエンド（Phase 3 の一部） | ✅ | Windows / WebView2。VST3 `IPlugView` と CLAP `gui` 拡張。ABI 拡張 `ferritron.view.v1`。双方向同期とジェスチャ通知。HiDPI（ホスト指定の倍率、なければウィンドウの DPI）とリサイズ（上限・下限付き）に対応 |
 | ABI 拡張の仕組み | ✅ | `get_extension(id)`。未知の ID は NULL（1.6 / 4.1 の規則どおり） |

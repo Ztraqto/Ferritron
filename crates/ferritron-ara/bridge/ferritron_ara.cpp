@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 #include <thread>
@@ -62,8 +63,19 @@ public:
 		_notes.clear();
 		const auto channels = static_cast<size_t>(getChannelCount());
 		const auto samples = static_cast<size_t>(getSampleCount());
-		auto cache = std::make_shared<std::vector<float>>(channels * samples);
-		std::vector<void*> pointers(channels);
+		std::shared_ptr<std::vector<float>> cache;
+		std::vector<void*> pointers;
+		try {
+			cache = std::make_shared<std::vector<float>>(channels * samples);
+			pointers.resize(channels);
+		} catch (const std::exception&) {
+			// Not enough memory for the whole file (or a size that does not fit): the source
+			// counts as empty, so its regions are silent. The host keeps running.
+			_cache = std::make_shared<std::vector<float>>();
+			_cachedChannels = channels;
+			_cachedSamples = 0;
+			return;
+		}
 		for (size_t c = 0; c < channels; ++c)
 			pointers[c] = cache->data() + c * samples;
 		// The host clears the buffers itself if reading fails (and tells the user).

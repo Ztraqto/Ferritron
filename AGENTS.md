@@ -11,10 +11,16 @@ file** (`<name>.ferritroject`, TOML) that declares everything static, and a **Ru
 the typed parameters, stable parameter IDs and the VST3/CLAP entry points from
 the project file.
 
-**Version: 1.3.0** (all crates share it; history in [CHANGELOG.md](CHANGELOG.md)).
+**Version: 2.0.0** (all crates share it; history in [CHANGELOG.md](CHANGELOG.md)).
+**Ferritron 1.4.x and older are deprecated**: new plugins and fixes target 2.0.0; do not start
+work against an older version, and move existing plugins up (see `docs/migration-2.0.md` and
+"Moving up from 1.4.x" in the CHANGELOG: `Context` fields became methods, automation is
+applied per control period, the C ABI is v2, the built-in bypass crossfades).
 When you develop against Ferritron, state the version you target and pin it:
-`ferritron = { path = "...", version = "1.3.0" }`. `ferritron::VERSION` and
+`ferritron = { path = "...", version = "2.0.0" }`. `ferritron::VERSION` and
 `cargo ferritron --version` report the version in use.
+
+**Current state (read first):** [release/plans/ferritron-2.0-status.md](release/plans/ferritron-2.0-status.md) says which branch holds the latest 2.0.0, what is verified and what is not.
 
 ## 1. Prerequisites
 
@@ -34,6 +40,7 @@ When you develop against Ferritron, state the version you target and pin it:
 |---|---|---|---|
 | `VST3_SDK_DIR` | VST3 (default) | the one containing `pluginterfaces/` | Steinberg VST3 SDK |
 | `CLAP_SDK_DIR` | CLAP (default) | the one containing `include/clap/clap.h` | github.com/free-audio/clap |
+| `VST2_SDK_DIR` | VST 2 (feature `vst2`, off by default) | the one containing `pluginterfaces/vst2.x` | **Not fetched or shipped by Ferritron.** Steinberg no longer licenses VST 2; only people who already have the SDK under an existing agreement can use it. `cargo ferritron sdk fetch` does not offer it. Without it the crate builds empty with a warning. |
 | `ARA_SDK_DIR` | ARA 2 (feature `ara`) | the one containing `ARA_API` and `ARA_Library` | `git clone --recursive https://github.com/Celemony/ARA_SDK` (Apache 2.0) |
 | `AAX_SDK_DIR` | AAX (feature `aax`) | the one containing `Interfaces/AAX.h` | Avid developer site (sign up; the user gets it) |
 | `ANDROID_NDK_HOME` | Android apps (`--target android`) | the NDK root (`meta/platforms.json`) | developer.android.com/ndk (also `C:\Ferritron\SDK\ndk\<version>`) |
@@ -104,13 +111,13 @@ struct Gain;
 #[ferritron::plugin]
 impl Process for Gain {
     fn process(&mut self, ctx: &mut Context) {
-        let gain = db_to_gain(ctx.params.gain.value());
-        ctx.io.for_each_sample(|s| *s *= gain);
+        let gain = db_to_gain(ctx.params().gain.value());
+        ctx.io().for_each_sample(|s| *s *= gain);
     }
 }
 ```
 
-The plugin type must implement `Default`. `ctx.params.<key>` exists because the
+The plugin type must implement `Default`. `ctx.params().<key>` exists because the
 key is declared in `[params]`.
 
 ### Parameter types
@@ -145,9 +152,9 @@ the plugin and editor in the host's process (not with `[isolation]` or
 ### Instrument
 
 Add `kind = "instrument"` under `[plugin]`. The plugin then receives notes
-instead of audio input: iterate `ctx.notes` (each has `offset` in samples,
+instead of audio input: iterate `ctx.notes()` (each has `offset` in samples,
 `key`, `velocity`, `kind: NoteKind::On | Off`) and write to
-`ctx.io.channel_mut(0)`. Reference: [examples/sine-synth](examples/sine-synth).
+`ctx.io().channel_mut(0)`. Reference: [examples/sine-synth](examples/sine-synth).
 
 ### Editor (optional)
 
@@ -164,6 +171,47 @@ instead of audio input: iterate `ctx.notes` (each has `offset` in samples,
   `ferritron::gpu_view::GpuEditor`. See [examples/gpu-view](examples/gpu-view).
 - `[view] process = true` runs any editor in its own process.
 
+### 2.0 additions (see `docs/migration-2.0.md`, `docs/performance.md` and the CHANGELOG)
+
+- `[process] automation = "control" | "sample" | "events"` and `control_block = 32`: parameter changes are applied at the
+  start of each control period (default). `ctx.param_events()` serves `"events"`.
+- `smooth = "20ms"` (or `{ time, kind = "linear" | "log" | "exp" }`) on a float parameter; `ctx.ramp(&p, &mut buf)` gives the
+  per-sample values (allocate `buf` in `activate`). `value()` is smoothed, `target()` is the host's.
+- `ctx.changed(&p)`, `any_changed()`, `changed_indices()`; `Process::scratch` + `ctx.scratch::<f32>(n)` (no allocation);
+  `ctx.set_param` and `ctx.midi_out` send events to the host from the audio thread; `Process::STATE_VERSION` +
+  `migrate_state` upgrade old projects.
+- `[params.band] repeat = 24` with `[params.band.fields]` makes repeated parameters (`ctx.params().band[i].freq`).
+- `ferritron::dsp` (feature `dsp`, default on): SIMD, `Biquad*`, `DelayLine`, `Smoother`, `Fft`, `Oversampler`, ...
+  `FERRITRON_ISA=scalar` caps the instruction set for debugging.
+- GPU editors can draw with Ferritron Native Graphics: feature `fng`, `editor = "FngAdapter<Editor>"`
+  ([examples/fng-view](examples/fng-view)).
+- Without a GPU, an FNG editor (`FngAdapter`) is drawn on the CPU in its window (Windows); `FERRITRON_GPU_VIEW=cpu` forces the CPU mode.
+- Graph nodes report and fix where they run: `Graph::placement(id)` and `Graph::set_placement(id, device)`.
+- When the GPU is lost, `IirNode`, `KernelNode` and `MatrixMixerNode` switch to their CPU candidate from the next `Graph::process` call, and `Graph::take_latency_changed()` reports a latency change (loss simulated by hand only).
+- Settings kept across projects: `ferritron::settings::<P>()` / `settings_for(id)` (JSON per plugin ID, safe across
+  processes, `on_change`); the web editor's `ferritron.settings` uses the same file. Not for the audio thread.
+- `Harness` also drives parameters by index / ID (`set_param_index`, `param_id`, `flags`), runs `host_latency()`,
+  `load_values`, `set_automation_mode`, `process_events` / `param_event`, and reports `memory_report()`.
+  `testing::check_fixture::<P>(json)` checks IDs, class ID and a saved state against `tests/fixtures/1.4.0/`.
+- Isolation sizes its audio shared memory in `activate` (channels × max block); shims sort events with the shared
+  allocation-free sort (`ferritron_events.h` in C/C++, `abi::sort_events` in Rust). Never use `sort_by_key` (allocates)
+  or `Vec` on the audio path of an adapter.
+- Checked on 2.0.0: every example passes the VST3 `validator`; `clap-validator` fails only `midi-out`,
+  `multiband-test` and `wasm-crusher` (the sandbox guest crashes / hangs on purpose), by design; its preset
+  discovery crawl / load tests deadlock in 0.4.1 with 2+ presets and are skipped. DAW: FL Studio's plugin scan loads the VST2 build ("ok"); VST3/CLAP not
+  played in a DAW; AAX built only (no Pro Tools);
+  macOS/iOS/AU/AUv3 type-checked only. MIDI output and the plugin's own parameter edits compile against the SDK; not run in Pro Tools. VST2 is checked with a simulated host only; LV2 MIDI output is not checked in an LV2 host; device loss is only simulated. Say so. The wasm-sandbox example did not load in 2.0.0 before audit fix f1 (its guest did not build); it loads and is checked again after f2.
+- `ctx.notify(code)` / `InstanceHandle::notify` from any thread (the audio thread too) run the `on_notify` handler on the
+  main thread. `instances_watch(|event| ..)` follows instances and editors (one Ferritron thread); `editors::<P>()`,
+  `SingletonView`. `TrackInfo` also has `kind`, `location`, `channels` (mute / solo / fader: no format tells them).
+- `[presets]` become the VST3 program list, CLAP `preset-load` / preset discovery and VST2 programs (a hidden built-in
+  "Program" parameter); user presets: `presets::save_user` / `load_user`. `poly = true` (floats): CLAP per-note
+  modulation; `Process::VOICES` turns on CLAP `voice-info` and VST3 Note Expression; read `ctx.voice_events()`.
+- Voices: `Process::REPORTS_VOICE_END` and `ctx.voice_ended` report CLAP NOTE_END; `VoiceMods` keeps a released voice until `end()`.
+- Measure before you optimize: `cargo run --release -p ferritron-bench-fx`; `ferritron-testhost <bundle> --bench N` (through the shim, S9; with
+  `FERRITRON_ISOLATION=process`, S7); `AllocGuard` (feature `alloc-check`) and
+  `Harness::assert_no_alloc()` check that `process` allocates nothing. Numbers belong in `docs/performance.md`.
+
 ### Silence and quality
 
 - Ferritron stops calling `process` while the input is silent and the
@@ -171,7 +219,7 @@ instead of audio input: iterate `ctx.notes` (each has `offset` in samples,
   A plugin that makes sound from silence or whose output pauses for more
   than two seconds (long delays, loopers) returns `Tail::Infinite` or
   `Tail::Samples(n)`.
-- `ctx.quality` is `Quality::Best` while the host exports and
+- `ctx.quality()` is `Quality::Best` while the host exports and
   `Quality::Normal` otherwise. `[quality]` in the project file adds a
   user switch (Auto / Normal / Best). Allocate for `Best` in `activate`.
 
@@ -237,7 +285,7 @@ cargo ferritron bundle gain --target ios        # app + AUv3; needs a Mac with X
   `window.ferritron`; plugins without one get an editor made from their parameters.
 - Verified on this machine: LV2 (test host), standalone on Windows, WAM in a
   browser, Android on the emulator. Not verified: macOS/iOS (type-checked
-  only), AAX (written without the SDK). Say so; do not claim otherwise.
+  only), AAX (compiles and links against the AAX SDK, exports the ACF entry points, but never run in Pro Tools; mono sidechain; no AudioSuite). Say so; do not claim otherwise.
 - Test LV2 bundles from `target/bundled`, never install them into `%APPDATA%\LV2`
   while testing (same rule as VST3/CLAP).
 
@@ -279,11 +327,16 @@ of each file. Both buses may be mono. Without `[ara]` nothing ARA is linked.
 References: [examples/ara-reverse](examples/ara-reverse),
 [examples/ara-stretch](examples/ara-stretch).
 
+ARA limits (current behavior): the bridge renders only the parts of a region whose audio file has the
+host's sample rate (other rates are silent; Ferritron does not resample). Each audio file is read into
+memory whole (channels × samples × 4 bytes); a region of a file that could not be read is silent. A part of
+a region longer than the maximum block size the host announced is not rendered.
+
 ## 5. Optional project-file features
 
 | Table | Effect |
 |---|---|
-| `[quality]` | A "Quality" switch (Auto / Normal / Best) for `ctx.quality`; Auto is Best while the host exports |
+| `[quality]` | A "Quality" switch (Auto / Normal / Best) for `ctx.quality()`; Auto is Best while the host exports |
 | `[mcp]` | Lets AI clients reach the running plugin through the `ferritron-mcp` hub, behind a user-controlled "AI Access" switch (off by default) |
 | `[isolation] mode = "process"` | Plugin runs in its own process; a crash silences it instead of taking down the host. Also `share`, `pipeline` |
 | `[view]` | Editor (see above) |
@@ -321,6 +374,7 @@ sandboxing exist too; see the README sections of the same names.
 | `crates/ferritron-wam` | Web Audio Module (WAM 2.0) files for `--target web` |
 | `crates/ferritron-ara` | ARA 2 |
 | `crates/ferritron-web` / `-gpu-view` | HTML/JS and wgpu editors |
+| `crates/ferritron-dsp` / `-native-graphics` | DSP building blocks; Ferritron Native Graphics (2D drawing, wgpu and CPU) |
 | `crates/ferritron-gpu` / `-graph` / `-slang` / `-vulkan` | GPU processing |
 | `crates/ferritron-wasm` | Isolation level 2 (WebAssembly) |
 | `crates/ferritron-cli` | `cargo ferritron` (new, bundle, i18n) |

@@ -13,6 +13,11 @@
 //! screenshot. `--instances N` runs N instances of the plugin in this
 //! process, each told it sits on its own track ("Track 1", ...), for plugins
 //! whose instances work together.
+//!
+//! `--bench N` (VST3 / VST 2): processes N blocks of 256 stereo frames back to back through the
+//! format shim, after 500 to warm up, and prints the mean, p99 and maximum time per block
+//! (benchmark S9). With `FERRITRON_ISOLATION=process` the plugin runs in its own process
+//! (S7); with `FERRITRON_TESTHOST_DENSE=K` the host sends K automation points per block.
 
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
@@ -81,6 +86,7 @@ fn main() -> ExitCode {
             "--wheel" => script.push(format!("wheel:{}", numbers(3, &mut args))),
             "--leave" => script.push("leave".into()),
             "--bmp" => set_env("FERRITRON_TESTHOST_BMP", "1"),
+            "--bench" => set_env("FERRITRON_TESTHOST_BENCH", &args.next().unwrap_or_else(|| "20000".into())),
             "--seconds" => seconds = args.next().and_then(|v| v.parse().ok()).unwrap_or(seconds),
             "--param" => param = args.next().and_then(|v| v.parse().ok()).unwrap_or(param),
             "--gui" => gui = args.next(),
@@ -102,7 +108,7 @@ fn main() -> ExitCode {
         set_env("FERRITRON_TESTHOST_SCRIPT", &script.join(";"));
     }
     let Some(bundle) = bundle else {
-        eprintln!("usage: ferritron-testhost <bundle.vst3> [--seconds N] [--param NORMALIZED]");
+        eprintln!("usage: ferritron-testhost <bundle.vst3 | plugin.vst2.dll | plugin.clap> [--seconds N] [--param NORMALIZED]");
         return ExitCode::FAILURE;
     };
     let gui: Option<Vec<u16>> = gui.map(|d| std::ffi::OsStr::new(&d).encode_wide().chain(Some(0)).collect());
@@ -130,7 +136,8 @@ fn main() -> ExitCode {
         }
     }
     let name = bundle.file_name().expect("bundle path has a file name");
-    let binary = bundle.join("Contents").join("x86_64-win").join(name);
+    // A VST 3 bundle holds its binary; a .dll is the binary itself (a VST 2 plugin).
+    let binary = if bundle.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) { bundle.clone() } else { bundle.join("Contents").join("x86_64-win").join(name) };
     let wide: Vec<u16> = binary.as_os_str().encode_wide().chain(Some(0)).collect();
     let code =
         unsafe { ferritron_testhost_run(wide.as_ptr(), seconds, param, gui_ptr, click.0, click.1, scale, resize.0, resize.1, pulse_at) };

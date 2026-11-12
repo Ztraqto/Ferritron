@@ -68,6 +68,33 @@ impl TensorMixer {
         self.gpu.name()
     }
 
+    /// True once the device this mixer runs on is lost (see [`Gpu::get`]). A
+    /// lost mixer is silent until [`revive`](Self::revive) builds it again.
+    pub fn lost(&self) -> bool {
+        self.commands.lost()
+    }
+
+    /// Marks this mixer's device as lost, as if the device had been lost (for
+    /// tests; see [`PersistentModalBank::simulate_loss`](crate::PersistentModalBank::simulate_loss)).
+    #[doc(hidden)]
+    pub fn simulate_loss(&self) {
+        self.gpu.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Builds the mixer again after its device was lost (see
+    /// [`PersistentModalBank::revive`](crate::PersistentModalBank::revive)):
+    /// the weights are kept. Consumes the mixer; off the audio thread.
+    pub fn revive(self) -> Result<Self, String> {
+        let (inputs, outputs, max_frames) = (self.inputs, self.outputs, self.max_frames);
+        let count = self.pin * self.pout;
+        let mut weights = vec![f16::ZERO; count];
+        unsafe { std::ptr::copy_nonoverlapping(self.matrix.slice::<f16>(), weights.as_mut_ptr(), count) };
+        drop(self);
+        let fresh = Self::new(inputs, outputs, max_frames)?;
+        unsafe { std::ptr::copy_nonoverlapping(weights.as_ptr(), fresh.matrix.slice::<f16>(), count) };
+        Ok(fresh)
+    }
+
     /// Sets the weight of input `input` in output `output`.
     pub fn set_gain(&mut self, output: usize, input: usize, gain: f32) {
         if output < self.outputs && input < self.inputs {
@@ -89,6 +116,11 @@ impl TensorMixer {
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
         let n = inputs.iter().map(|c| c.len()).chain(outputs.iter().map(|c| c.len())).min().unwrap_or(0).min(self.max_frames);
         if n == 0 {
+            return;
+        }
+        if self.commands.lost() {
+            // The device is gone: silence, not the input (the mixer is not a dry path).
+            outputs.iter_mut().for_each(|out| out[..n].fill(0.0));
             return;
         }
         let frames = pad16(n);
@@ -117,10 +149,11 @@ impl TensorMixer {
             device.cmd_dispatch(cb, (frames / 16) as u32, (self.pout / 16) as u32, 1);
             let _ = device.end_command_buffer(cb);
         }
-        if self.commands.submit(0).is_err() {
+        if self.commands.submit(0).is_err() || !self.commands.wait(0) {
+            // Submission failed, or the GPU did not finish in time: silence.
+            outputs.iter_mut().for_each(|out| out[..n].fill(0.0));
             return;
         }
-        self.commands.wait(0);
         let output = self.output.slice::<f32>();
         for (o, out) in outputs.iter_mut().take(self.outputs).enumerate() {
             let row = unsafe { std::slice::from_raw_parts(output.add(o * frames), n) };
@@ -174,5 +207,48 @@ mod tests {
         let few: Vec<&[f32]> = input.iter().map(|c| &c[..5]).collect();
         mixer.process(&few, &mut outs);
         assert!((short[0][3] - want[0][3]).abs() < 5e-3 * peak);
+    }
+
+    /// V1 (rebuild, simulated loss): a lost mixer is silent; `revive` builds it
+    /// again on a new device with the same weights.
+    #[test]
+    fn a_lost_mixer_is_built_again_with_its_weights() {
+        let _serial = crate::serial();
+        let (inputs, outputs, frames) = (32, 16, 64);
+        let mut mixer = match TensorMixer::new(inputs, outputs, frames) {
+            Ok(m) => m,
+            Err(e) => return eprintln!("skipping: {e}"),
+        };
+        let weights: Vec<f32> = (0..inputs * outputs).map(|k| ((k * 7919 % 1000) as f32 / 1000.0 - 0.5) / 8.0).collect();
+        mixer.set_matrix(&weights);
+        let before = mixer.gpu.generation();
+        mixer.gpu.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(mixer.lost(), "the mixer reports its lost device");
+        let input: Vec<Vec<f32>> = (0..inputs).map(|c| (0..frames).map(|f| ((f * (c + 3)) as f32 * 0.01).sin() * 0.5).collect()).collect();
+        let ins: Vec<&[f32]> = input.iter().map(|c| &c[..]).collect();
+        let mut got = vec![vec![1.0f32; frames]; outputs];
+        {
+            let mut outs: Vec<&mut [f32]> = got.iter_mut().map(|c| &mut c[..]).collect();
+            mixer.process(&ins, &mut outs);
+        }
+        assert!(got.iter().flatten().all(|&v| v == 0.0), "a lost mixer is silent");
+        let mut mixer = mixer.revive().expect("built again");
+        assert!(mixer.gpu.generation() > before, "built again on a new device");
+        let mut got = vec![vec![0.0f32; frames]; outputs];
+        {
+            let mut outs: Vec<&mut [f32]> = got.iter_mut().map(|c| &mut c[..]).collect();
+            mixer.process(&ins, &mut outs);
+        }
+        let mut want = vec![vec![0.0f32; frames]; outputs];
+        for o in 0..outputs {
+            for i in 0..inputs {
+                for f in 0..frames {
+                    want[o][f] += weights[o * inputs + i] * input[i][f];
+                }
+            }
+        }
+        let peak = want.iter().flatten().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let worst = got.iter().flatten().zip(want.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(peak > 0.01 && worst < 5e-3 * peak, "off by {worst} (peak {peak})");
     }
 }

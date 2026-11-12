@@ -1,0 +1,10 @@
+{
+  "plugin": "dev.ferritron.examples.gpu-reverb",
+  "ferritron": "1.4.0",
+  "class_id": "58133cd0ea677568ef94c2145f876d6e",
+  "params": [
+    {"index": 0, "id": 279054680, "name": "ミックス", "flags": 0, "default": 0.3, "value": 0.21},
+    {"index": 1, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1}
+  ],
+  "state": "4652544e01000000040000005809a210000000000000354000000040000000000000f03f03000040000040217407dd41040000400000e0422168ea41"
+}

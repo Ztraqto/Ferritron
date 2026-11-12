@@ -1,0 +1,11 @@
+{
+  "plugin": "dev.ferritron.examples.gpu-chain",
+  "ferritron": "1.4.0",
+  "class_id": "de3a1ee9bf9c9155f52f6750115f7bdf",
+  "params": [
+    {"index": 0, "id": 390124622, "name": "トーン", "flags": 0, "default": 0.5, "value": 0.21},
+    {"index": 1, "id": 1089540391, "name": "音量", "flags": 0, "default": 0.6666666666666666, "value": 0.58},
+    {"index": 2, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1}
+  ],
+  "state": "4652544e01000000050000004ed44017d7a3703d0ad71bc02711f140af47e17a14ae30c000000040000000000000f03f03000040000060db4b2fe54104000040000000f8988ea241"
+}

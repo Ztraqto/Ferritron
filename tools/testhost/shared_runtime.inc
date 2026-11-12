@@ -51,7 +51,8 @@ bool load(const wchar_t* path, Loaded& out) {
 bool processBlock(const Loaded& p) {
 	std::vector<float> buf(256, 0.0f);
 	float* ch[1] = {buf.data()};
-	return p.api->process(p.core, ch, 1, 256, nullptr, 0, nullptr);
+	ferritron_process_data pd = {sizeof(pd), 256, 1, 0, ch, nullptr, nullptr, nullptr, 0, 0};
+	return p.api->process(p.core, &pd);
 }
 
 } // namespace

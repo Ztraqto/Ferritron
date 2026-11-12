@@ -1,0 +1,22 @@
+[package]
+name = "multiband-test"
+description = "Ferritron 1.3.1 test plugin: explicit IDs, initial values, class ID, categories (grows with each 1.3.1 feature)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron = { workspace = true }
+
+[features]
+# Tests the VST 2 shim; needs your own VST 2 SDK (VST2_SDK_DIR).
+vst2-test = ["ferritron/vst2"]
+# Builds AAX too; needs your own AAX SDK (AAX_SDK_DIR).
+aax-test = ["ferritron/aax"]
+
+[dev-dependencies]
+ferritron-manifest.workspace = true

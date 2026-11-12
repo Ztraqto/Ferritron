@@ -14,6 +14,7 @@ doctest = false
 
 [dependencies]
 ferritron-core.workspace = true
+ferritron-manifest.workspace = true
 
 # How `cargo ferritron bundle` packages this format: a folder with the
 # binary and its Turtle description, generated from the project file.

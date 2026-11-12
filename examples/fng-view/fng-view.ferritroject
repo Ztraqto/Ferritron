@@ -1,0 +1,16 @@
+[plugin]
+id     = "dev.ferritron.examples.fng-view"
+name   = "Ferritron FNG View"
+vendor = "Ztraqto"
+
+[params]
+gain = { type = "float", range = [-60, 12], default = 0, unit = "dB", smooth = "20ms" }
+
+# The editor is described with Ferritron Native Graphics by `Editor` in src/lib.rs.
+[view]
+backend   = "gpu"
+editor    = "FngAdapter<Editor>"
+size      = [480, 240]
+resizable = true
+min_size  = [240, 120]
+max_size  = [1600, 800]

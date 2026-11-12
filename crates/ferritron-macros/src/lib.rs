@@ -12,16 +12,34 @@ use proc_macro::{Delimiter, Group, TokenStream, TokenTree};
 /// It reads the project file next to `Cargo.toml` (`<name>.ferritroject` or `<name>.frtx`, or the
 /// former `ferritron.toml`) and generates, in the same
 /// module: a `Params` struct, a `Context` alias, the plugin metadata and the
-/// format entry points.
+/// format entry points (and a `Streams` struct for `[streams]`).
+///
+/// `#[ferritron::plugin(worker = MyWorker)]` gives the plugin a worker that runs off the
+/// audio thread (`MyWorker` implements `ferritron::Worker` with `type Plugin = ` this plugin).
 #[proc_macro_attribute]
-pub fn plugin(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    match expand(item) {
+pub fn plugin(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match parse_attr(attr).and_then(|worker| expand(item, worker)) {
         Ok(tokens) => tokens,
         Err(message) => format!("::core::compile_error!({message:?});").parse().unwrap(),
     }
 }
 
-fn expand(item: TokenStream) -> Result<TokenStream, String> {
+/// `worker = Type` (the only argument). Returns the worker type as source text.
+fn parse_attr(attr: TokenStream) -> Result<Option<String>, String> {
+    const USAGE: &str = "#[ferritron::plugin] takes no arguments, or `worker = YourWorker`";
+    let tokens: Vec<TokenTree> = attr.into_iter().collect();
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+    match (tokens.first(), tokens.get(1)) {
+        (Some(TokenTree::Ident(name)), Some(TokenTree::Punct(eq))) if name.to_string() == "worker" && eq.as_char() == '=' && tokens.len() > 2 => {
+            Ok(Some(tokens[2..].iter().map(|t| t.to_string()).collect::<Vec<_>>().join("")))
+        }
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn expand(item: TokenStream, worker: Option<String>) -> Result<TokenStream, String> {
     let (impl_block, self_ty) = add_params_type(item)?;
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| "CARGO_MANIFEST_DIR is not set")?;
     let path = ferritron_manifest::locate(std::path::Path::new(&manifest_dir))?;
@@ -35,15 +53,36 @@ fn expand(item: TokenStream) -> Result<TokenStream, String> {
     let (view_items, view_method) = view.as_ref().map(|v| view::generate(v, &self_ty)).unwrap_or_default();
     generated.push_str(&view_items);
     let parallel = if manifest.parallel { "const PARALLEL: bool = true;" } else { "" };
+    let process = format!("const AUTOMATION: u8 = {}; const CONTROL_BLOCK: u32 = {};", manifest.automation, manifest.control_block);
     let mcp = if manifest.mcp { "const MCP: bool = true;" } else { "" };
     let quality = if manifest.quality { "const QUALITY: bool = true;" } else { "" };
+    let worker = match &worker {
+        Some(w) => {
+            generated.push_str(&format!(
+                "const _: fn() = || {{ fn __ferritron_worker_check<W: ::ferritron::Worker<Plugin = {self_ty}>>() {{}} __ferritron_worker_check::<{w}>(); }};
+"
+            ));
+            format!(
+                "fn make_worker(params: &::std::sync::Arc<dyn ::core::any::Any + ::core::marker::Send + ::core::marker::Sync>, instance: &::ferritron::InstanceHandle) -> ::core::option::Option<::std::boxed::Box<dyn ::ferritron::worker::WorkerObj>> {{ ::ferritron::worker::make::<{w}>(params, instance) }}"
+            )
+        }
+        None => String::new(),
+    };
+    let presets = if manifest.presets.is_empty() {
+        ""
+    } else {
+        "fn presets() -> &'static [::ferritron::Preset] { &__FERRITRON_PRESETS }
+    fn program_param() -> ::core::option::Option<&'static ::ferritron::ParamInfo> { ::core::option::Option::Some(&__FERRITRON_PROGRAM) }"
+    };
     let ara = if manifest.ara {
         generated.push_str("::ferritron::__require_ara!();\n");
         "fn ara() -> ::core::option::Option<&'static ::ferritron::abi::AraApi> { ::core::option::Option::Some(::ferritron::ara::api::<Self>()) }"
     } else {
         ""
     };
-    generated.push_str(&locales::generate(&locales, &self_ty, &format!("{view_method}\n    {parallel}\n    {mcp}\n    {quality}\n    {ara}")));
+    generated.push_str(&locales::generate(&locales, &self_ty, &format!("{view_method}\n    {parallel}\n    {process}\n    {mcp}\n    {quality}\n    {ara}
+    {worker}
+    {presets}")));
     let generated: TokenStream = generated.parse().map_err(|e| format!("internal codegen error: {e}"))?;
     let mut out = impl_block;
     out.extend(generated);

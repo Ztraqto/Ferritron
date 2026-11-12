@@ -106,7 +106,7 @@ pub fn parse(root: &Table, manifest_dir: &Path) -> Result<Option<View>, String> 
 
     if gpu {
         let editor = view.get("editor").ok_or("a gpu view needs view.editor = \"<type implementing GpuEditor>\"")?;
-        let editor = editor.as_str().filter(|e| is_path(e)).ok_or("view.editor must be a Rust type path, e.g. \"Editor\" or \"ui::Editor\"")?;
+        let editor = editor.as_str().filter(|e| is_type(e)).ok_or("view.editor must be a Rust type path, e.g. \"Editor\", \"ui::Editor\" or \"FngAdapter<Editor>\"")?;
         return Ok(Some(View { backend: Backend::Gpu(editor.to_string()), process, width, height, min, max, background, preload }));
     }
     let folder = manifest_dir.join(entry);
@@ -123,6 +123,14 @@ fn parse_color(s: &str) -> Option<[u8; 3]> {
     let hex = s.strip_prefix('#').filter(|h| h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()))?;
     let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
     Some([byte(0)?, byte(2)?, byte(4)?])
+}
+
+/// A type path, optionally with one generic argument that is itself such a type.
+fn is_type(s: &str) -> bool {
+    match s.split_once('<') {
+        None => is_path(s),
+        Some((head, rest)) => is_path(head) && rest.strip_suffix('>').is_some_and(is_type),
+    }
 }
 
 fn is_path(s: &str) -> bool {

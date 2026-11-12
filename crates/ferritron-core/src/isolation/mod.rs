@@ -1,7 +1,7 @@
 //! Crash isolation, level 3 (design doc, 8.5): the plugin runs in a separate
 //! process, so a crash cannot take the host down.
 //!
-//! The library the host loaded becomes a client: [`resolve`] swaps in a
+//! The library the host loaded becomes a client: [`crate::reload::resolve`] swaps in a
 //! function table that forwards processing to a child process. The child is
 //! the same plugin library, which runs its exported `ferritron_host_main`:
 //! loaded by Windows' `rundll32.exe` (no executable to ship), or on macOS and

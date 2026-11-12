@@ -1,0 +1,12 @@
+# A plain delay with two knobs that should be equal: how many samples it delays (`actual`)
+# and how many it tells the host (`reported`). A plugin that gets this wrong is what
+# `cargo ferritron check` looks for; see the tests in src/lib.rs.
+[plugin]
+id     = "dev.ferritron.examples.latency-check"
+name   = "Ferritron Latency Check"
+vendor = "Ztraqto"
+
+[params]
+reported = { type = "int", range = [0, 2000], default = 64, unit = "samples" }
+actual   = { type = "int", range = [0, 2000], default = 64, unit = "samples" }
+mute     = { type = "bool", default = false }

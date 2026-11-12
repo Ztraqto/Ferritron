@@ -225,6 +225,13 @@ impl Format {
         Ok((root, binary))
     }
 
+    /// The system folder for this format on this computer (`None`: the format has none here,
+    /// such as the standalone app).
+    pub fn install_folder(&self) -> Option<Result<PathBuf, String>> {
+        let (os, _) = platform();
+        self.install.get(os).map(|template| expand_env(template))
+    }
+
     /// Copies a package into the system folder for this format. Sibling files
     /// of a single-file package (such as the hot reload marker) come along.
     pub fn install(&self, root: &Path, sibling_suffixes: &[&str]) -> Result<PathBuf, String> {
@@ -289,11 +296,43 @@ fn expand_env(template: &str) -> Result<PathBuf, String> {
         let end = rest[start..].find('}').ok_or_else(|| format!("unclosed {{ in `{template}`"))? + start;
         let var = &rest[start + 1..end];
         out.push_str(&rest[..start]);
-        out.push_str(&std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))?);
+        out.push_str(&match var {
+            "VSTPLUGINS" => vst2_folder()?,
+            _ => std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))?,
+        });
         rest = &rest[end + 1..];
     }
     out.push_str(rest);
+    // Templates use '/'; Windows paths are shown (and written into shortcuts) with '\'.
+    if cfg!(windows) {
+        out = out.replace('/', "\\");
+    }
     Ok(PathBuf::from(out))
+}
+
+/// The VST 2 folder (`{VSTPLUGINS}`): the `VSTPLUGINS` variable if set, else the folder hosts read
+/// from the registry (`HKLM\SOFTWARE\VST`, `VSTPluginsPath`), else `%COMMONPROGRAMFILES%\VST2`.
+fn vst2_folder() -> Result<String, String> {
+    if let Ok(dir) = std::env::var("VSTPLUGINS") {
+        return Ok(dir);
+    }
+    #[cfg(windows)]
+    if let Ok(out) = std::process::Command::new("reg").args(["query", r"HKLM\SOFTWARE\VST", "/v", "VSTPluginsPath"]).output()
+        && let Some(dir) = reg_value(&String::from_utf8_lossy(&out.stdout))
+    {
+        return Ok(dir);
+    }
+    let common = std::env::var("COMMONPROGRAMFILES").map_err(|_| "environment variable COMMONPROGRAMFILES is not set".to_string())?;
+    Ok(format!(r"{common}\VST2"))
+}
+
+/// The value of a `reg query /v` line (`    VSTPluginsPath    REG_SZ    C:\...`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reg_value(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| l.trim_start().starts_with("VSTPluginsPath"))?;
+    let (_, rest) = line.split_once("REG_")?;
+    let value = rest.split_once(char::is_whitespace)?.1.trim();
+    (!value.is_empty()).then(|| value.trim_end_matches(['\\', '/']).to_string())
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -313,6 +352,13 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_vst2_folder_from_reg_output() {
+        let text = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\VST\r\n    VSTPluginsPath    REG_SZ    C:\\Program Files\\Vstplugins\\\r\n\r\n";
+        assert_eq!(reg_value(text).as_deref(), Some(r"C:\Program Files\Vstplugins"));
+        assert_eq!(reg_value("ERROR: not found"), None);
+    }
 
     fn vst3() -> serde_json::Value {
         serde_json::json!({ "packages": [

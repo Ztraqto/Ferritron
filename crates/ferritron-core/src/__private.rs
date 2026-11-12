@@ -12,6 +12,10 @@ pub trait PluginMeta {
     fn localized() -> &'static Localized;
     /// `parallel = true` in the project file: start Ferritron's worker pool.
     const PARALLEL: bool = false;
+    /// `[process] automation`: 0 control period (default), 1 every change, 2 events.
+    const AUTOMATION: u8 = 0;
+    /// `[process] control_block`: the control period in samples.
+    const CONTROL_BLOCK: u32 = 32;
     /// `[mcp]` in the project file: the plugin gets an "AI Access" switch.
     const MCP: bool = false;
     /// `[quality]` in the project file: the plugin gets a "Quality" switch.
@@ -24,6 +28,19 @@ pub trait PluginMeta {
     const VIEW_PROCESS: bool = false;
     /// The plugin's editor, if `[view]` is declared in the project file.
     fn view() -> Option<&'static crate::abi::ViewApi> {
+        None
+    }
+    /// `[presets.<id>]` in the project file: the factory presets.
+    fn presets() -> &'static [crate::presets::Preset] {
+        &[]
+    }
+    /// The built-in "Program" parameter (generated with `[presets]`): an enum of the preset names.
+    fn program_param() -> Option<&'static crate::ParamInfo> {
+        None
+    }
+    /// `#[ferritron::plugin(worker = W)]`: builds the instance's worker.
+    fn make_worker(params: &std::sync::Arc<dyn std::any::Any + Send + Sync>, instance: &crate::InstanceHandle) -> Option<Box<dyn crate::worker::WorkerObj>> {
+        let _ = (params, instance);
         None
     }
     /// An instance was created (`true`) or destroyed (`false`): the editor
@@ -52,7 +69,17 @@ pub const fn param_id(key: &str) -> u32 {
 }
 
 /// ID of the built-in bypass parameter.
-pub const BYPASS_ID: u32 = param_id("ferritron.bypass");
+pub const BYPASS_ID: u32 = reserved_id("ferritron.bypass");
+/// The built-in "Program" parameter of plugins with `[presets]`.
+pub const PROGRAM_ID: u32 = reserved_id("ferritron.program");
+
+/// Parameter IDs Ferritron keeps for itself (`0x4000_0000` and up).
+pub const fn reserved_id(key: &str) -> u32 {
+    ferritron_manifest::reserved_id(key)
+}
+
+/// First reserved parameter ID.
+pub const RESERVED_BASE: u32 = ferritron_manifest::RESERVED_BASE;
 
 /// Stable 16-byte class ID from the plugin ID.
 pub const fn class_id(plugin_id: &str) -> [u8; 16] {

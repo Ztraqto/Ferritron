@@ -3,7 +3,7 @@
 //! Layout (little endian): `"FRTN"`, format version `u32`, parameter count
 //! `u32`, then `(id: u32, plain value: f64)` per parameter. Parameters are
 //! matched by ID, so adding, removing or reordering parameters keeps old
-//! projects loadable. Since 1.2 an optional block may follow the entries:
+//! projects loadable. Parameters the state does not hold get their default. Since 1.2 an optional block may follow the entries:
 //! the instance's key-value store (`crate::instance::write_store`). Readers
 //! before 1.2 stop after the entries, so they still load such state.
 
@@ -13,9 +13,9 @@ const MAGIC: [u8; 4] = *b"FRTN";
 const VERSION: u32 = 1;
 
 /// Saves the plugin's parameters plus framework-owned `extra` `(id, value)` pairs.
-pub fn serialize<P: ParamSet>(params: &P, extra: &[(u32, f64)], store: &std::collections::BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+pub fn serialize<P: ParamSet>(_params: &P, value: impl Fn(usize) -> f64, extra: &[(u32, f64)], store: &std::collections::BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let infos = P::infos();
-    let values = infos.iter().enumerate().map(|(index, info)| (info.id, params.cell(index).get()));
+    let values = infos.iter().enumerate().map(|(index, info)| (info.id, value(index)));
     let entries: Vec<(u32, f64)> = values.chain(extra.iter().copied()).collect();
     let mut out = Vec::with_capacity(12 + entries.len() * 12);
     out.extend_from_slice(&MAGIC);
@@ -53,12 +53,22 @@ pub fn deserialize<P: ParamSet>(params: &P, data: &[u8], mut other: impl FnMut(u
         return false;
     }
     let count = u32_at(8) as usize;
+    let mut seen = vec![false; P::infos().len()];
     for entry in data[12..].as_chunks::<12>().0.iter().take(count) {
         let id = u32::from_le_bytes(entry[..4].try_into().unwrap());
         let value = f64::from_le_bytes(entry[4..].try_into().unwrap());
         match P::index_of(id) {
-            Some(index) => params.cell(index).set(P::infos()[index].sanitize(value)),
+            Some(index) => {
+                params.cell(index).set(P::infos()[index].sanitize(value));
+                seen[index] = true;
+            }
             None => other(id, value),
+        }
+    }
+    // Parameters the state does not hold (added after it was saved) start from their default.
+    for (index, info) in P::infos().iter().enumerate() {
+        if !seen[index] {
+            params.cell(index).set(info.default);
         }
     }
     true
@@ -75,8 +85,8 @@ mod tests {
     }
 
     static INFOS: [ParamInfo; 2] = [
-        ParamInfo { id: 10, key: "a", name: "A", unit: "", kind: ParamKind::Float { min: 0.0, max: 1.0 }, default: 0.0 },
-        ParamInfo { id: 20, key: "b", name: "B", unit: "", kind: ParamKind::Float { min: 0.0, max: 1.0 }, default: 0.0 },
+        ParamInfo { id: 10, key: "a", name: "A", unit: "", kind: ParamKind::Float { min: 0.0, max: 1.0 }, default: 0.0, scale: crate::ParamScale::Linear, text: None },
+        ParamInfo { id: 20, key: "b", name: "B", unit: "", kind: ParamKind::Float { min: 0.0, max: 1.0 }, default: 0.0, scale: crate::ParamScale::Linear, text: None },
     ];
 
     impl Default for Two {
@@ -102,7 +112,7 @@ mod tests {
         let src = Two::default();
         src.a.cell().set(0.25);
         src.b.cell().set(0.75);
-        let mut data = serialize(&src, &[], &Default::default());
+        let mut data = serialize(&src, |i| src.cell(i).get(), &[], &Default::default());
         // Append an entry for a parameter that no longer exists.
         data[8] = 3;
         data.extend_from_slice(&99u32.to_le_bytes());
@@ -122,13 +132,13 @@ mod tests {
         let src = Two::default();
         let mut store = std::collections::BTreeMap::new();
         store.insert("name".to_string(), b"Lead".to_vec());
-        let data = serialize(&src, &[(99, 1.0)], &store);
+        let data = serialize(&src, |i| src.cell(i).get(), &[(99, 1.0)], &store);
         let dst = Two::default();
         // The entries still read as before (what 1.1 readers do).
         let mut unknown = Vec::new();
         assert!(deserialize(&dst, &data, |id, v| unknown.push((id, v))));
         assert_eq!(unknown, [(99, 1.0)]);
         assert_eq!(store_of(&data), store);
-        assert!(store_of(&serialize(&src, &[], &Default::default())).is_empty());
+        assert!(store_of(&serialize(&src, |i| src.cell(i).get(), &[], &Default::default())).is_empty());
     }
 }

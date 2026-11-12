@@ -9,9 +9,18 @@ authors.workspace = true
 links = "ferritron_abi"
 build = "build.rs"
 
+[features]
+# Counting allocator for tests and benchmarks (`AllocGuard`).
+alloc-check = []
+
 [dependencies]
 fluent-syntax = "0.12"
 serde_json = "1"
+ferritron-manifest.workspace = true
+hmac = "0.12.1"
+sha2 = "0.10.9"
+# MCP tokens and nonces come from the operating system's random source (`mcp::random_hex`).
+getrandom = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

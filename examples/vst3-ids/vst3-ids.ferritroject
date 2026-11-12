@@ -1,0 +1,19 @@
+# The three classes of the VST3 factory have fixed IDs (never change them once released):
+# the component (`class_id`), the edit controller as a class of its own (`controller_id`) and the
+# "Plugin Compatibility Class" (`compatibility.id`), whose `replaces` lists the class IDs of older
+# plug-ins this one takes over (the digits as the old plug-in's own moduleinfo.json wrote them).
+[plugin]
+id         = "dev.ferritron.examples.vst3-ids"
+name       = "Ferritron Vst3 Ids"
+vendor     = "Ztraqto"
+categories = ["EQ"]
+
+[vst3]
+class_id      = "3E6B2A90-4C17-4D61-9D5B-1F7A0C2E8B11"
+controller_id = "A1C4F7E2-6B38-4C90-8F2D-5E7B3A91C640"
+compatibility = { id = "0D9E5B70-2A46-4F83-B1C7-8E4A6F2D9035", replaces = ["11111111-2222-3333-4444-555555555555", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"] }
+
+[quality]
+
+[params]
+gain = { type = "float", range = [-60, 12], default = 0, unit = "dB" }

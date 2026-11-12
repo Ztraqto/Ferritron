@@ -260,6 +260,15 @@ struct Adapter {
         *out = param(i).normalize(v);
         return true;
     }
+    static void reset(void* p) {
+        auto* inst = self(p);
+        try {
+            if constexpr (requires(P& x) { x.reset(); }) inst->plugin.reset();
+        } catch (...) {
+            inst->failed = true;
+        }
+    }
+
     static bool activate(void* p, double sample_rate, uint32_t max_block) {
         auto* inst = self(p);
         try {
@@ -288,8 +297,10 @@ struct Adapter {
         inst->plugin.process(block);
     }
 
-    static bool process(void* p, float* const* channels, uint32_t n_channels, uint32_t frames, const ferritron_event* events, uint32_t n_events,
-                        const ferritron_executor*) {
+    static bool process(void* p, const ferritron_process_data* data) {
+        float* const* channels = data->channels;
+        const uint32_t n_channels = data->num_channels, frames = data->frames, n_events = data->num_events;
+        const ferritron_event* events = data->events;
         auto* inst = self(p);
         DenormalGuard guard;
         try {
@@ -374,6 +385,7 @@ struct Adapter {
         static const ferritron_plugin_api api{
             sizeof(ferritron_plugin_api), FERRITRON_ABI_VERSION, &info_value, create, destroy, param_count, param_info, get_param,
             set_param, to_plain, to_normalized, format_param, parse_param, activate, process, save_state, load_state, get_extension,
+            reset,
         };
         return &api;
     }

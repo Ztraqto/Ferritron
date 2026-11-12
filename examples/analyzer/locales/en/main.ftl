@@ -1,0 +1,3 @@
+ui-title = Spectrum
+ui-waiting = waiting for audio...
+param-floor = Floor

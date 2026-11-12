@@ -175,13 +175,13 @@ extern "C-unwind" fn mouse_down(this: &AnyObject, _cmd: Sel, event: *mut AnyObje
     }
     let (x, y) = position(this, event);
     let (button, clicks): (Button, isize) = (button_of(event), unsafe { msg_send![event, clickCount] });
-    with_view(this, |view| view.canvas.input(if clicks == 2 { Input::DoubleClick { x, y, button } } else { Input::Press { x, y, button } }));
+    with_view(this, |view| view.canvas.input(if clicks == 2 { Input::DoubleClick { x, y, button, modifiers: modifiers_of(event) } } else { Input::Press { x, y, button, modifiers: modifiers_of(event) } }));
 }
 
 extern "C-unwind" fn mouse_up(this: &AnyObject, _cmd: Sel, event: *mut AnyObject) {
     let (x, y) = position(this, event);
     let button = button_of(event);
-    with_view(this, |view| view.canvas.input(Input::Release { x, y, button }));
+    with_view(this, |view| view.canvas.input(Input::Release { x, y, button, modifiers: modifiers_of(event) }));
 }
 
 /// Moves, with or without buttons held (AppKit keeps sending drags to the
@@ -189,7 +189,7 @@ extern "C-unwind" fn mouse_up(this: &AnyObject, _cmd: Sel, event: *mut AnyObject
 extern "C-unwind" fn mouse_moved(this: &AnyObject, _cmd: Sel, event: *mut AnyObject) {
     let (x, y) = position(this, event);
     with_view(this, |view| {
-        view.canvas.input(Input::Move { x, y });
+        view.canvas.input(Input::Move { x, y, modifiers: modifiers_of(event) });
         apply_cursor(view.canvas.cursor());
     });
 }
@@ -226,11 +226,14 @@ fn apply_cursor(cursor: crate::Cursor) {
 
 extern "C-unwind" fn scroll_wheel(this: &AnyObject, _cmd: Sel, event: *mut AnyObject) {
     let (x, y) = position(this, event);
-    let (dy, precise): (f64, Bool) = unsafe { (msg_send![event, scrollingDeltaY], msg_send![event, hasPreciseScrollingDeltas]) };
+    let (dy, dx, precise): (f64, f64, Bool) =
+        unsafe { (msg_send![event, scrollingDeltaY], msg_send![event, scrollingDeltaX], msg_send![event, hasPreciseScrollingDeltas]) };
     // Trackpads report points; a wheel notch is about 10 of them.
-    let delta = if precise.as_bool() { dy / 10.0 } else { dy };
-    if delta != 0.0 {
-        with_view(this, |view| view.canvas.input(Input::Wheel { x, y, delta }));
+    let scale = if precise.as_bool() { 10.0 } else { 1.0 };
+    let (delta, delta_x) = (dy / scale, dx / scale);
+    if delta != 0.0 || delta_x != 0.0 {
+        let modifiers = modifiers_of(event);
+        with_view(this, |view| view.canvas.input(Input::Wheel { x, y, delta, delta_x, modifiers }));
     }
 }
 
@@ -362,7 +365,9 @@ fn create<P: Process + PluginMeta, E: GpuEditor>(parent: *mut c_void, host: View
     let ptr: *mut View = &mut *view;
     VIEWS.with(|v| v.borrow_mut().insert(&*view.ns_view as *const AnyObject as usize, ptr));
     // SAFETY: the timer is the view's first field: it stops before the view goes.
-    view.timer = UiTimer::new(TICK_MS, Box::new(move || unsafe { (*ptr).canvas.tick() }));
+    view.timer = UiTimer::new(TICK_MS, Box::new(move || unsafe {
+        let _ = (*ptr).canvas.tick();
+    }));
     view.layout();
     Some(view)
 }

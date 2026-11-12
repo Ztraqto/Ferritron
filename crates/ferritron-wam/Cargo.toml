@@ -22,5 +22,5 @@ entry-symbol = "ferritron_wasm_alloc"
 root = "{name}.wam"
 binary = "{name}.wam/plugin.wasm"
 files = { "{name}.wam/descriptor.json" = "web/descriptor.json", "{name}.wam/index.html" = "web/demo.html" }
-assets = { "{name}.wam/index.js" = "web/index.js", "{name}.wam/processor.js" = "web/processor.js", "{name}.wam/guest.js" = "web/guest.js", "{name}.wam/gui.js" = "web/gui.js" }
+assets = { "{name}.wam/index.js" = "web/index.js", "{name}.wam/processor.js" = "web/processor.js", "{name}.wam/guest.js" = "web/guest.js", "{name}.wam/gui.js" = "web/gui.js", "{name}.wam/extras.js" = "../ferritron-web/src/extras.js" }
 ui = "{name}.wam/gui"

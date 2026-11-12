@@ -13,8 +13,8 @@ struct GpuGain;
 #[ferritron::plugin]
 impl Process for GpuGain {
     fn process(&mut self, ctx: &mut Context) {
-        let gain = db_to_gain(ctx.params.gain.value());
-        ctx.io.for_each_sample(|s| *s *= gain);
+        let gain = db_to_gain(ctx.params().gain.value());
+        ctx.io().for_each_sample(|s| *s *= gain);
     }
 }
 
@@ -164,7 +164,7 @@ impl GpuEditor for Editor {
                 ui.begin("gain");
                 ui.set_normalized("gain", Self::at(x, ui));
             }
-            Input::Move { x, y } => {
+            Input::Move { x, y, .. } => {
                 let hover = (y / ui.height() - 0.5).abs() < 0.12;
                 ui.set_cursor(if self.dragging { Cursor::ResizeHorizontal } else if hover { Cursor::Hand } else { Cursor::Arrow });
                 if self.dragging {
@@ -204,4 +204,12 @@ mod tests {
         assert_eq!(ui.cursor(), Cursor::Hand);
         assert!(ui.instance().is_none());
     }
+}
+
+/// G5: parameter IDs, order and class ID are those of 1.4.0, and a state saved by 1.4.0 loads.
+#[cfg(test)]
+#[test]
+fn loads_state_saved_by_1_4_0() {
+    let n = ferritron::testing::check_fixture::<GpuGain>(include_str!("../../../tests/fixtures/1.4.0/gpu-view.json")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(n > 0);
 }

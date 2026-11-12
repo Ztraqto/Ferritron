@@ -154,6 +154,12 @@ impl GpuKernel {
         Ok(gpu)
     }
 
+    /// True once the device this kernel runs on is lost (a flag read: the
+    /// audio thread calls it through [`KernelNode`]).
+    pub(crate) fn lost(&self) -> bool {
+        self.ctx.lost.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Clears the state of stateful kernels.
     pub fn reset(&mut self) {
         for state in self.stages.iter().filter_map(|s| s.state.as_ref()) {
@@ -233,6 +239,9 @@ pub struct KernelNode {
     setup: NodeSetup,
     measured: Vec<Measured>,
     values: Vec<[f32; 8]>,
+    /// The other side: the CPU candidate of a GPU node, or the GPU part of a
+    /// node switched to the CPU after its device was lost (see `fall_back`).
+    fallback: Option<Box<KernelNode>>,
 }
 
 impl KernelNode {
@@ -240,9 +249,9 @@ impl KernelNode {
         Self::chain(&[kernel], channels, setup)
     }
 
-    /// Kernels in series as one node (the result of fusing kernel nodes).
-    pub fn chain(kernels: &[Kernel], channels: usize, setup: &NodeSetup) -> Self {
-        let node = |gpu| Self {
+    /// A node with these parts and no other side kept beside it.
+    fn bare(kernels: &[Kernel], channels: usize, setup: &NodeSetup, gpu: Option<GpuKernel>) -> Self {
+        Self {
             kernels: kernels.to_vec(),
             channels,
             args: vec![KernelArgs::default(); kernels.len()],
@@ -252,22 +261,38 @@ impl KernelNode {
             setup: *setup,
             measured: Vec::new(),
             values: vec![[0.0; 8]; kernels.len()],
-        };
-        let mut candidates = vec![(Device::Cpu, node(None))];
+            fallback: None,
+        }
+    }
+
+    /// Kernels in series as one node (the result of fusing kernel nodes).
+    /// A GPU choice keeps a CPU candidate beside it, for a lost device.
+    pub fn chain(kernels: &[Kernel], channels: usize, setup: &NodeSetup) -> Self {
+        let mut candidates = vec![(Device::Cpu, Self::bare(kernels, channels, setup, None))];
         if setup.offline
             && setup.policy != Policy::Off
             && let Ok(gpu) = GpuKernel::chain(kernels, channels, setup.max_block)
         {
-            candidates.push((Device::Gpu, node(Some(gpu))));
+            candidates.push((Device::Gpu, Self::bare(kernels, channels, setup, Some(gpu))));
         }
         let (mut chosen, measured) = choose(candidates, setup).expect("the CPU candidate is always there");
         chosen.measured = measured;
+        if chosen.gpu.is_some() {
+            chosen.fallback = Some(Box::new(Self::bare(kernels, channels, setup, None)));
+        }
         chosen
     }
 
     /// Sets parameter `index` (`args.values[index]` in the kernel) of the
-    /// selected kernel.
+    /// selected kernel, on both sides.
     pub fn set(&mut self, index: usize, value: f32) {
+        self.set_here(index, value);
+        if let Some(other) = self.fallback.as_mut() {
+            other.set_here(index, value);
+        }
+    }
+
+    fn set_here(&mut self, index: usize, value: f32) {
         if let Some(v) = self.args[self.active].values.get_mut(index) {
             *v = value;
         }
@@ -295,6 +320,42 @@ impl Node for KernelNode {
         self.states.iter_mut().flatten().for_each(|s| *s = KernelState::default());
         if let Some(gpu) = &mut self.gpu {
             gpu.reset();
+        }
+    }
+
+    /// The GPU side's device is lost.
+    fn lost(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.lost())
+    }
+
+    /// A lost GPU node becomes its CPU candidate; the GPU side is kept.
+    fn fall_back(&mut self) -> bool {
+        if !self.lost() {
+            return false;
+        }
+        let Some(mut other) = self.fallback.take() else { return false };
+        std::mem::swap(self, &mut *other);
+        self.fallback = Some(other);
+        true
+    }
+
+    /// Builds a lost GPU side again (on a new device if the old one is lost),
+    /// and goes back to the GPU when that side works. Off the audio thread.
+    fn revive(&mut self) {
+        self.fall_back();
+        if let Some(parked) = self.fallback.as_mut()
+            && parked.lost()
+        {
+            parked.gpu = GpuKernel::chain(&parked.kernels, parked.channels, parked.setup.max_block).ok();
+        }
+        if self.gpu.is_none() && self.fallback.as_ref().is_some_and(|f| f.gpu.is_some() && !f.lost()) {
+            let Some(mut other) = self.fallback.take() else { return };
+            std::mem::swap(self, &mut *other);
+            self.fallback = Some(other);
+            self.reset();
+            if let Some(cpu) = self.fallback.as_mut() {
+                cpu.reset();
+            }
         }
     }
 

@@ -1,0 +1,15 @@
+{
+  "plugin": "dev.ferritron.examples.multiband-test",
+  "ferritron": "1.4.0",
+  "class_id": "6f1e4c2a9b3d4e77a1c5d1a570000001",
+  "params": [
+    {"index": 0, "id": 0, "name": "入力ゲイン", "flags": 0, "default": 0.5, "value": 0.20999999999999996},
+    {"index": 1, "id": 1, "name": "入力パン", "flags": 0, "default": 0.5, "value": 0.58},
+    {"index": 2, "id": 2, "name": "出力ゲイン", "flags": 0, "default": 0.5, "value": 0.9499999999999998},
+    {"index": 3, "id": 3, "name": "Freq", "flags": 0, "default": 0.5751884543241927, "value": 0.31999999999999984},
+    {"index": 4, "id": 4, "name": "Level", "flags": 0, "default": 0.8882352941176471, "value": 0.69},
+    {"index": 5, "id": 696, "name": "処理モード", "flags": 1, "default": 0, "value": 0},
+    {"index": 6, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 0}
+  ],
+  "state": "4652544e010000000900000000000000e27a14ae47e134c0010000007814ae47e17ac43f0200000032333333333340400300000078a8bfa0e73360400400000090b46305c24835c0b80200000000000000000000000000400000000000000000030000400000407d2e8ae04104000040000060a31e2eed41"
+}

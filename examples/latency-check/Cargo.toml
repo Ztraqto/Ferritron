@@ -1,0 +1,13 @@
+[package]
+name = "latency-check"
+description = "Ferritron test fixture: a delay whose reported latency and real delay can be set apart (for `cargo ferritron check`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron = { workspace = true }

@@ -32,7 +32,16 @@ pub use modal::{ModalLane, PersistentModalBank};
 
 use ash::vk;
 use std::ffi::CStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// How long a submission may take before the device counts as lost (the
+/// fence wait in [`Commands::wait`]).
+const FENCE_WAIT: Duration = Duration::from_secs(2);
+
+/// After a failed attempt to open a device again, the next attempt waits this long.
+const REOPEN_WAIT: Duration = Duration::from_secs(5);
 
 /// The process's Vulkan device, shared by every component (design doc 2.3).
 pub struct Gpu {
@@ -49,7 +58,28 @@ pub struct Gpu {
     name: String,
     /// Optional features this device has.
     pub features: Features,
+    /// Set when a call reports the device lost (VK_ERROR_DEVICE_LOST) or a
+    /// submission does not finish in time. Work is then skipped.
+    lost: AtomicBool,
+    /// 1 for the first device of the process, up by one for each replacement.
+    generation: u64,
 }
+
+/// The process's device slot: the device in use (a lost one stays until a
+/// new one replaces it), and the bookkeeping for opening a new one.
+struct Slot {
+    current: Option<Arc<Gpu>>,
+    /// Why no device could be opened, if none ever was (cached for good).
+    never: Option<String>,
+    generation: u64,
+    retry_at: Option<std::time::Instant>,
+    /// Set once a device came from the wgpu side (`adopt`). From then on the
+    /// wgpu side owns the device: after a loss, [`Gpu::get`] waits for it to
+    /// hand over a new one instead of opening a device of Ferritron's own.
+    handed_over: bool,
+}
+
+static GPU: Mutex<Slot> = Mutex::new(Slot { current: None, never: None, generation: 0, retry_at: None, handed_over: false });
 
 /// What the device offers beyond plain compute.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,31 +90,77 @@ pub struct Features {
     pub ray_query: bool,
 }
 
-static GPU: OnceLock<Result<Arc<Gpu>, String>> = OnceLock::new();
-
 impl Gpu {
     /// The shared device (opened on first use). Fails without Vulkan, or
     /// with only a software or integrated-less setup that is slower than
-    /// the CPU.
+    /// the CPU. After the device is lost, the next call opens a new device of
+    /// its own (generation up by one), at most once per five seconds while
+    /// that fails; users of the lost device call `revive` to build again.
     pub fn get() -> Result<Arc<Gpu>, String> {
-        GPU.get_or_init(|| Gpu::open().map(Arc::new)).clone()
+        let mut slot = GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(gpu) = &slot.current {
+            if !gpu.is_lost() {
+                return Ok(gpu.clone());
+            }
+        }
+        if let Some(why) = &slot.never {
+            return Err(why.clone());
+        }
+        if slot.handed_over {
+            // The wgpu side owns the device: it hands over a new one (`adopt`).
+            return Err("the shared device was lost; waiting for the wgpu side to hand over a new one".into());
+        }
+        if slot.retry_at.is_some_and(|t| std::time::Instant::now() < t) {
+            return Err("the GPU was lost and a new device is not ready yet".into());
+        }
+        let generation = slot.generation + 1;
+        match Gpu::open() {
+            Ok(mut gpu) => {
+                gpu.generation = generation;
+                let gpu = Arc::new(gpu);
+                slot.generation = generation;
+                slot.retry_at = None;
+                slot.current = Some(gpu.clone());
+                Ok(gpu)
+            }
+            Err(why) => {
+                if slot.current.is_none() {
+                    slot.never = Some(why.clone());
+                } else {
+                    slot.retry_at = Some(std::time::Instant::now() + REOPEN_WAIT);
+                }
+                Err(why)
+            }
+        }
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Generation of this device: 1 for the first device of the process,
+    /// up by one for each device that replaced a lost one.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Takes a device created elsewhere (wgpu's) and uses its queue
     /// `queue_index` of `queue_family`, then makes it the process's device.
-    /// Never destroys it. Returns false if a device was already set up.
+    /// Never destroys it. Returns false if a device that is not lost was
+    /// already set up (a lost one is replaced).
     ///
     /// # Safety
     /// `device` must have been created from `physical` of `instance` with at
     /// least `queue_index + 1` queues in `queue_family`, none of them used
     /// by anyone else, and must outlive the process's use of this crate.
     pub unsafe fn adopt(instance: ash::Instance, physical: vk::PhysicalDevice, device: ash::Device, queue_family: u32, queue_index: u32, name: &str, features: Features) -> bool {
+        let mut slot = GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.current.as_ref().is_some_and(|g| !g.is_lost()) {
+            return false;
+        }
         let queue = unsafe { device.get_device_queue(queue_family, queue_index) };
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let generation = slot.generation + 1;
         let gpu = Gpu {
             _entry: None,
             owned: false,
@@ -96,8 +172,15 @@ impl Gpu {
             memory,
             name: format!("{name} (Vulkan, shared device)"),
             features,
+            lost: AtomicBool::new(false),
+            generation,
         };
-        GPU.set(Ok(Arc::new(gpu))).is_ok()
+        slot.generation = generation;
+        slot.current = Some(Arc::new(gpu));
+        slot.never = None;
+        slot.retry_at = None;
+        slot.handed_over = true;
+        true
     }
 
     /// Whether the device does 16×16×16 cooperative-matrix tiles of f16
@@ -175,7 +258,20 @@ impl Gpu {
         }
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
-        Ok(Gpu { _entry: Some(entry), owned: true, instance, physical, device, queue: Mutex::new(queue), queue_family, memory, name, features })
+        Ok(Gpu { _entry: Some(entry), owned: true, instance, physical, device, queue: Mutex::new(queue), queue_family, memory, name, features, lost: AtomicBool::new(false), generation: 0 })
+    }
+
+    /// True once the device was reported lost, or a submission missed
+    /// [`FENCE_WAIT`]. Persistent kernels and mixers then produce silence.
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Relaxed)
+    }
+
+    /// Records a failed call: a lost device stays lost.
+    pub(crate) fn note(&self, error: vk::Result) {
+        if error == vk::Result::ERROR_DEVICE_LOST {
+            self.lost.store(true, Relaxed);
+        }
     }
 
     /// The discrete GPU if there is one, else any hardware GPU, with a
@@ -217,6 +313,35 @@ impl Gpu {
 }
 
 /// GPU tests one at a time (a persistent kernel is one per process).
+#[cfg(test)]
+mod shared_device_tests {
+    use super::*;
+
+    /// A lost device the wgpu side owns (hand-set flags, no device was lost):
+    /// `Gpu::get` does not open a device of Ferritron's own until the wgpu side
+    /// hands one over; without a wgpu side it opens one as before.
+    #[test]
+    fn after_a_loss_the_wgpu_side_hands_over_and_ferritron_does_not_open_its_own() {
+        use std::sync::atomic::Ordering;
+        let _serial = crate::serial();
+        let current = match Gpu::get() {
+            Ok(gpu) => gpu,
+            Err(e) => return eprintln!("skipping: {e}"),
+        };
+        let saved = GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner).handed_over;
+        // Hand-set: this process's device belongs to the wgpu side, and is lost.
+        GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner).handed_over = true;
+        current.lost.store(true, Ordering::Relaxed);
+        assert!(Gpu::get().is_err(), "a lost shared device is not replaced by a device of our own");
+        assert!(Gpu::get().is_err(), "still waiting for the hand-over");
+        // Hand-set: no wgpu side (standalone use): the device of our own is opened.
+        GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner).handed_over = false;
+        let own = Gpu::get().expect("standalone: a device of our own");
+        assert!(own.generation() > current.generation(), "a new generation");
+        GPU.lock().unwrap_or_else(std::sync::PoisonError::into_inner).handed_over = saved;
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
@@ -391,22 +516,44 @@ impl Commands {
         Ok(Commands { gpu: gpu.clone(), pool, buffers, fences })
     }
 
-    /// Submits command buffer `i`; its fence signals when it is done.
+    /// Submits command buffer `i`; its fence signals when it is done. Fails
+    /// at once if the device is lost.
     pub fn submit(&self, i: usize) -> Result<(), String> {
+        if self.gpu.is_lost() {
+            return Err("the GPU was lost".into());
+        }
         let device = &self.gpu.device;
         unsafe { device.reset_fences(&[self.fences[i]]) }.map_err(|e| e.to_string())?;
         let buffers = [self.buffers[i]];
         let submit = vk::SubmitInfo::default().command_buffers(&buffers);
         let queue = self.gpu.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe { device.queue_submit(*queue, &[submit], self.fences[i]) }.map_err(|e| format!("cannot submit GPU work: {e}"))
+        unsafe { device.queue_submit(*queue, &[submit], self.fences[i]) }.map_err(|e| {
+            self.gpu.note(e);
+            format!("cannot submit GPU work: {e}")
+        })
     }
 
     pub fn finished(&self, i: usize) -> bool {
         unsafe { self.gpu.device.get_fence_status(self.fences[i]) }.unwrap_or(true)
     }
 
-    pub fn wait(&self, i: usize) {
-        let _ = unsafe { self.gpu.device.wait_for_fences(&[self.fences[i]], true, u64::MAX) };
+    /// The device this work runs on is lost (see [`Gpu::is_lost`]).
+    pub fn lost(&self) -> bool {
+        self.gpu.is_lost()
+    }
+
+    /// Waits up to [`FENCE_WAIT`] for command buffer `i`. Returns false if it
+    /// did not finish (the device is then counted as lost).
+    pub fn wait(&self, i: usize) -> bool {
+        let timeout = FENCE_WAIT.as_nanos() as u64;
+        match unsafe { self.gpu.device.wait_for_fences(&[self.fences[i]], true, timeout) } {
+            Ok(()) => true,
+            Err(e) => {
+                self.gpu.note(e);
+                self.gpu.lost.store(true, Relaxed);
+                false
+            }
+        }
     }
 }
 
@@ -414,7 +561,8 @@ impl Drop for Commands {
     fn drop(&mut self) {
         unsafe {
             let device = &self.gpu.device;
-            let _ = device.wait_for_fences(&self.fences, true, u64::MAX);
+            // Bounded: a hung device must not hold up the host's unload.
+            let _ = device.wait_for_fences(&self.fences, true, FENCE_WAIT.as_nanos() as u64);
             for &fence in &self.fences {
                 device.destroy_fence(fence, None);
             }

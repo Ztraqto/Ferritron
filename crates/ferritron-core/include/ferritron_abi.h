@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define FERRITRON_ABI_VERSION 1
+#define FERRITRON_ABI_VERSION 2
 
 typedef struct ferritron_str {
     const char* ptr;
@@ -50,7 +50,21 @@ typedef struct ferritron_plugin_info {
        per plugin type), FERRITRON_ISOLATION_PIPELINE (blocks run one block
        late, reported as latency). */
     uint32_t isolation;
+    /* Added in 1.3.1. Empty = the format's default. */
+    ferritron_str vst3_subcategories; /* e.g. "Fx|EQ|Analyzer" */
+    ferritron_str clap_features;      /* comma separated, e.g. "audio-effect,stereo,equalizer" */
+    /* Added in 1.3.1: audio buses and MIDI. */
+    uint32_t audio_flags;         /* FERRITRON_AUDIO_* */
+    uint32_t min_channels;        /* main bus: fewest and most channels (1 and 2 unless the project says more) */
+    uint32_t max_channels;
+    uint32_t sidechain_channels;  /* with FERRITRON_AUDIO_SIDECHAIN: 0 = as many as the main bus */
+    uint32_t vst2_id;             /* VST 2 plugin ID; 0 = derive one */
 } ferritron_plugin_info;
+
+#define FERRITRON_AUDIO_MIDI_INPUT (1u << 0)  /* an effect that takes MIDI */
+#define FERRITRON_AUDIO_SIDECHAIN (1u << 1)   /* has a sidechain input */
+#define FERRITRON_AUDIO_PASSTHROUGH (1u << 2) /* layouts out of range pass through instead of being refused */
+#define FERRITRON_AUDIO_HOST_CC (1u << 3)     /* VST3: controllers go to the host's own mapping (no IMidiMapping) */
 
 #define FERRITRON_ISOLATION_PER_INSTANCE (1u << 8)
 #define FERRITRON_ISOLATION_PIPELINE (1u << 9)
@@ -60,6 +74,9 @@ enum ferritron_param_flags {
     FERRITRON_PARAM_BYPASS = 1 << 1, /* the plugin's bypass switch (always present, listed last) */
     FERRITRON_PARAM_NOT_AUTOMATABLE = 1 << 2, /* not for automation (e.g. the AI Access switch) */
     FERRITRON_PARAM_HIDDEN = 1 << 3, /* not shown in the host's parameter lists (still saved) */
+    FERRITRON_PARAM_PROGRAM = 1 << 4, /* (2.0) the built-in Program parameter of plugins with
+                                         [presets]: an enum of the preset names */
+    FERRITRON_PARAM_POLY = 1 << 5,    /* (2.0) poly = true: hosts may modulate it per note */
 };
 
 typedef struct ferritron_param_info {
@@ -75,6 +92,10 @@ enum ferritron_event_type {
     FERRITRON_EVENT_PARAM = 0,
     FERRITRON_EVENT_NOTE_ON = 1,
     FERRITRON_EVENT_NOTE_OFF = 2,
+    FERRITRON_EVENT_MIDI = 3, /* any other MIDI message (1.3.1) */
+    FERRITRON_EVENT_NOTE_MOD = 4,        /* (2.0) per-note modulation: data.voice, target = parameter ID, value = plain offset */
+    FERRITRON_EVENT_NOTE_EXPRESSION = 5, /* (2.0) note expression: data.voice, target = CLAP_NOTE_EXPRESSION_* number */
+    FERRITRON_EVENT_NOTE_END = 6,        /* (2.0) plugin -> host only: the voice of a note ended; data.note (velocity 0). Shims that do not know it ignore it. */
 };
 
 /* A timed event inside the current block. */
@@ -92,6 +113,20 @@ typedef struct ferritron_event {
             int16_t key;     /* 0..127, 60 = middle C */
             float velocity;  /* 0..1 */
         } note;
+        struct {
+            uint8_t status;  /* status byte without the channel: 0xB0 CC, 0xC0 program, 0xD0 channel pressure, 0xE0 pitch bend, 0xA0 poly pressure */
+            uint8_t channel; /* 0..15 */
+            uint8_t data1;
+            uint8_t data2;
+        } midi;
+        struct {
+            int32_t note_id; /* -1: any */
+            uint32_t target;
+            float value;
+            int8_t key;      /* -1: any */
+            int8_t channel;  /* -1: any */
+            uint16_t reserved;
+        } voice; /* all of note_id, key and channel -1: every note */
     } data;
 } ferritron_event;
 
@@ -110,6 +145,26 @@ typedef struct ferritron_event {
 #define FERRITRON_EXT_SLEEP "ferritron.sleep.v1"
 #define FERRITRON_EXT_HOST2 "ferritron.host.v2"
 #define FERRITRON_EXT_TRACK "ferritron.track.v1"
+#define FERRITRON_EXT_TRANSPORT "ferritron.transport.v1"
+#define FERRITRON_EXT_MAIN "ferritron.main.v1"
+/* (2.0) How many voices the instrument plays (Process::VOICES); absent when it does not say. */
+#define FERRITRON_EXT_VOICES "ferritron.voices.v1"
+typedef struct ferritron_voices_api {
+    uint32_t (*capacity)(void* instance); /* [main] */
+} ferritron_voices_api;
+/* (2.0, audit fix f4) What an instance is for. The VST3 shim calls set_role(instance, FERRITRON_ROLE_CONTROLLER) right
+   after create for the controller copy of a [vst3] controller_id plugin: that copy is then not listed by
+   the instance lists and not served by the MCP hub. Cores or shims without this extension behave as before
+   (the extension is NULL, the shim does not call it). Check struct_size before calling. */
+#define FERRITRON_EXT_ROLE "ferritron.role.v1"
+#define FERRITRON_ROLE_NORMAL 0
+#define FERRITRON_ROLE_CONTROLLER 1
+typedef struct ferritron_role_api {
+    uint32_t struct_size;
+    void (*set_role)(void* instance, uint32_t role); /* [main] */
+} ferritron_role_api;
+#define FERRITRON_EXT_SIDECHAIN "ferritron.sidechain.v1"
+#define FERRITRON_EXT_LAYOUT "ferritron.layout.v1"
 #define FERRITRON_EXT_DESCRIBE "ferritron.describe.v1"
 
 /* FERRITRON_EXT_DESCRIBE: the plugin described as UTF-8 JSON, for shims
@@ -212,6 +267,9 @@ enum {
     FERRITRON_TRACK_HAS_NAME = 1 << 0,
     FERRITRON_TRACK_HAS_COLOR = 1 << 1,
     FERRITRON_TRACK_HAS_INDEX = 1 << 2,
+    FERRITRON_TRACK_HAS_KIND = 1 << 3,     /* (2.0) */
+    FERRITRON_TRACK_HAS_LOCATION = 1 << 4, /* (2.0) */
+    FERRITRON_TRACK_HAS_CHANNELS = 1 << 5, /* (2.0) */
 };
 
 typedef struct ferritron_track_info {
@@ -219,11 +277,84 @@ typedef struct ferritron_track_info {
     ferritron_str name; /* UTF-8 */
     uint8_t color[3];   /* red, green, blue */
     uint32_t index;     /* position in the host's mixer, from 0 */
+    uint32_t kind;      /* (2.0) FERRITRON_TRACK_HAS_KIND: 0 track, 1 return, 2 bus, 3 master */
+    uint32_t location;  /* (2.0) FERRITRON_TRACK_HAS_LOCATION: 0 pre fader, 1 post fader, 2 panner */
+    uint32_t channels;  /* (2.0) FERRITRON_TRACK_HAS_CHANNELS: audio channels of the track */
 } ferritron_track_info;
 
 typedef struct ferritron_track_api {
     void (*set_track_info)(void* instance, const ferritron_track_info* info); /* [main] */
 } ferritron_track_api;
+
+/* FERRITRON_EXT_TRANSPORT (1.3.1): the host's transport. Shims call set()
+   on the audio thread right before every process(). */
+#define FERRITRON_TRANSPORT_TEMPO (1u << 0)
+#define FERRITRON_TRANSPORT_TIME_SIGNATURE (1u << 1)
+#define FERRITRON_TRANSPORT_PLAYING (1u << 2)
+#define FERRITRON_TRANSPORT_RECORDING (1u << 3)
+#define FERRITRON_TRANSPORT_POSITION_BEATS (1u << 4)
+#define FERRITRON_TRANSPORT_BAR_START (1u << 5)
+#define FERRITRON_TRANSPORT_POSITION_SAMPLES (1u << 6)
+#define FERRITRON_TRANSPORT_LOOP_RANGE (1u << 7)
+#define FERRITRON_TRANSPORT_LOOPING (1u << 8)
+
+typedef struct ferritron_transport {
+    uint32_t flags; /* FERRITRON_TRANSPORT_*: which fields are valid */
+    uint16_t numerator;
+    uint16_t denominator;
+    double tempo;
+    double position_beats;
+    double bar_start_beats;
+    int64_t position_samples;
+    double loop_start;
+    double loop_end;
+} ferritron_transport;
+
+typedef struct ferritron_transport_api {
+    void (*set)(void* instance, const ferritron_transport* transport); /* [audio] */
+} ferritron_transport_api;
+
+/* FERRITRON_EXT_MAIN (1.3.1): work the plugin asked of the host's main thread
+   from other threads. Shims call take_requests() on the main thread
+   regularly (a timer, or the host's callback request) and act on the bits:
+   LATENCY: the latency changed (read it with FERRITRON_EXT_LATENCY and tell
+   the host: VST3 restartComponent(kLatencyChanged); CLAP request_restart and
+   latency->changed()); VALUES: many parameter values changed at once (VST3
+   restartComponent(kParamValuesChanged); CLAP params->rescan VALUES). */
+#define FERRITRON_REQUEST_LATENCY (1u << 0)
+#define FERRITRON_REQUEST_VALUES (1u << 1)
+/* (2.0) InstanceHandle::notify codes wait; take_requests runs their handler itself and never
+   returns this bit. */
+#define FERRITRON_REQUEST_NOTIFY (1u << 31)
+
+typedef struct ferritron_main_api {
+    uint32_t (*take_requests)(void* instance); /* [main] returns and clears the bits */
+    bool (*pending)(void* instance);           /* [audio, any] any bit set? does not clear */
+} ferritron_main_api;
+
+/* FERRITRON_EXT_SIDECHAIN (1.3.1): the sidechain input of the next block. Shims call set()
+   on the audio thread right before every process(); n = 0 or channels = NULL means not
+   connected. The buffers (read-only) must stay valid until process() returns. */
+typedef struct ferritron_sidechain_api {
+    void (*set)(void* instance, const float* const* channels, uint32_t n); /* [audio] */
+} ferritron_sidechain_api;
+
+/* FERRITRON_EXT_LAYOUT (1.3.1): the speaker of each channel of the main bus, as FERRITRON_SPEAKER_*
+   ids (0..29 in the order below; 0x1000 + n for a position without a name). Shims call it before
+   activate whenever the host sets the arrangement. */
+enum {
+    FERRITRON_SPEAKER_L = 0, FERRITRON_SPEAKER_R, FERRITRON_SPEAKER_C, FERRITRON_SPEAKER_LFE, FERRITRON_SPEAKER_LS,
+    FERRITRON_SPEAKER_RS, FERRITRON_SPEAKER_LSS, FERRITRON_SPEAKER_RSS, FERRITRON_SPEAKER_LSR, FERRITRON_SPEAKER_RSR,
+    FERRITRON_SPEAKER_LC, FERRITRON_SPEAKER_RC, FERRITRON_SPEAKER_CS, FERRITRON_SPEAKER_TC, FERRITRON_SPEAKER_TFL,
+    FERRITRON_SPEAKER_TFC, FERRITRON_SPEAKER_TFR, FERRITRON_SPEAKER_TRL, FERRITRON_SPEAKER_TRC, FERRITRON_SPEAKER_TRR,
+    FERRITRON_SPEAKER_TSL, FERRITRON_SPEAKER_TSR, FERRITRON_SPEAKER_LW, FERRITRON_SPEAKER_RW, FERRITRON_SPEAKER_BFL,
+    FERRITRON_SPEAKER_BFC, FERRITRON_SPEAKER_BFR, FERRITRON_SPEAKER_BRL, FERRITRON_SPEAKER_BRR, FERRITRON_SPEAKER_LFE2,
+    FERRITRON_SPEAKER_OTHER = 0x1000,
+};
+
+typedef struct ferritron_layout_api {
+    void (*set)(void* instance, const uint32_t* speakers, uint32_t n); /* [main] */
+} ferritron_layout_api;
 
 /* FERRITRON_EXT_RENDER: whether the host renders offline (bounce, export).
    The plugin's processing quality follows at once; its setup (Setup::offline)
@@ -246,6 +377,9 @@ typedef struct ferritron_view_host {
     void (*begin_edit)(void* ctx, uint32_t id);
     void (*perform_edit)(void* ctx, uint32_t id, double normalized); /* sets the value and tells the host */
     void (*end_edit)(void* ctx, uint32_t id);
+    /* Asks the host window to become width x height physical pixels (it answers through
+       ferritron_view_api::set_size). NULL where the format cannot resize on request. */
+    bool (*request_resize)(void* ctx, uint32_t width, uint32_t height);
 } ferritron_view_host;
 
 /* FERRITRON_EXT_VIEW: the plugin's editor, embedded in a host window.
@@ -274,6 +408,22 @@ typedef struct ferritron_executor {
     bool (*run)(void* ctx, uint32_t count, void (*task)(void* data, uint32_t index), void* data);
 } ferritron_executor;
 
+/* Everything one process() call gets. `size` is sizeof() as the caller built
+   it: a field at or beyond `size` is not there (so fields can be added later).
+   Fields up to and including `executor` must be present. */
+typedef struct ferritron_process_data {
+    uint32_t size;
+    uint32_t frames;
+    uint32_t num_channels;
+    uint32_t num_events;
+    float* const* channels;
+    const ferritron_event* events; /* sorted by offset */
+    const ferritron_executor* executor; /* NULL if the host has no thread pool */
+    ferritron_event* out_events; /* events the plugin may write (MIDI out, notifications); NULL = no room */
+    uint32_t out_capacity;
+    uint32_t* out_count; /* the plugin writes how many of out_events it filled; NULL = no room */
+} ferritron_process_data;
+
 typedef struct ferritron_plugin_api {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -296,13 +446,12 @@ typedef struct ferritron_plugin_api {
 
     /* Processing */
     bool (*activate)(void* instance, double sample_rate, uint32_t max_block_size); /* [main] */
-    /* Processes the channels in place. `events` must be sorted by offset;
-       parameter changes take effect exactly at their sample (the block is
-       split there). Returns false if the plugin failed; the shim must then
-       output silence. */
-    bool (*process)(void* instance, float* const* channels, uint32_t num_channels, uint32_t frames,
-                    const ferritron_event* events, uint32_t num_events,
-                    const ferritron_executor* executor /* NULL if the host has no thread pool */); /* [audio] */
+    /* Processes the channels in place. `data->events` must be sorted by
+       offset; with the default `[process] automation = "control"` parameter
+       changes take effect at the start of their control period (the block is
+       split there; "sample" splits at the exact sample). Returns false if the
+       plugin failed; the shim must then output silence. */
+    bool (*process)(void* instance, const ferritron_process_data* data); /* [audio] */
 
     /* State. save_state returns the full size; data is written only if it fits in cap. */
     uint32_t (*save_state)(void* instance, uint8_t* buf, uint32_t cap); /* [main] */
@@ -310,7 +459,26 @@ typedef struct ferritron_plugin_api {
 
     /* Optional features by ID (see "Extensions"); NULL if unsupported. */
     const void* (*get_extension)(const char* id); /* [any] */
+    /* (2.0.1) clears delay lines, voices and smoothing; never while process runs. Check struct_size before calling. */
+    void (*reset)(void* instance); /* [audio] */
 } ferritron_plugin_api;
+
+/* Layout guard: the same sizes are asserted in abi.rs (abi_sizes_match_the_c_header).
+   Change both together; never change the layout of an existing struct. */
+#if defined(__cplusplus)
+#define FERRITRON_ABI_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define FERRITRON_ABI_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+#if UINTPTR_MAX == 0xffffffffffffffffu
+FERRITRON_ABI_ASSERT(sizeof(ferritron_event) == 24, "ferritron_event");
+FERRITRON_ABI_ASSERT(sizeof(ferritron_process_data) == 64, "ferritron_process_data");
+FERRITRON_ABI_ASSERT(sizeof(ferritron_param_info) == 64, "ferritron_param_info");
+FERRITRON_ABI_ASSERT(sizeof(ferritron_plugin_info) == 176, "ferritron_plugin_info");
+FERRITRON_ABI_ASSERT(sizeof(ferritron_plugin_api) == 144, "ferritron_plugin_api");
+FERRITRON_ABI_ASSERT(sizeof(ferritron_transport) == 56, "ferritron_transport");
+#endif
+#undef FERRITRON_ABI_ASSERT
 
 #ifdef __cplusplus
 }

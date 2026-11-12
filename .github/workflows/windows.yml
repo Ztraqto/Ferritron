@@ -1,0 +1,24 @@
+# Windows: unit tests of the crates that need no plugin-format SDK (ferritron-core,
+# ferritron-dsp, ferritron-manifest, ferritron-macros). SDK-free crates only.
+# The format adapters and the validators are not in this job: they need the
+# VST3, CLAP, ARA and AAX SDKs, which the user fetches under their own license
+# terms, so nothing is fetched or accepted here.
+
+name: Windows
+
+# Started by hand (Actions > Windows > Run workflow), like the macOS workflow.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Unit tests without SDKs
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: cargo test -p ferritron-core -p ferritron-dsp -p ferritron-manifest -p ferritron-macros

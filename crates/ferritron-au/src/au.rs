@@ -14,8 +14,8 @@
 
 use crate::sys::*;
 use ferritron_core::abi::{
-    EVENT_NOTE_OFF, EVENT_NOTE_ON, EVENT_PARAM, EXT_EDITOR_SIZE, EXT_HOST, EXT_LATENCY, EXT_RENDER, EXT_VIEW, EditorSizeApi, Event,
-    EventData, HostApi, LatencyApi, NoteData, ParamData, ParamInfoC, PluginApi, RenderApi, ViewApi,
+    EVENT_MIDI, EVENT_NOTE_OFF, EVENT_NOTE_ON, EVENT_PARAM, EXT_EDITOR_SIZE, EXT_HOST, EXT_LATENCY, EXT_RENDER, EXT_VIEW, EditorSizeApi,
+    Event, EventData, HostApi, LatencyApi, NoteData, ParamData, ParamInfoC, PluginApi, RenderApi, ViewApi,
 };
 use std::cell::UnsafeCell;
 use std::collections::HashSet;
@@ -23,10 +23,14 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize};
 
 const MAX_CHANNELS: usize = 2;
 const MAX_EVENTS: usize = 1024;
+/// Events the plugin may write per block (the `out_events` the render passes).
+const MAX_OUT: usize = 256;
+/// Parameter edits the render thread has reported and the main thread has not told the host yet.
+const PARAM_EDITS: usize = 256;
 /// What hosts assume until they set kAudioUnitProperty_MaximumFramesPerSlice.
 const DEFAULT_MAX_FRAMES: u32 = 1156;
 
@@ -82,11 +86,55 @@ impl EventQueue {
     }
 }
 
+/// Parameter IDs the plugin changed on the render thread, waiting for the main
+/// thread to report them to the host. Single producer (the render thread), single
+/// consumer (`drain_param_edits`, on the main thread); no locks.
+struct ParamEdits {
+    ids: [AtomicU32; PARAM_EDITS],
+    read: AtomicUsize,
+    write: AtomicUsize,
+    /// A drain is queued on the main thread; the render thread queues at most one.
+    scheduled: AtomicBool,
+}
+
+impl ParamEdits {
+    fn new() -> Self {
+        Self { ids: std::array::from_fn(|_| AtomicU32::new(0)), read: AtomicUsize::new(0), write: AtomicUsize::new(0), scheduled: AtomicBool::new(false) }
+    }
+
+    /// Render thread. Returns false (the edit is not reported) when the queue is full.
+    fn push(&self, id: u32) -> bool {
+        let (w, r) = (self.write.load(Relaxed), self.read.load(Acquire));
+        let next = (w + 1) % PARAM_EDITS;
+        if next == r {
+            return false;
+        }
+        self.ids[w].store(id, Relaxed);
+        self.write.store(next, Release);
+        true
+    }
+
+    /// Main thread.
+    fn pop(&self) -> Option<u32> {
+        let (r, w) = (self.read.load(Relaxed), self.write.load(Acquire));
+        if r == w {
+            return None;
+        }
+        let id = self.ids[r].load(Relaxed);
+        self.read.store((r + 1) % PARAM_EDITS, Release);
+        Some(id)
+    }
+}
+
 /// Render-thread state: buffers sized in `Initialize`.
 struct RenderState {
     output: Vec<Vec<f32>>,
     input: Vec<Vec<f32>>,
     events: Vec<Event>,
+    /// Room for sorting `events` without allocating.
+    sort_scratch: Vec<Event>,
+    /// The events the plugin writes (`out_events`): MIDI out and parameter edits.
+    out: Vec<Event>,
 }
 
 #[repr(C)]
@@ -106,6 +154,10 @@ pub(crate) struct Unit {
     in_place: AtomicU32,
     allocate: AtomicU32,
     callback: Mutex<Option<AURenderCallbackStruct>>,
+    /// The host's MIDI output (`kAudioUnitProperty_MIDIOutputCallback`), called from the render thread.
+    midi_out: Mutex<Option<AUMIDIOutputCallbackStruct>>,
+    /// Parameter edits to report to the host from the main thread.
+    param_edits: ParamEdits,
     connection: Mutex<Option<AudioUnitConnection>>,
     listeners: Mutex<Vec<(u32, AudioUnitPropertyListenerProc, usize)>>,
     notifies: Mutex<Vec<(AURenderCallback, usize)>>,
@@ -212,11 +264,19 @@ impl Unit {
             in_place: AtomicU32::new(1),
             allocate: AtomicU32::new(1),
             callback: Mutex::new(None),
+            midi_out: Mutex::new(None),
+            param_edits: ParamEdits::new(),
             connection: Mutex::new(None),
             listeners: Mutex::new(Vec::new()),
             notifies: Mutex::new(Vec::new()),
             events: EventQueue::new(),
-            render: UnsafeCell::new(RenderState { output: Vec::new(), input: Vec::new(), events: Vec::with_capacity(MAX_EVENTS) }),
+            render: UnsafeCell::new(RenderState {
+                output: Vec::new(),
+                input: Vec::new(),
+                events: Vec::with_capacity(MAX_EVENTS),
+                sort_scratch: vec![ferritron_core::abi::Event::midi(0, 0, 0, 0, 0); MAX_EVENTS],
+                out: vec![Event::param(0, 0, 0.0); MAX_OUT],
+            }),
             preset: Mutex::new((-1, "Untitled".into())),
             host_callbacks: Mutex::new(None),
             observer,
@@ -293,10 +353,20 @@ impl Unit {
 
     fn save_class_info(&self) -> CFDictionaryRef {
         let core = self.core();
-        let size = unsafe { (self.api.save_state)(core, std::ptr::null_mut(), 0) };
-        let mut state = vec![0u8; size as usize];
-        let written = unsafe { (self.api.save_state)(core, state.as_mut_ptr(), size) };
-        state.truncate(written.min(size) as usize);
+        // The size can grow between the size query and the copy: try again, never save zeros.
+        let mut saved = None;
+        for _ in 0..3 {
+            let size = unsafe { (self.api.save_state)(core, std::ptr::null_mut(), 0) };
+            let mut buf = vec![0u8; size as usize];
+            let written = unsafe { (self.api.save_state)(core, buf.as_mut_ptr(), size) };
+            if written <= size {
+                buf.truncate(written as usize);
+                saved = Some(buf);
+                break;
+            }
+        }
+        // Still changing after three tries: no class info (the host keeps its previous state).
+        let Some(state) = saved else { return std::ptr::null() };
         unsafe {
             let dict = CFDictionaryCreateMutable(
                 std::ptr::null(),
@@ -404,6 +474,8 @@ impl Unit {
             kAudioUnitProperty_ParameterValueFromString => (size_of::<AudioUnitParameterValueFromString>(), false),
             kAudioUnitProperty_CocoaUI if self.view_api.is_some() => (size_of::<AudioUnitCocoaViewInfo>(), false),
             kAudioUnitProperty_RenderContextObserver => (ptr, false),
+            kAudioUnitProperty_MIDIOutputCallbackInfo => (ptr, false),
+            kAudioUnitProperty_MIDIOutputCallback => (size_of::<AUMIDIOutputCallbackStruct>(), true),
             kFerritronProperty_Instance => (ptr, false),
             _ => return Err(kAudioUnitErr_InvalidProperty),
         })
@@ -515,6 +587,19 @@ impl Unit {
                 None => kAudioUnitErr_InvalidProperty,
             },
             kAudioUnitProperty_RenderContextObserver => put!(*const c_void, block2::RcBlock::as_ptr(&self.observer) as *const c_void),
+            kAudioUnitProperty_MIDIOutputCallbackInfo => {
+                // The name of the plugin's one MIDI output, as a CFArray of CFStrings.
+                let name = unsafe { (*self.api.info).name.to_str() }.unwrap_or("Ferritron").to_string();
+                let cf = cf_string(&name);
+                let names = [cf];
+                let array = unsafe { CFArrayCreate(std::ptr::null(), names.as_ptr(), 1, &kCFTypeArrayCallBacks as *const u8 as *const c_void) };
+                unsafe { CFRelease(cf) };
+                put!(CFArrayRef, array)
+            }
+            kAudioUnitProperty_MIDIOutputCallback => match *self.midi_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+                Some(callback) => put!(AUMIDIOutputCallbackStruct, callback),
+                None => kAudioUnitErr_InvalidProperty,
+            },
             kFerritronProperty_Instance => put!(*const Unit, self as *const Unit),
             _ => kAudioUnitErr_InvalidProperty,
         }
@@ -590,6 +675,11 @@ impl Unit {
             }
             kAudioUnitProperty_HostCallbacks => {
                 *self.host_callbacks.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read!(HostCallbackInfo));
+                noErr
+            }
+            kAudioUnitProperty_MIDIOutputCallback => {
+                let callback: AUMIDIOutputCallbackStruct = read!(AUMIDIOutputCallbackStruct);
+                *self.midi_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = callback.midiOutputCallback.is_some().then_some(callback);
                 noErr
             }
             kAudioUnitProperty_InPlaceProcessing => {
@@ -734,18 +824,80 @@ impl Unit {
                     state.events.push(event);
                 }
             });
-            state.events.sort_by_key(|e| e.offset); // stable: same-offset events keep their order
+            // Stable (same-offset events keep their order), without allocating.
+            let n = state.events.len();
+            ferritron_core::abi::sort_events(&mut state.events, &mut state.sort_scratch[..n]);
+            if let Some(t) = extension::<ferritron_core::abi::TransportApi>(self.api, ferritron_core::abi::EXT_TRANSPORT) {
+                let c = self.transport();
+                unsafe { (t.set)(self.core(), &c) };
+            }
+            let mut out_count = 0u32;
             let ok = unsafe {
-                (self.api.process)(self.core(), outputs.as_ptr(), channels as u32, frames, state.events.as_ptr(), state.events.len() as u32, std::ptr::null())
+                let mut d = ferritron_core::abi::ProcessData::new(outputs.as_ptr(), channels as u32, frames, state.events.as_ptr(), state.events.len() as u32, std::ptr::null());
+                d.out_events = state.out.as_mut_ptr();
+                d.out_capacity = state.out.len() as u32;
+                d.out_count = &mut out_count;
+                (self.api.process)(self.core(), &d)
             };
             if !ok {
                 for &out in outputs.iter().take(channels) {
                     unsafe { std::ptr::write_bytes(out, 0, n) };
                 }
+            } else {
+                let written = (out_count as usize).min(state.out.len());
+                self.send_out(&state.out[..written], time);
             }
         }
         self.render_notify(base | kAudioUnitRenderAction_PostRender, time, bus, frames, data);
         status
+    }
+
+    /// The host's transport, from the callbacks it gave (`kAudioUnitProperty_HostCallbacks`).
+    /// Written from the documentation of `HostCallbackInfo`; not run on a Mac.
+    fn transport(&self) -> ferritron_core::transport::TransportC {
+        use ferritron_core::transport::*;
+        let mut t = TransportC::default();
+        let Some(info) = *self.host_callbacks.try_lock().ok().as_deref().unwrap_or(&None) else { return t };
+        let user = info.hostUserData;
+        // beatAndTempoProc(userData, &currentBeat, &currentTempo)
+        if !info.callbacks[0].is_null() {
+            let f: unsafe extern "C" fn(*mut c_void, *mut f64, *mut f64) -> OSStatus = unsafe { std::mem::transmute(info.callbacks[0]) };
+            let (mut beat, mut tempo) = (0.0f64, 0.0f64);
+            if unsafe { f(user, &mut beat, &mut tempo) } == noErr {
+                t.flags |= TRANSPORT_TEMPO | TRANSPORT_POSITION_BEATS;
+                t.tempo = tempo;
+                t.position_beats = beat;
+            }
+        }
+        // musicalTimeLocationProc(userData, &deltaSampleOffsetToNextBeat, &timeSigNumerator, &timeSigDenominator, &currentMeasureDownBeat)
+        if !info.callbacks[1].is_null() {
+            let f: unsafe extern "C" fn(*mut c_void, *mut u32, *mut f32, *mut u32, *mut f64) -> OSStatus = unsafe { std::mem::transmute(info.callbacks[1]) };
+            let (mut delta, mut num, mut den, mut bar) = (0u32, 0.0f32, 0u32, 0.0f64);
+            if unsafe { f(user, &mut delta, &mut num, &mut den, &mut bar) } == noErr {
+                t.flags |= TRANSPORT_TIME_SIGNATURE | TRANSPORT_BAR_START;
+                t.numerator = num as u16;
+                t.denominator = den as u16;
+                t.bar_start_beats = bar;
+            }
+        }
+        // transportStateProc(userData, &isPlaying, &changed, &currentSampleInTimeline, &isCycling, &cycleStart, &cycleEnd)
+        if !info.callbacks[2].is_null() {
+            let f: unsafe extern "C" fn(*mut c_void, *mut u8, *mut u8, *mut f64, *mut u8, *mut f64, *mut f64) -> OSStatus = unsafe { std::mem::transmute(info.callbacks[2]) };
+            let (mut playing, mut changed, mut sample, mut cycling, mut start, mut end) = (0u8, 0u8, 0.0f64, 0u8, 0.0f64, 0.0f64);
+            if unsafe { f(user, &mut playing, &mut changed, &mut sample, &mut cycling, &mut start, &mut end) } == noErr {
+                if playing != 0 {
+                    t.flags |= TRANSPORT_PLAYING;
+                }
+                t.flags |= TRANSPORT_POSITION_SAMPLES | TRANSPORT_LOOP_RANGE;
+                t.position_samples = sample as i64;
+                t.loop_start = start;
+                t.loop_end = end;
+                if cycling != 0 {
+                    t.flags |= TRANSPORT_LOOPING;
+                }
+            }
+        }
+        t
     }
 
     fn schedule(&self, events: &[AudioUnitParameterEvent]) {
@@ -764,10 +916,54 @@ impl Unit {
         }
     }
 
+    /// Sends what the plugin wrote in this block. MIDI goes to the host's MIDI output right
+    /// away, on the render thread (where the host's callback is meant to run); parameter
+    /// edits are queued for the main thread (`drain_param_edits`). Allocates nothing; a busy
+    /// callback or a full queue drops the event. Sample offsets are not used for MIDI yet:
+    /// packets carry timestamp 0 (now), so they can land up to a block late.
+    fn send_out(&self, events: &[Event], time: *const c_void) {
+        let midi = self.midi_out.try_lock().ok().and_then(|callback| *callback);
+        for event in events {
+            if event.kind == EVENT_PARAM {
+                // SAFETY: the kind says the `param` member is the one the plugin wrote.
+                let id = unsafe { event.data.param.id };
+                self.param_edits.push(id);
+                if !self.param_edits.scheduled.swap(true, SeqCst) {
+                    on_main_with(self as *const Unit as *mut c_void, drain_param_edits);
+                }
+            } else if event.kind == EVENT_MIDI {
+                let Some(callback) = midi else { continue };
+                // SAFETY: the kind says the `midi` member is the one the plugin wrote.
+                let m = unsafe { event.data.midi };
+                // The status byte without the channel; data bytes are 7 bits.
+                let (len, kind): (u16, u8) = match m.status & 0xF0 {
+                    kind @ (0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0) => (3, kind),
+                    kind @ (0xC0 | 0xD0) => (2, kind),
+                    _ => continue,
+                };
+                let mut data = [0u8; 256];
+                data[0] = kind | (m.channel & 0x0F);
+                data[1] = m.data1 & 0x7F;
+                data[2] = m.data2 & 0x7F;
+                let list = MIDIPacketList { numPackets: 1, packet: MIDIPacket { timeStamp: 0, length: len, data } };
+                if let Some(send) = callback.midiOutputCallback {
+                    unsafe { send(callback.userData, time, 0, &list) };
+                }
+            }
+        }
+    }
+
     fn midi(&self, status: u32, data1: u32, data2: u32, offset: u32) {
+        let status_byte = status;
         let kind = match status & 0xF0 {
             0x90 if data2 > 0 => EVENT_NOTE_ON,
             0x80 | 0x90 => EVENT_NOTE_OFF,
+            // Controllers, pressure, pitch bend, program changes.
+            status @ (0xA0..=0xE0) => {
+                let m = ferritron_core::abi::MidiData { status: status as u8, channel: (status_byte & 0x0F) as u8, data1: (data1 & 0x7F) as u8, data2: (data2 & 0x7F) as u8 };
+                self.events.push(Event { offset, kind: ferritron_core::abi::EVENT_MIDI, data: EventData { midi: m } });
+                return;
+            }
             _ => return,
         };
         let note = NoteData { note_id: -1, channel: (status & 0x0F) as i16, key: (data1 & 0x7F) as i16, velocity: (data2 & 0x7F) as f32 / 127.0 };
@@ -791,6 +987,21 @@ impl Drop for Unit {
 
 unsafe fn unit<'a>(this: *mut c_void) -> &'a Unit {
     unsafe { &*(this as *const Unit) }
+}
+
+/// Main thread: tells the host about the parameter edits the render thread queued (the
+/// host records them as automation). `context` is the unit; it may be closed already,
+/// which `is_live` checks before the unit is touched.
+unsafe extern "C" fn drain_param_edits(context: *mut c_void) {
+    let unit = context as *const Unit;
+    if !is_live(unit) {
+        return;
+    }
+    let unit = unsafe { &*unit };
+    unit.param_edits.scheduled.store(false, SeqCst);
+    while let Some(id) = unit.param_edits.pop() {
+        unit.notify(kAudioUnitEvent_ParameterValueChange, id);
+    }
 }
 
 /// Runs an entry point, turning a panic into an error instead of unwinding into the host.
@@ -970,8 +1181,12 @@ unsafe extern "C" fn schedule_parameters(this: *mut c_void, events: *const Audio
 unsafe extern "C" fn reset(this: *mut c_void, _scope: u32, _element: u32) -> OSStatus {
     let unit = unsafe { unit(this) };
     if unit.initialized.load(SeqCst) {
-        // A fresh setup clears delay lines and voices.
-        unsafe { (unit.api.activate)(unit.core(), unit.sample_rate(), unit.max_frames.load(Relaxed)) };
+        // Libraries built before 2.0.1 have no reset in their table: a fresh setup then clears through activate.
+        if unit.api.struct_size as usize >= std::mem::offset_of!(ferritron_core::abi::PluginApi, reset) + size_of::<usize>() {
+            unsafe { (unit.api.reset)(unit.core()) };
+        } else {
+            unsafe { (unit.api.activate)(unit.core(), unit.sample_rate(), unit.max_frames.load(Relaxed)) };
+        }
     }
     noErr
 }

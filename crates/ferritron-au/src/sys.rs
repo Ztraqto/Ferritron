@@ -76,6 +76,10 @@ pub const kAudioUnitProperty_OfflineRender: u32 = 37;
 pub const kAudioUnitProperty_ParameterValueFromString: u32 = 38;
 pub const kAudioUnitProperty_ShouldAllocateBuffer: u32 = 51;
 pub const kAudioUnitProperty_RenderContextObserver: u32 = 60;
+/// Not checked against an SDK header offline (no Apple SDK here): the numbers are
+/// from the AudioUnitProperties.h of the public SDK as remembered. Verify on a Mac.
+pub const kAudioUnitProperty_MIDIOutputCallbackInfo: u32 = 47;
+pub const kAudioUnitProperty_MIDIOutputCallback: u32 = 48;
 /// Private (IDs from 64000 are free for audio units): the adapter's own
 /// instance, for the Cocoa view factory.
 pub const kFerritronProperty_Instance: u32 = 64_000 + 0x46;
@@ -249,6 +253,33 @@ pub struct AudioUnitEvent {
     pub mArgument: AudioUnitParameter,
 }
 
+/// CoreMIDI's `MIDIPacket` and `MIDIPacketList` (declared with `#pragma pack(4)`).
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+pub struct MIDIPacket {
+    pub timeStamp: u64,
+    pub length: u16,
+    pub data: [u8; 256],
+}
+
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+pub struct MIDIPacketList {
+    pub numPackets: u32,
+    pub packet: MIDIPacket,
+}
+
+/// `AUMIDIOutputCallback`: the host's function that receives the plugin's MIDI.
+pub type AUMIDIOutputCallback = unsafe extern "C" fn(*mut c_void, *const c_void, u32, *const MIDIPacketList) -> OSStatus;
+
+/// `AUMIDIOutputCallbackStruct`, the value of `kAudioUnitProperty_MIDIOutputCallback`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AUMIDIOutputCallbackStruct {
+    pub midiOutputCallback: Option<AUMIDIOutputCallback>,
+    pub userData: *mut c_void,
+}
+
 /// `HostCallbackInfo`, kept as the host gives it.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -344,4 +375,11 @@ pub fn on_main(f: Box<dyn FnOnce() + Send>) {
     }
     let context = Box::into_raw(Box::new(f)) as *mut c_void;
     unsafe { dispatch_async_f(&_dispatch_main_q as *const u8 as *const c_void, context, run) };
+}
+
+/// Runs `work(context)` on the main thread, later, without a Rust allocation: the
+/// caller's `context` (which must stay valid until then) is passed on. For the
+/// render thread; `on_main` boxes its closure and is for other threads.
+pub fn on_main_with(context: *mut c_void, work: unsafe extern "C" fn(*mut c_void)) {
+    unsafe { dispatch_async_f(&_dispatch_main_q as *const u8 as *const c_void, context, work) };
 }

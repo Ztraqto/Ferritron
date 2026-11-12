@@ -1,0 +1,16 @@
+[package]
+name = "midi-out"
+description = "Ferritron example: an instrument that sends MIDI and moves its own parameter from the audio thread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron = { workspace = true }
+
+[dev-dependencies]
+ferritron = { workspace = true, features = ["alloc-check"] }

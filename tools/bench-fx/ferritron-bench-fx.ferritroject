@@ -1,0 +1,14 @@
+[plugin]
+id     = "dev.ferritron.bench.fx"
+name   = "Ferritron Bench Fx"
+vendor = "Ztraqto"
+
+[params]
+p0 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+p1 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+p2 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+p3 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+p4 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+p5 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+p6 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }
+p7 = { type = "float", range = [-12, 12], default = 0, unit = "dB" }

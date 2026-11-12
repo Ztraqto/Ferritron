@@ -30,8 +30,8 @@ impl Process for Voices {
     }
 
     fn process(&mut self, ctx: &mut Context) {
-        let frames = ctx.io.frames();
-        let harmonics = ctx.params.harmonics.value() as usize;
+        let frames = ctx.io().frames();
+        let harmonics = ctx.params().harmonics.value() as usize;
         ctx.parallel_for(&mut self.voices, |voice| {
             for sample in &mut voice.out[..frames] {
                 let mut sum = 0.0;
@@ -42,7 +42,7 @@ impl Process for Voices {
                 voice.phase = (voice.phase + voice.step).fract();
             }
         });
-        let out = ctx.io.channel_mut(0);
+        let out = ctx.io().channel_mut(0);
         out.fill(0.0);
         for voice in &self.voices {
             for (o, v) in out.iter_mut().zip(&voice.out) {

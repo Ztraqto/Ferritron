@@ -1,0 +1,31 @@
+[package]
+name = "ferritron-vst2"
+description = "VST 2 format adapter of the Ferritron audio plugin framework (needs your own VST 2 SDK)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# Links against `ferritron_plugin_entry`, which only plugin crates define.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ferritron-core.workspace = true
+
+[build-dependencies]
+cc = "1"
+ferritron-build.workspace = true
+
+# How `cargo ferritron bundle` packages this format.
+[package.metadata.ferritron.format]
+name = "VST2"
+entry-symbol = "VSTPluginMain"
+root = "{name}.vst2.dll"
+binary = "{name}.vst2.dll"
+# VST 2 has no fixed folder: {VSTPLUGINS} is the one hosts read from the registry
+# (HKLM\SOFTWARE\VST VSTPluginsPath), else %COMMONPROGRAMFILES%\VST2.
+install = { windows = "{VSTPLUGINS}" }

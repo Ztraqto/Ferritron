@@ -34,6 +34,170 @@ pub const fn param_id(key: &str) -> u32 {
     ((hash ^ (hash >> 32)) as u32) & 0x7fff_ffff
 }
 
+/// Parameter IDs Ferritron keeps for itself start here (1.3.1). A plugin's own
+/// parameters, hashed or given with `id = ...`, are always below it.
+pub const RESERVED_BASE: u32 = 0x4000_0000;
+
+/// ID of a parameter Ferritron adds itself (`ferritron.bypass`, ...): a fixed
+/// value at or above [`RESERVED_BASE`]. Other keys get the hashed ID (1.3.0 IDs
+/// of the reserved keys are returned by [`legacy_reserved_id`]).
+pub const fn reserved_id(key: &str) -> u32 {
+    const fn is(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    if is(key, "ferritron.bypass") {
+        RESERVED_BASE
+    } else if is(key, "ferritron.quality") {
+        RESERVED_BASE + 1
+    } else if is(key, "ferritron.mcp") {
+        RESERVED_BASE + 2
+    } else if is(key, "ferritron.instance.high") {
+        RESERVED_BASE + 3
+    } else if is(key, "ferritron.instance.low") {
+        RESERVED_BASE + 4
+    } else if is(key, "ferritron.editor.width") {
+        RESERVED_BASE + 5
+    } else if is(key, "ferritron.editor.height") {
+        RESERVED_BASE + 6
+    } else {
+        param_id(key)
+    }
+}
+
+/// The VST3 class ID of a plugin that has no `[vst3] class_id`: derived from the plugin ID.
+/// The same function as `ferritron::__private::class_id` (pinned by a test in `examples/vst3-ids`),
+/// so packaging can name the class in moduleinfo.json without running the plugin.
+pub const fn class_id(plugin_id: &str) -> [u8; 16] {
+    const fn fnv1a64(bytes: &[u8], seed: u64) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325 ^ seed;
+        let mut i = 0;
+        while i < bytes.len() {
+            hash ^= bytes[i] as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            i += 1;
+        }
+        hash
+    }
+    let hi = fnv1a64(plugin_id.as_bytes(), 0x6665_7272_6974_726f).to_be_bytes();
+    let lo = fnv1a64(plugin_id.as_bytes(), 0x6e00_0000_0000_0001).to_be_bytes();
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < 8 {
+        out[i] = hi[i];
+        out[i + 8] = lo[i];
+        i += 1;
+    }
+    out
+}
+
+/// The 16 bytes of a VST3 class ID that makes Windows hosts (`FUID::toString`, COM layout) show
+/// the GUID exactly as it was written in the project file (an explicit `class_id`,
+/// `controller_id` or `compatibility.id`). Elsewhere the written bytes are used as they are.
+/// IDs derived from the plugin's `id` are not changed: they keep what 1.x shipped.
+pub fn windows_tuid(written: &[u8; 16]) -> [u8; 16] {
+    let mut b = *written;
+    b[0..4].reverse();
+    b[4..6].reverse();
+    b[6..8].reverse();
+    b
+}
+
+/// The 32 hex digits a VST3 host shows for a class ID (`FUID::toString`): on Windows the first
+/// three fields of the 16 bytes are read as little endian numbers (COM layout, `com = true`),
+/// elsewhere the bytes are printed as they are.
+pub fn vst3_uid_string(bytes: &[u8; 16], com: bool) -> String {
+    let mut b = *bytes;
+    if com {
+        b[0..4].reverse();
+        b[4..6].reverse();
+        b[6..8].reverse();
+    }
+    b.iter().map(|x| format!("{x:02X}")).collect()
+}
+
+/// The ID a reserved parameter had in Ferritron 1.3.0 (the hash of its key):
+/// hosts that support VST3 `IRemapParamID` are told to map it to the new one.
+pub const fn legacy_reserved_id(key: &str) -> u32 {
+    param_id(key)
+}
+
+/// A port of an LV2 plugin after its parameter (control) ports, in port order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lv2Port {
+    /// Main audio input, channel `n`.
+    In(u32),
+    /// Sidechain audio input, channel `n`.
+    Sidechain(u32),
+    /// Audio output, channel `n`.
+    Out(u32),
+    /// MIDI input (an atom sequence).
+    Midi,
+    /// Transport input (an atom sequence of `time:Position`).
+    Time,
+    Latency,
+    Freewheel,
+    /// MIDI output (an atom sequence the plugin writes `ctx.midi_out` to). Always the last port.
+    MidiOut,
+}
+
+/// The ports an LV2 plugin has after its parameters. Both the Turtle
+/// description and the adapter (`ferritron-lv2`) use this one list.
+///
+/// A plugin with nothing new (stereo or mono-to-stereo, no sidechain, no MIDI
+/// input beyond instruments) keeps the 1.3.0 ports, plus the MIDI output as the
+/// last port (added in 2.0.0, so the earlier ports keep their indices); one that
+/// uses 1.3.1's audio features also gets a Time port.
+pub fn lv2_port_plan(instrument: bool, min_channels: u32, max_channels: u32, sidechain: Option<u32>, midi_input: bool) -> Vec<Lv2Port> {
+    let n = 2u32.clamp(min_channels.max(1), max_channels.max(min_channels).max(1));
+    let extended = midi_input || sidechain.is_some() || n != 2;
+    let mut plan = Vec::new();
+    if !instrument {
+        plan.extend((0..n).map(Lv2Port::In));
+        if let Some(sc) = sidechain {
+            let m = if sc == 0 { n } else { sc };
+            plan.extend((0..m).map(Lv2Port::Sidechain));
+        }
+    }
+    plan.extend((0..n).map(Lv2Port::Out));
+    if instrument || midi_input {
+        plan.push(Lv2Port::Midi);
+    }
+    if extended {
+        plan.push(Lv2Port::Time);
+    }
+    plan.push(Lv2Port::Latency);
+    plan.push(Lv2Port::Freewheel);
+    plan.push(Lv2Port::MidiOut);
+    plan
+}
+
+fn lv2_channel_name(prefix: &str, label: &str, channel: u32, count: u32) -> (String, String) {
+    if count == 2 {
+        let side = if channel == 0 { "l" } else { "r" };
+        (format!("{prefix}_{side}"), format!("{label} {}", side.to_uppercase()))
+    } else {
+        (format!("{prefix}_{}", channel + 1), format!("{label} {}", channel + 1))
+    }
+}
+
+impl Manifest {
+    /// [`lv2_port_plan`] of this plugin.
+    pub fn lv2_ports(&self) -> Vec<Lv2Port> {
+        lv2_port_plan(self.instrument, self.audio.min_channels, self.audio.max_channels, self.audio.sidechain, self.midi_input)
+    }
+}
+
 /// One parameter as hosts see it, in host order: the plugin's own, then
 /// Bypass, then AI Access (`[mcp]`), then Quality (`[quality]`).
 #[derive(Clone, Debug, PartialEq)]
@@ -84,7 +248,7 @@ impl HostParam {
 fn builtin(key: &str, name: &str, kind: Kind, automatable: bool) -> HostParam {
     HostParam {
         index: 0,
-        id: param_id(key),
+        id: reserved_id(key),
         key: key.into(),
         symbol: String::new(),
         name: name.into(),
@@ -98,6 +262,11 @@ fn builtin(key: &str, name: &str, kind: Kind, automatable: bool) -> HostParam {
 }
 
 impl Manifest {
+    /// The class ID of the plugin's component: `[vst3] class_id`, else derived from `plugin.id`.
+    pub fn vst3_class_bytes(&self) -> [u8; 16] {
+        self.vst3_class_id.unwrap_or_else(|| class_id(&self.id))
+    }
+
     /// Every parameter the plugin shows hosts, in the order of the C ABI.
     pub fn host_params(&self) -> Vec<HostParam> {
         let mut out: Vec<HostParam> = self
@@ -105,7 +274,7 @@ impl Manifest {
             .iter()
             .map(|p| HostParam {
                 index: 0,
-                id: param_id(&p.key),
+                id: p.id,
                 key: p.key.clone(),
                 symbol: String::new(),
                 name: p.name.clone(),
@@ -151,6 +320,53 @@ impl Manifest {
         scope.flag("effect", !self.instrument);
         scope.flag("midi-input", self.instrument || self.au.kind == "aumf");
         scope.flag("view", self.view);
+        // VST3 classes (moduleinfo.json). `.com` is the text a Windows host shows for the bytes,
+        // `.plain` the one other systems show.
+        for (name, id, explicit) in [
+            ("class-id", Some(self.vst3_class_bytes()), self.vst3_class_id.is_some()),
+            ("controller-id", self.vst3_controller_id, true),
+            ("compat-id", self.vst3_compat.as_ref().map(|c| c.id), true),
+        ] {
+            let id = id.unwrap_or([0; 16]);
+            // On Windows an explicit GUID is stored in COM order, so the host shows it as written.
+            let on_windows = if explicit { windows_tuid(&id) } else { id };
+            scope.text(&format!("vst3.{name}.com"), vst3_uid_string(&on_windows, true));
+            scope.text(&format!("vst3.{name}.plain"), vst3_uid_string(&id, false));
+        }
+        scope.flag("vst3.controller", self.vst3_controller_id.is_some());
+        scope.flag("vst3.compat", self.vst3_compat.is_some());
+        let replaces = self.vst3_compat.as_ref().map(|c| c.replaces.clone()).unwrap_or_default();
+        scope.flag("vst3.has-replaces", !replaces.is_empty());
+        let count = replaces.len();
+        scope.list(
+            "vst3.replaces",
+            replaces
+                .iter()
+                .enumerate()
+                .map(|(i, old)| {
+                    let mut item = Scope::default();
+                    // As the old plug-in's own moduleinfo.json wrote it: the digits in the order written.
+                    item.text("uid", vst3_uid_string(old, false));
+                    item.flag("last", i + 1 == count);
+                    item
+                })
+                .collect(),
+        );
+        let subs: Vec<String> = self.vst3_sub_categories().split('|').filter(|c| !c.is_empty()).map(str::to_string).collect();
+        let sub_count = subs.len();
+        scope.list(
+            "vst3.subcategories",
+            subs.into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let mut item = Scope::default();
+                    item.text("name", name);
+                    item.flag("last", i + 1 == sub_count);
+                    item
+                })
+                .collect(),
+        );
+        scope.text("vst3.sdk-version", "VST 3.8.0".into());
         scope.flag("isolated", self.isolate);
         scope.flag("ara", self.ara);
         let params = self.host_params();
@@ -158,6 +374,41 @@ impl Manifest {
             scope.text(&format!("after.{n}"), (params.len() + n).to_string());
         }
         scope.text("params.count", params.len().to_string());
+        let plan = self.lv2_ports();
+        let main = plan.iter().filter(|p| matches!(p, Lv2Port::Out(_))).count() as u32;
+        let side = plan.iter().filter(|p| matches!(p, Lv2Port::Sidechain(_))).count() as u32;
+        let first = params.len();
+        let lv2ports = plan
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut item = Scope::default();
+                item.text("index", (first + i).to_string());
+                let (symbol, name) = match *p {
+                    Lv2Port::In(c) => lv2_channel_name("in", "In", c, main),
+                    Lv2Port::Sidechain(c) => lv2_channel_name("sc", "Sidechain", c, side),
+                    Lv2Port::Out(c) => lv2_channel_name("out", "Out", c, main),
+                    Lv2Port::Midi => ("midi_in".into(), "MIDI In".into()),
+                    Lv2Port::Time => ("time_in".into(), "Transport".into()),
+                    Lv2Port::Latency => ("latency".into(), "Latency".into()),
+                    Lv2Port::Freewheel => ("freewheel".into(), "Freewheel".into()),
+                    Lv2Port::MidiOut => ("midi_out".into(), "MIDI Out".into()),
+                };
+                item.text("symbol", symbol);
+                item.text("name", name);
+                item.flag("input", matches!(p, Lv2Port::In(_) | Lv2Port::Sidechain(_) | Lv2Port::Midi | Lv2Port::Time | Lv2Port::Freewheel));
+                item.flag("audio", matches!(p, Lv2Port::In(_) | Lv2Port::Sidechain(_) | Lv2Port::Out(_)));
+                // An atom port: MIDI input (`midi_in`) or MIDI output.
+                item.flag("midi", matches!(p, Lv2Port::Midi | Lv2Port::MidiOut));
+                item.flag("midi_in", *p == Lv2Port::Midi);
+                item.flag("time", *p == Lv2Port::Time);
+                item.flag("latency", *p == Lv2Port::Latency);
+                item.flag("freewheel", *p == Lv2Port::Freewheel);
+                item.flag("last", i + 1 == plan.len());
+                item
+            })
+            .collect();
+        scope.list("lv2ports", lv2ports);
         let count = params.len();
         let items = params
             .into_iter()
@@ -383,6 +634,43 @@ fn render_into(template: &str, stack: &[&Scope], escape: Escape, out: &mut Strin
     }
     out.push_str(rest);
     Ok(())
+}
+
+#[cfg(test)]
+mod vst3_tests {
+    use super::*;
+
+    #[test]
+    fn host_strings_of_a_class_id() {
+        let bytes = crate::parse_guid("3E6B2A90-4C17-4D61-9D5B-1F7A0C2E8B11").unwrap();
+        assert_eq!(vst3_uid_string(&bytes, false), "3E6B2A904C174D619D5B1F7A0C2E8B11");
+        // FUID::toString on Windows: Data1, Data2 and Data3 are little endian in memory
+        assert_eq!(vst3_uid_string(&bytes, true), "902A6B3E174C614D9D5B1F7A0C2E8B11");
+    }
+
+    #[test]
+    fn the_derived_class_id_is_stable() {
+        // These bytes are in users' projects (hosts store the class ID): never change them.
+        assert_eq!(class_id("dev.ferritron.examples.gain"), class_id("dev.ferritron.examples.gain"));
+        assert_ne!(class_id("a.b"), class_id("a.c"));
+    }
+
+    #[test]
+    fn moduleinfo_templates_see_the_classes() {
+        let m = crate::parse(
+            "[plugin]\nid = \"a.b\"\nname = \"X\"\ncategories = [\"EQ\"]\n[vst3]\nclass_id = \"3E6B2A90-4C17-4D61-9D5B-1F7A0C2E8B11\"\ncontroller_id = \"A1C4F7E2-6B38-4C90-8F2D-5E7B3A91C640\"\ncompatibility = { id = \"0D9E5B70-2A46-4F83-B1C7-8E4A6F2D9035\", replaces = [\"11111111-2222-3333-4444-555555555555\", \"AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE\"] }",
+        )
+        .unwrap();
+        let scope = m.template_scope();
+        let t = "{vst3.class-id.plain}|{vst3.controller-id.com}|{#vst3.controller}C{/vst3.controller}{^vst3.compat}-{/vst3.compat}|{#vst3.replaces}{uid}{^last},{/last}{/vst3.replaces}|{#vst3.subcategories}{name}{^last}/{/last}{/vst3.subcategories}";
+        assert_eq!(
+            render(t, &scope, Escape::None).unwrap(),
+            "3E6B2A904C174D619D5B1F7A0C2E8B11|A1C4F7E26B384C908F2D5E7B3A91C640|C|11111111222233334444555555555555,AAAAAAAABBBBCCCCDDDDEEEEEEEEEEEE|Fx/EQ"
+        );
+        let plain = crate::parse("[plugin]\nid = \"a.b\"\nname = \"X\"").unwrap();
+        let none = render("{#vst3.controller}C{/vst3.controller}{^vst3.has-replaces}n{/vst3.has-replaces}", &plain.template_scope(), Escape::None).unwrap();
+        assert_eq!(none, "n");
+    }
 }
 
 #[cfg(test)]

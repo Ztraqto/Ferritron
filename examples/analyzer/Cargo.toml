@@ -1,0 +1,17 @@
+[package]
+name = "analyzer"
+description = "Ferritron example: a spectrum analyzer (tap, worker with ferritron-dsp Fft, stream to the editor)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron = { workspace = true, features = ["web"] }
+
+[dev-dependencies]
+# `ui.stream` of a GPU editor, and the allocation counter, in the tests.
+ferritron = { workspace = true, features = ["web", "gpu-view", "alloc-check"] }

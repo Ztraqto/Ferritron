@@ -115,19 +115,19 @@ impl Process for GpuChain {
     }
 
     fn process(&mut self, ctx: &mut Context) {
-        let tone = ctx.params.tone.value() as f64;
+        let tone = ctx.params().tone.value() as f64;
         if tone != self.tone {
             self.set_tone(tone);
         }
-        let volume = db_to_gain(ctx.params.volume.value());
+        let volume = db_to_gain(ctx.params().volume.value());
         let (Some(graph), Some(&(level, _))) = (self.graph.as_mut(), self.ends.get(2)) else { return };
         if let Some(gain) = graph.node_mut::<Gain>(level) {
             gain.set(volume);
         }
-        let (n, channels) = (ctx.io.frames(), ctx.io.num_channels().min(CHANNELS));
+        let (n, channels) = (ctx.io().frames(), ctx.io().num_channels().min(CHANNELS));
         for (ch, input) in self.inputs.iter_mut().enumerate() {
             if ch < channels {
-                input[..n].copy_from_slice(ctx.io.channel_mut(ch));
+                input[..n].copy_from_slice(ctx.io().channel_mut(ch));
             } else {
                 input[..n].fill(0.0);
             }
@@ -136,7 +136,7 @@ impl Process for GpuChain {
         let [left, right] = &mut self.outputs[..] else { return };
         graph.process(&ins, &mut [&mut left[..n], &mut right[..n]]);
         for ch in 0..channels {
-            ctx.io.channel_mut(ch).copy_from_slice(&self.outputs[ch][..n]);
+            ctx.io().channel_mut(ch).copy_from_slice(&self.outputs[ch][..n]);
         }
     }
 }
@@ -198,4 +198,12 @@ mod tests {
         let latency = h.latency();
         assert!(latency == 0 || latency == 512, "one GPU bank's latency at most, got {latency}");
     }
+}
+
+/// G5: parameter IDs, order and class ID are those of 1.4.0, and a state saved by 1.4.0 loads.
+#[cfg(test)]
+#[test]
+fn loads_state_saved_by_1_4_0() {
+    let n = ferritron::testing::check_fixture::<GpuChain>(include_str!("../../../tests/fixtures/1.4.0/gpu-chain.json")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(n > 0);
 }

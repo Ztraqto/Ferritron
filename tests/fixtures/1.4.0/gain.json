@@ -1,0 +1,11 @@
+{
+  "plugin": "dev.ferritron.examples.gain",
+  "ferritron": "1.4.0",
+  "class_id": "acd0f605624489caaa94b982f4ebbe94",
+  "params": [
+    {"index": 0, "id": 248864332, "name": "ゲイン", "flags": 0, "default": 0.8333333333333334, "value": 0.20999999999999996},
+    {"index": 1, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1},
+    {"index": 2, "id": 1073741826, "name": "AI Access", "flags": 4, "default": 0, "value": 0}
+  ],
+  "state": "4652544e01000000050000004c5ed50e713d0ad7a37046c000000040000000000000f03f02000040000000000000000003000040000080295c8fc741040000400000c0a3d264e141"
+}

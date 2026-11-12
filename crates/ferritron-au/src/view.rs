@@ -211,7 +211,7 @@ fn make_view(au: AudioUnit) -> Option<*mut AnyObject> {
         unit,
         container: &*container as *const AnyObject as usize,
         view: std::ptr::null_mut(),
-        host: ViewHost { ctx: unit as *const Unit as *mut c_void, get_param: host_get, begin_edit: host_begin, perform_edit: host_perform, end_edit: host_end },
+        host: ViewHost { ctx: unit as *const Unit as *mut c_void, get_param: host_get, begin_edit: host_begin, perform_edit: host_perform, end_edit: host_end, request_resize: None },
     }));
     let parent = &*container as *const AnyObject as *mut c_void;
     let view = unsafe { (api.open)(parent, &(*editor).host, w, h, 1.0) };

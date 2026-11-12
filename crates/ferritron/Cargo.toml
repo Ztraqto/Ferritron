@@ -8,7 +8,11 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = ["vst3", "clap", "au", "lv2", "standalone", "auv3"]
+# `testing::AllocGuard`: counts allocations on the audio thread in tests.
+alloc-check = ["ferritron-core/alloc-check"]
+default = ["vst3", "clap", "au", "lv2", "standalone", "auv3", "dsp"]
+# DSP building blocks (SIMD, filters, delay lines, smoothers): `ferritron::dsp`.
+dsp = ["dep:ferritron-dsp"]
 vst3 = ["dep:ferritron-vst3"]
 clap = ["dep:ferritron-clap"]
 # Audio Unit v2; only builds anything on macOS.
@@ -21,10 +25,14 @@ standalone = ["dep:ferritron-standalone"]
 auv3 = ["dep:ferritron-auv3", "standalone"]
 # AAX (Pro Tools); needs Avid's AAX SDK (AAX_SDK_DIR), so it is off by default.
 aax = ["dep:ferritron-aax"]
+# VST 2 (.dll); needs your own copy of the VST 2 SDK (VST2_SDK_DIR), so it is off by default.
+vst2 = ["dep:ferritron-vst2"]
 # HTML/JS editors (`[view] backend = "web"`).
 web = ["dep:ferritron-web"]
 # Editors drawn with wgpu (`[view] backend = "gpu"`).
 gpu-view = ["dep:ferritron-gpu-view"]
+# Editors drawn with Ferritron Native Graphics (`ferritron::gpu_view::FngEditor`).
+fng = ["gpu-view", "ferritron-gpu-view/fng"]
 # ARA 2 (`[ara]`); needs your own ARA SDK (ARA_SDK_DIR).
 ara = ["dep:ferritron-ara"]
 
@@ -39,6 +47,7 @@ ferritron-macros.workspace = true
 ferritron-web = { workspace = true, optional = true }
 ferritron-gpu-view = { workspace = true, optional = true }
 ferritron-ara = { workspace = true, optional = true }
+ferritron-dsp = { workspace = true, optional = true }
 
 # The browser: built for WebAssembly, every plugin is also a Web Audio
 # Module (`cargo ferritron bundle <package> --target web`).
@@ -65,3 +74,4 @@ ferritron-auv3 = { workspace = true, optional = true }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 ferritron-aax = { workspace = true, optional = true }
+ferritron-vst2 = { workspace = true, optional = true }

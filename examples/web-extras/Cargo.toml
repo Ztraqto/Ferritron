@@ -1,0 +1,17 @@
+[package]
+name = "web-extras"
+description = "Ferritron example: the web editor's theme, settings, context menu, file dialogs and browser input (E1, E7, E8, E10, E12, R4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# `cargo ferritron bundle web-extras --features vst2` also builds the VST 2 library (needs your own VST 2 SDK).
+vst2 = ["ferritron/vst2"]
+
+[dependencies]
+ferritron = { workspace = true, features = ["web"] }

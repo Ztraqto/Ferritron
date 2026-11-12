@@ -1,0 +1,8 @@
+[plugin]
+id     = "dev.ferritron.examples.midi-out"
+name   = "Ferritron MIDI Out"
+vendor = "Ztraqto"
+kind   = "instrument"
+
+[params]
+level = { type = "float", range = [0, 1], default = 0 }

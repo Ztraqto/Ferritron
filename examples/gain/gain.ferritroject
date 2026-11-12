@@ -8,7 +8,7 @@ vendor = "Ztraqto"
 [mcp]
 
 [params]
-gain = { type = "float", range = [-60, 12], default = 0, unit = "dB" }
+gain = { type = "float", range = [-60, 12], default = 0, unit = "dB", smooth = "20ms" }
 
 [view]
 backend = "web"

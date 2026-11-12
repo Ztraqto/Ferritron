@@ -89,7 +89,7 @@ const READY: u32 = 2;
 /// How long to wait for another process that is building the same data.
 const WAIT: Duration = Duration::from_secs(20);
 
-/// The bytes named `name` (a key unique to the data, e.g. "<plugin id>/ir/hall-2s"),
+/// The bytes named `name` (a key unique to the data, e.g. `"<plugin id>/ir/hall-2s"`),
 /// built once by `build` for the whole session. Call off the audio thread.
 pub fn bytes(name: &str, build: impl FnOnce() -> Vec<u8>) -> SharedBytes {
     let meta_name = crate::shmem::name_for("share-meta", name);

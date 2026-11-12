@@ -16,10 +16,20 @@ fn main() {
         (Ok("macos"), Ok("aarch64")) => "osx-arm64",
         _ => "osx-x64",
     };
-    let status = Command::new("dotnet")
-        .args(["publish", "plugin/CSharpGain.csproj", "-c", "Release", "-r", rid, "--nologo", "-v", "quiet", "-o"])
-        .arg(&out)
-        .status();
+    let mut dotnet = Command::new("dotnet");
+    dotnet.args(["publish", "plugin/CSharpGain.csproj", "-c", "Release", "-r", rid, "--nologo", "-v", "quiet", "-o"]).arg(&out);
+    // NativeAOT finds the linker through `vswhere.exe`, which the Visual Studio installer keeps
+    // outside PATH: without it the link step fails even with the C++ build tools installed.
+    if rid.starts_with("win-")
+        && let Some(installer) = std::env::var_os("ProgramFiles(x86)")
+            .map(|p| std::path::PathBuf::from(p).join("Microsoft Visual Studio").join("Installer"))
+            .filter(|d| d.join("vswhere.exe").is_file())
+    {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let joined = std::env::join_paths(std::iter::once(installer).chain(std::env::split_paths(&path))).unwrap_or(path);
+        dotnet.env("PATH", joined);
+    }
+    let status = dotnet.status();
     match status {
         Ok(s) if s.success() => {}
         // Bundling then reports the missing companion; the workspace still builds.

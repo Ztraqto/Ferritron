@@ -20,8 +20,11 @@
 //!
 //! The project file names the type: `[view] backend = "gpu"`, `editor = "Editor"`.
 //! The editor is redrawn when a parameter changes (UI, automation or host),
-//! after input that asks for it, on resize, and on every tick while
-//! [`GpuEditor::animating`] (meters, animations). Sizes are logical pixels
+//! after input that asks for it, on resize, and at the pace of
+//! [`GpuEditor::next_frame`] (meters, animations: 60 / 30 / 20 Hz or once per display
+//! refresh). An editor that asks for nothing and has nothing that changed is not drawn at
+//! all; frames never come faster than the display refreshes (read from the compositor on
+//! Windows). Sizes are logical pixels
 //! (points on macOS); `frame` carries the physical size and the scale factor.
 //! On macOS, Command counts as `ctrl` in [`Modifiers`], and typed text arrives
 //! after the keyboard layout (input methods such as Japanese composition are
@@ -29,6 +32,15 @@
 //!
 //! All views of a process share one wgpu device. Edits go to the host as
 //! gestures (`begin` / `set` / `end`), so DAWs record them as automation.
+//!
+//! Without a usable GPU (no device can present to the window, or the device
+//! was lost and could not be made again three times in a row) an editor that
+//! implements [`GpuEditor::new_cpu`] and [`GpuEditor::render_cpu`] (such as
+//! [`FngAdapter`] on Windows) is drawn on the CPU into the window instead. It
+//! goes back to the GPU when a device can be made again; the check is made every
+//! five seconds. `FERRITRON_GPU_VIEW=cpu` forces the CPU mode (for tests and
+//! for users whose GPU driver misbehaves). An editor that needs the GPU does
+//! not open without one.
 //!
 //! [`Ui::instance`] is the editor's plugin instance (identity, track, store,
 //! the other instances of the plugin); the editor is also redrawn when it
@@ -49,6 +61,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use wgpu;
+
+mod pacing;
+pub use pacing::{Clock, ManualClock, SystemClock};
+
+/// The refresh rate of the display the editors are shown on, in Hz, as the system's
+/// compositor reports it (Windows: `DwmGetCompositionTimingInfo`); `None` where it cannot say
+/// (editors are then paced as for 60 Hz).
+pub fn display_refresh_hz() -> Option<f64> {
+    #[cfg(windows)]
+    {
+        imp::dwm_refresh_hz()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(feature = "fng")]
+mod native;
+/// Ferritron Native Graphics, for editors that draw with it (feature `fng`).
+#[cfg(feature = "fng")]
+pub use ::fng;
+#[cfg(feature = "fng")]
+pub use native::{FngAdapter, FngEditor};
 
 /// A plugin editor drawn with wgpu. Every method runs on the host's UI thread.
 pub trait GpuEditor: 'static {
@@ -79,8 +116,46 @@ pub trait GpuEditor: 'static {
         false
     }
 
-    /// Whether to redraw on every tick (about 60 per second), e.g. for meters.
+    /// Whether to redraw continuously, e.g. for meters: once per display refresh. The
+    /// default of [`next_frame`](GpuEditor::next_frame) is made from this.
     fn animating(&self) -> bool {
+        false
+    }
+
+    /// When the editor wants its next frame, asked after every frame and at every check:
+    ///
+    /// * `None`: no frame is needed (the editor is drawn again only when something changes:
+    ///   parameters, input, [`Ui::request_redraw`], new stream values, resize).
+    /// * `Some(Duration::ZERO)`: once per display refresh.
+    /// * `Some(interval)`: a frame every `interval` (for 30 Hz: `Duration::from_secs_f64(1.0 /
+    ///   30.0)`). Frames are put on a fixed grid, so the rate is exact on average; an interval
+    ///   shorter than the display refresh gives one frame per refresh.
+    ///
+    /// The default is `Some(ZERO)` while [`animating`](GpuEditor::animating) is true and `None`
+    /// otherwise, so existing editors behave as before.
+    fn next_frame(&self) -> Option<std::time::Duration> {
+        self.animating().then_some(std::time::Duration::ZERO)
+    }
+
+    /// Makes the editor for a window that has no usable GPU (the CPU mode, Windows only: the
+    /// view then draws with [`render_cpu`](GpuEditor::render_cpu)). The default is `None`: an
+    /// editor that draws with its own GPU code does not open without a GPU, and the log says so.
+    fn new_cpu(ui: &Ui) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        let _ = ui;
+        None
+    }
+
+    /// Draws one frame on the CPU into `out`, for a window without a GPU: `size` physical pixels
+    /// at `scale` physical pixels per logical pixel, 4 bytes per pixel in the order blue, green,
+    /// red, alpha, with premultiplied alpha (what a Windows DIB takes). `out` may have any length
+    /// on entry: the editor resizes it to `width * height * 4` bytes, and it is kept between frames
+    /// so that a frame of the same size allocates nothing. Returns false when the frame could not
+    /// be drawn. The default returns false (see [`new_cpu`](GpuEditor::new_cpu)).
+    fn render_cpu(&mut self, ui: &Ui, size: (u32, u32), scale: f64, out: &mut Vec<u8>) -> bool {
+        let _ = (ui, size, scale, out);
         false
     }
 }
@@ -94,6 +169,8 @@ pub struct Gpu {
 }
 
 /// One frame to draw.
+#[derive(Debug)]
+#[non_exhaustive]
 pub struct Frame {
     pub target: wgpu::TextureView,
     /// Physical pixels.
@@ -101,6 +178,21 @@ pub struct Frame {
     pub height: u32,
     /// Physical pixels per logical pixel.
     pub scale: f64,
+    /// When this frame started, by the view's clock ([`Ui::now`]).
+    pub time: std::time::Duration,
+    /// Time since the previous frame (zero for the first), so animations need no clock of
+    /// their own.
+    pub delta: std::time::Duration,
+    /// How many frames this editor has drawn before this one.
+    pub index: u64,
+}
+
+impl Frame {
+    /// A frame for `target` (tests and tools that draw an editor themselves): time zero, the
+    /// first frame.
+    pub fn new(target: wgpu::TextureView, width: u32, height: u32, scale: f64) -> Frame {
+        Frame { target, width, height, scale, time: std::time::Duration::ZERO, delta: std::time::Duration::ZERO, index: 0 }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,15 +202,18 @@ pub enum Button {
     Middle,
 }
 
-/// Mouse input in logical pixels from the editor's top left corner.
+/// Mouse input in logical pixels from the editor's top left corner. Every
+/// pointer event carries the modifier keys held at that moment.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Input {
-    Press { x: f64, y: f64, button: Button },
-    DoubleClick { x: f64, y: f64, button: Button },
-    Move { x: f64, y: f64 },
-    Release { x: f64, y: f64, button: Button },
-    /// `delta` in notches; positive away from the user.
-    Wheel { x: f64, y: f64, delta: f64 },
+    Press { x: f64, y: f64, button: Button, modifiers: Modifiers },
+    DoubleClick { x: f64, y: f64, button: Button, modifiers: Modifiers },
+    Move { x: f64, y: f64, modifiers: Modifiers },
+    Release { x: f64, y: f64, button: Button, modifiers: Modifiers },
+    /// `delta` in notches, positive away from the user; `delta_x` sideways
+    /// (positive to the right; 0 where the device or platform has none).
+    Wheel { x: f64, y: f64, delta: f64, delta_x: f64, modifiers: Modifiers },
     /// A key went down (`pressed`, with `repeat` for auto-repeat) or up. Only
     /// keys the editor wants ([`GpuEditor::wants_key`]) arrive, and only while
     /// it has the keyboard focus (a click gives it the focus).
@@ -130,6 +225,11 @@ pub enum Input {
     Focus(bool),
     /// The mouse left the editor (no button held): hover effects end here.
     Leave,
+    /// While the pointer is locked ([`Ui::lock_pointer`]): how far the mouse moved, in logical
+    /// pixels (positive right and down). No `Move` events arrive during the lock.
+    PointerDelta { dx: f64, dy: f64, modifiers: Modifiers },
+    /// The system switched between a light (`false`) and a dark (`true`) theme.
+    ThemeChanged(bool),
 }
 
 /// The shape of the mouse pointer over the editor ([`Ui::set_cursor`]).
@@ -166,6 +266,18 @@ pub struct RedrawHandle(Arc<AtomicBool>);
 impl RedrawHandle {
     pub fn request(&self) {
         self.0.store(true, Ordering::Release);
+    }
+
+    /// Redraws the editor whenever an instance event passes `filter` (another instance of the
+    /// plugin moved, opened its editor, ...; see `ferritron::instances_watch`). Keep the
+    /// returned watch as long as the editor wants the redraws.
+    pub fn wake_on(&self, filter: impl Fn(&ferritron_core::InstanceEvent) -> bool + Send + 'static) -> ferritron_core::Watch {
+        let me = self.clone();
+        ferritron_core::instances_watch(move |event| {
+            if filter(event) {
+                me.request();
+            }
+        })
     }
 }
 
@@ -213,6 +325,29 @@ pub struct Ui {
     redraw: Arc<AtomicBool>,
     /// The parameter values of a `Ui` made by [`Ui::for_tests`].
     test_values: Option<Box<TestValues>>,
+    /// The instance's data streams (`[streams]`), refreshed once per frame.
+    streams: Vec<StreamBuf>,
+    /// The time source of the view (replaceable in tests).
+    clock: Arc<dyn Clock>,
+    /// Set for a `for_tests` `Ui`: the same clock, to be moved by hand.
+    test_clock: Option<ManualClock>,
+    /// Physical pixels per logical pixel.
+    scale: Cell<f64>,
+    /// A change of the pointer lock the editor asked for and the view has not applied yet.
+    lock_request: Cell<Option<bool>>,
+    locked: Cell<bool>,
+    /// Set while the editor takes typed text: the caret, in logical pixels (see `set_text_input`).
+    text_caret: Cell<Option<(f64, f64)>>,
+}
+
+/// The newest values of one data stream, as of the last refresh.
+struct StreamBuf {
+    name: String,
+    reader: RefCell<Option<ferritron_core::StreamReader>>,
+    /// Written only by `Ui::refresh_streams`, which the frame driver calls while no editor
+    /// code runs; `Ui::stream` hands out shared references to it.
+    data: std::cell::UnsafeCell<Vec<f32>>,
+    has: Cell<bool>,
 }
 
 /// Parameter values behind a test `Ui`, by ID (normalized).
@@ -239,10 +374,97 @@ impl Ui {
             language: localized.language.clone(),
             size: Cell::new(size),
             // The shim's object for the instance is the view host's context.
-            instance: InstanceHandle::for_shim_ctx(host.ctx),
+            instance: {
+                let instance = InstanceHandle::for_shim_ctx(host.ctx);
+                if let Some(i) = &instance {
+                    i.editor_opened(true);
+                }
+                instance
+            },
             cursor: Cell::new(Cursor::Arrow),
             redraw: Arc::new(AtomicBool::new(false)),
             test_values: None,
+            streams: Vec::new(),
+            clock: Arc::new(SystemClock),
+            test_clock: None,
+            scale: Cell::new(1.0),
+            lock_request: Cell::new(None),
+            locked: Cell::new(false),
+            text_caret: Cell::new(None),
+        }
+        .with_streams()
+    }
+
+    fn with_streams(mut self) -> Self {
+        self.load_streams();
+        self
+    }
+
+    fn load_streams(&mut self) {
+        if let Some(i) = &self.instance {
+            self.streams = i
+                .streams()
+                .into_iter()
+                .filter(|(_, _, kind)| *kind == ferritron_core::StreamKind::Data)
+                .filter_map(|(name, _, _)| {
+                    Some(StreamBuf { name: name.to_string(), reader: RefCell::new(Some(i.stream(name)?)), data: Default::default(), has: Cell::new(false) })
+                })
+                .collect();
+        }
+    }
+
+    /// The newest values of data stream `name` (`[streams]` in the project file), or `None`
+    /// when there is no such stream or nothing was written yet. The values are those of the
+    /// start of the frame. The audio thread writes only while an editor is open, so a stream
+    /// starts to fill when the editor opens. A new frame is drawn whenever new values arrive.
+    pub fn stream(&self, name: &str) -> Option<&[f32]> {
+        let b = self.streams.iter().find(|b| b.name == name)?;
+        if !b.has.get() {
+            return None;
+        }
+        // SAFETY: `refresh_streams` is the only writer and never runs while editor code does.
+        Some(unsafe { &*b.data.get() })
+    }
+
+    /// Takes the newest stream values; true when any stream had new values. Called by the
+    /// frame driver before it asks the editor to draw.
+    #[doc(hidden)]
+    pub fn refresh_streams(&self) -> bool {
+        let mut any = false;
+        for b in &self.streams {
+            let mut reader = b.reader.borrow_mut();
+            let Some(reader) = reader.as_mut() else { continue };
+            // SAFETY: see `stream`.
+            let data = unsafe { &mut *b.data.get() };
+            if reader.read_new(data) {
+                b.has.set(true);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Links `instance` to a [`for_tests`](Self::for_tests) `Ui` as a host shim links the editor's
+    /// instance: the editor counts as open and the instance's data streams reach
+    /// [`stream`](Self::stream) (after `refresh_streams`, which the frame driver calls).
+    pub fn attach_instance_for_tests(&mut self, instance: InstanceHandle) {
+        instance.editor_opened(true);
+        self.instance = Some(instance);
+        self.load_streams();
+    }
+
+    /// Gives a [`for_tests`](Self::for_tests) `Ui` the values of stream `name`, as if the
+    /// audio thread had written them.
+    pub fn set_stream_for_tests(&mut self, name: &str, values: &[f32]) {
+        match self.streams.iter().find(|b| b.name == name) {
+            Some(b) => {
+                // SAFETY: `&mut self`: no references are out.
+                let data = unsafe { &mut *b.data.get() };
+                data.clear();
+                data.extend_from_slice(values);
+                b.has.set(true);
+            }
+            None => self.streams.push(StreamBuf { name: name.to_string(), reader: RefCell::new(None), data: std::cell::UnsafeCell::new(values.to_vec()), has: Cell::new(true) }),
         }
     }
 
@@ -264,11 +486,67 @@ impl Ui {
             begin_edit: test_gesture,
             perform_edit: test_set,
             end_edit: test_gesture,
+            request_resize: None,
         };
         let mut ui = Self::new::<P>(host, (width, height));
         ui.instance = None;
         ui.test_values = Some(values);
+        let clock = ManualClock::new();
+        ui.clock = Arc::new(clock.clone());
+        ui.test_clock = Some(clock);
         ui
+    }
+
+    /// The clock of a [`for_tests`](Self::for_tests) `Ui`: it starts at zero and moves only when
+    /// told to (`advance`), and [`now`](Self::now) follows it. `None` for a real editor.
+    pub fn test_clock(&self) -> Option<&ManualClock> {
+        self.test_clock.as_ref()
+    }
+
+    /// The current time by the view's clock. Use it instead of `Instant::now()` for anything an
+    /// editor decides by time, so tests can move the clock ([`test_clock`](Self::test_clock)).
+    pub fn now(&self) -> std::time::Duration {
+        self.clock.now()
+    }
+
+    /// Physical pixels per logical pixel (the DPI scale) of the window now. It changes when the
+    /// window moves to another monitor or the user changes the scaling.
+    pub fn scale_factor(&self) -> f64 {
+        self.scale.get()
+    }
+
+    /// Locks (`true`) or unlocks the mouse pointer, for knobs and faders that turn endlessly: the
+    /// pointer is hidden and stays where it is, and the editor gets [`Input::PointerDelta`] for
+    /// every movement instead of `Move`. The pointer comes back to where it was when the lock ends
+    /// (also when the editor closes). Windows only so far; elsewhere the call is ignored. Call it
+    /// from `input`, for example on `Press`, and unlock on `Release`.
+    pub fn lock_pointer(&self, lock: bool) {
+        self.lock_request.set(Some(lock));
+    }
+
+    /// Whether the pointer is locked now (the lock takes effect right after the call returns).
+    pub fn is_pointer_locked(&self) -> bool {
+        self.locked.get() || self.lock_request.get() == Some(true)
+    }
+
+    pub(crate) fn take_lock_request(&self) -> Option<bool> {
+        self.lock_request.take()
+    }
+
+    pub(crate) fn set_locked(&self, locked: bool) {
+        self.locked.set(locked);
+    }
+
+    pub(crate) fn set_scale_factor(&self, scale: f64) {
+        self.scale.set(scale);
+    }
+
+    pub(crate) fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
+    }
+
+    pub(crate) fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     /// Changes the size of a [`for_tests`](Self::for_tests) `Ui` (logical pixels).
@@ -319,6 +597,20 @@ impl Ui {
     /// Asks for a redraw at the next tick (on the UI thread).
     pub fn request_redraw(&self) {
         self.redraw.store(true, Ordering::Release);
+    }
+
+    /// Tells the view that the editor takes typed text (a text field has the focus): `Some` with
+    /// the caret's position in logical pixels, where the Japanese (or other) input method shows
+    /// its composition window, and text the input method finishes arrives as [`Input::Char`].
+    /// `None` when the editor takes no text. Call it from `render` or `input`; the view reads it
+    /// on the UI thread.
+    pub fn set_text_input(&self, caret: Option<(f64, f64)>) {
+        self.text_caret.set(caret);
+    }
+
+    /// The caret set by [`set_text_input`](Ui::set_text_input), if the editor takes text.
+    pub(crate) fn text_input(&self) -> Option<(f64, f64)> {
+        self.text_caret.get()
     }
 
     /// Takes a pending redraw request.
@@ -404,6 +696,31 @@ impl Ui {
     }
 
     /// The user's language, e.g. `"ja"`.
+    /// Asks the host to make the editor window `width` x `height` logical
+    /// pixels. Returns whether the request was passed on; the host decides and
+    /// answers with the new size (the editor is resized then). Formats that
+    /// cannot resize on request (or a test `Ui`) return false.
+    pub fn request_resize(&self, width: f64, height: f64) -> bool {
+        let Some(resize) = self.host.request_resize else { return false };
+        let scale = self.scale_factor();
+        // SAFETY: the shim's callback, called on the UI thread with its own context.
+        unsafe { resize(self.host.ctx, (width * scale).round().max(1.0) as u32, (height * scale).round().max(1.0) as u32) }
+    }
+
+    /// Whether the system is set to a dark theme (light where it cannot be
+    /// told). [`Input::ThemeChanged`] arrives when it changes (Windows: only
+    /// where the host passes the message on; not verified in a host).
+    pub fn system_dark(&self) -> bool {
+        #[cfg(windows)]
+        {
+            imp::system_dark()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub fn language(&self) -> &str {
         &self.language
     }
@@ -471,3 +788,11 @@ unsafe extern "C" fn close(_view: *mut std::ffi::c_void) {}
 
 #[cfg(not(any(windows, target_os = "macos")))]
 unsafe extern "C" fn set_size(_view: *mut std::ffi::c_void, _width: u32, _height: u32, _scale: f64) {}
+
+impl Drop for Ui {
+    fn drop(&mut self) {
+        if let Some(i) = &self.instance {
+            i.editor_opened(false);
+        }
+    }
+}

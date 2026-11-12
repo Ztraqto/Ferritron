@@ -192,6 +192,13 @@ fn worker(shared: Arc<Shared>) {
     }
 }
 
+/// Gives the calling thread the priority of an audio thread (see `sys::raise_priority`).
+/// For threads a host's audio thread waits for.
+#[cfg_attr(not(any(windows, unix)), allow(dead_code))]
+pub(crate) fn raise_audio_priority() {
+    sys::raise_priority();
+}
+
 static POOL: Mutex<Option<(Pool, usize)>> = Mutex::new(None);
 /// The running pool's shared state, for lock-free use on the audio thread.
 static SHARED: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());

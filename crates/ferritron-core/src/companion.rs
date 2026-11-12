@@ -48,20 +48,12 @@ pub fn load(file_name: &str) -> Option<&'static PluginApi> {
 /// The companion's own table (for `guarded_process`).
 static ORIGINAL: OnceLock<usize> = OnceLock::new();
 
-unsafe extern "C" fn guarded_process(
-    instance: *mut c_void,
-    channels: *const *mut f32,
-    num_channels: u32,
-    frames: u32,
-    events: *const Event,
-    num_events: u32,
-    executor: *const Executor,
-) -> bool {
+unsafe extern "C" fn guarded_process(instance: *mut c_void, data: *const crate::abi::ProcessData) -> bool {
     let Some(&api) = ORIGINAL.get() else { return false };
     // SAFETY: the companion is never unloaded.
     let api = unsafe { &*(api as *const PluginApi) };
     let _denormals = crate::abi::DenormalGuard::new();
-    unsafe { (api.process)(instance, channels, num_channels, frames, events, num_events, executor) }
+    unsafe { (api.process)(instance, data) }
 }
 
 fn try_load(file_name: &str) -> Result<&'static PluginApi, String> {

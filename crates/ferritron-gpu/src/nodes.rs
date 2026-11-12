@@ -10,7 +10,14 @@
 
 use crate::{Biquad, Convolver, CpuIirBank, IirBank, Lane, Mode, RealtimeIirBank};
 use ferritron_vulkan::{ModalLane, PersistentModalBank, TensorMixer};
-use ferritron_graph::{Device, Measured, Node, NodeSetup, Policy, choose};
+use ferritron_graph::{Device, Measured, Node, NodeSetup, Policy, choose_keyed, config_key};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Keys of the placement memory (see `ferritron_graph::choose_keyed`): one
+/// per kind of node, then its sizes.
+const IIR_KEY: u64 = 0x11;
+const MIXER_KEY: u64 = 0x12;
 
 enum Bank {
     Cpu(CpuIirBank),
@@ -42,6 +49,11 @@ pub struct IirNode {
     /// First lane of each member (original node), and the selected member.
     members: Vec<usize>,
     active: usize,
+    /// The device-lost mark of the context a real-time GPU bank runs on.
+    gpu_lost: Option<Arc<AtomicBool>>,
+    /// The other side: the CPU candidate of a GPU bank, or the GPU bank
+    /// parked after a switch to the CPU (see `fall_back`).
+    fallback: Option<Box<IirNode>>,
 }
 
 impl IirNode {
@@ -60,17 +72,21 @@ impl IirNode {
     /// usual candidates. Needs one stage of one-biquad lanes and at most 8
     /// outputs.
     pub fn new_low_latency(lanes: &[Lane], setup: &NodeSetup) -> Self {
-        Self::build(&[lanes], setup, true).expect("a single stage is always a valid chain")
+        Self::build(&[lanes], setup, true, None).expect("a single stage is always a valid chain")
     }
 
     /// Banks in series as one node ([`IirBank::chain`]). On the GPU the
     /// whole chain is fused: one round trip per block instead of one per
     /// bank. Fails only if a stage reads a channel the previous one lacks.
     pub fn chain(stages: &[&[Lane]], setup: &NodeSetup) -> Result<Self, String> {
-        Self::build(stages, setup, false)
+        Self::build(stages, setup, false, None)
     }
 
-    fn build(stages: &[&[Lane]], setup: &NodeSetup, low_latency: bool) -> Result<Self, String> {
+    /// Like [`chain`](Self::chain), on `device` if the policy allows it
+    /// (no measuring then). The placement is remembered for this
+    /// configuration in the process, so a second bank of the same size is
+    /// placed without measuring.
+    fn build(stages: &[&[Lane]], setup: &NodeSetup, low_latency: bool, fixed: Option<Device>) -> Result<Self, String> {
         let cpu = CpuIirBank::chain(stages, setup.max_block)?;
         let (inputs, outputs) = (cpu.inputs(), cpu.outputs());
         let node = |bank| Self {
@@ -82,6 +98,8 @@ impl IirNode {
             setup: *setup,
             members: vec![0],
             active: 0,
+            gpu_lost: None,
+            fallback: None,
         };
         let mut candidates = vec![(Device::Cpu, node(Bank::Cpu(cpu)))];
         if setup.policy != Policy::Off {
@@ -102,7 +120,10 @@ impl IirNode {
                 candidates.push((Device::Gpu, node(Bank::Persistent(Box::new(bank)))));
             }
         }
-        let (mut chosen, measured) = choose(candidates, setup).expect("the CPU candidate is always there");
+        // A persistent kernel is chosen by its own call only, so it is not remembered.
+        let lanes: u64 = stages.iter().map(|s| s.len() as u64).sum();
+        let key = (!low_latency).then(|| config_key(&[IIR_KEY, stages.len() as u64, lanes, setup.max_block as u64, setup.policy as u64, setup.offline as u64]));
+        let (mut chosen, measured) = choose_keyed(key, fixed, candidates, setup).expect("the CPU candidate is always there");
         // The CPU covers late GPU blocks only if it can afford a block: at
         // most half the real-time budget, or the fallback itself would glitch.
         let budget = setup.max_block as f64 / setup.sample_rate * 1e6;
@@ -118,11 +139,54 @@ impl IirNode {
             bank.settle();
             bank.reset();
         }
+        // A GPU bank that can be lost keeps a CPU candidate beside it (built
+        // now, off the audio thread); the context's lost mark is read later.
+        if matches!(chosen.bank, Bank::Gpu(_)) {
+            chosen.gpu_lost = crate::context().ok().map(|ctx| ctx.lost.clone());
+        }
+        if matches!(chosen.bank, Bank::Gpu(_) | Bank::Persistent(_)) {
+            chosen.fallback = chosen.cpu_twin().map(Box::new);
+        }
         chosen.measured = measured;
         Ok(chosen)
     }
 
-    /// Where the bank runs.
+    /// The CPU bank with this node's current coefficients and an empty state:
+    /// the candidate a lost GPU bank falls back to.
+    fn cpu_twin(&self) -> Option<Self> {
+        let stages: Vec<&[Lane]> = self.stages.iter().map(|s| &s[..]).collect();
+        let cpu = CpuIirBank::chain(&stages, self.setup.max_block).ok()?;
+        Some(Self {
+            bank: Bank::Cpu(cpu),
+            inputs: self.inputs,
+            outputs: self.outputs,
+            measured: Vec::new(),
+            stages: self.stages.clone(),
+            setup: self.setup,
+            members: self.members.clone(),
+            active: self.active,
+            gpu_lost: None,
+            fallback: None,
+        })
+    }
+
+    /// Builds a lost persistent kernel again on the current device. A real-time
+    /// `Gpu` bank is not built again here (its GPU thread belongs to it): it
+    /// stays lost. On an error the bank stays on the CPU.
+    fn rebuild_lost(&mut self) {
+        if !self.lost() {
+            return;
+        }
+        let Bank::Persistent(_) = &self.bank else { return };
+        let Some(placeholder) = self.cpu_twin() else { return };
+        let Bank::Persistent(old) = std::mem::replace(&mut self.bank, placeholder.bank) else { return };
+        if let Ok(fresh) = (*old).revive() {
+            self.bank = Bank::Persistent(Box::new(fresh));
+        }
+    }
+
+    /// Where the bank runs (for the graph's placement, see
+    /// [`Node::placement`]).
     pub fn device(&self) -> Device {
         match self.bank {
             Bank::Cpu(_) => Device::Cpu,
@@ -152,6 +216,14 @@ impl IirNode {
     /// safe. In a fused node, `lane` counts within the selected member.
     pub fn set_lane(&mut self, lane: usize, sections: &[Biquad]) {
         let lane = self.members[self.active] + lane;
+        self.set_lane_here(lane, sections);
+        if let Some(other) = self.fallback.as_mut() {
+            other.set_lane_here(lane, sections);
+        }
+    }
+
+    /// Sets lane `lane` (counted from the first member) on this side only.
+    fn set_lane_here(&mut self, lane: usize, sections: &[Biquad]) {
         match &mut self.bank {
             Bank::Cpu(b) => b.set_lane(lane, sections),
             Bank::Gpu(b) => b.set_lane(lane, sections),
@@ -200,6 +272,44 @@ impl Node for IirNode {
         }
     }
 
+    /// A real-time GPU bank whose context is lost, or a persistent kernel whose device is lost.
+    fn lost(&self) -> bool {
+        match &self.bank {
+            Bank::Gpu(_) => self.gpu_lost.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)),
+            Bank::Persistent(bank) => bank.lost(),
+            Bank::Cpu(_) | Bank::GpuOffline(_) => false,
+        }
+    }
+
+    /// A lost GPU bank becomes its CPU candidate; the GPU bank is kept.
+    fn fall_back(&mut self) -> bool {
+        if !self.lost() {
+            return false;
+        }
+        let Some(mut other) = self.fallback.take() else { return false };
+        std::mem::swap(self, &mut *other);
+        self.fallback = Some(other);
+        true
+    }
+
+    /// Builds a lost persistent kernel again and goes back to the GPU when it
+    /// works. Off the audio thread.
+    fn revive(&mut self) {
+        self.fall_back();
+        if let Some(parked) = self.fallback.as_mut() {
+            parked.rebuild_lost();
+        }
+        if self.device() == Device::Cpu && self.fallback.as_ref().is_some_and(|f| f.device() == Device::Gpu && !f.lost()) {
+            let Some(mut other) = self.fallback.take() else { return };
+            std::mem::swap(self, &mut *other);
+            self.fallback = Some(other);
+            self.reset();
+            if let Some(cpu) = self.fallback.as_mut() {
+                cpu.reset();
+            }
+        }
+    }
+
     fn reset(&mut self) {
         match &mut self.bank {
             Bank::Cpu(b) => b.reset(),
@@ -241,6 +351,26 @@ impl Node for IirNode {
     fn select_member(&mut self, member: usize) {
         self.active = member.min(self.members.len() - 1);
     }
+
+    fn placement(&self) -> Option<Device> {
+        Some(self.device())
+    }
+
+    /// Builds the bank again from its stages (the current coefficients) on
+    /// `device`. Persistent kernels are not rebuilt (`new_low_latency` is
+    /// for them); the node keeps its members and the selected one.
+    fn set_placement(&mut self, device: Device) -> bool {
+        let stages: Vec<Vec<Lane>> = self.stages.clone();
+        let refs: Vec<&[Lane]> = stages.iter().map(|s| &s[..]).collect();
+        let Ok(mut fresh) = Self::build(&refs, &self.setup, false, Some(device)) else { return false };
+        if fresh.device() != device {
+            return false; // the policy does not allow it: the node stays as it was
+        }
+        fresh.members = std::mem::take(&mut self.members);
+        fresh.active = self.active;
+        *self = fresh;
+        true
+    }
 }
 
 /// The persistent-kernel bank for `stages`, if they fit it: one stage of
@@ -249,8 +379,7 @@ fn persistent(stages: &[&[Lane]], inputs: usize, outputs: usize, setup: &NodeSet
     let [lanes] = stages else { return None };
     // Only on wgpu's own device: on a device of its own, a persistent
     // kernel would make wgpu's work wait for it.
-    crate::context().ok()?;
-    if !ferritron_vulkan::Gpu::get().is_ok_and(|g| g.is_shared()) {
+    if !crate::shared_vulkan().is_ok_and(|g| g.is_shared()) {
         return None;
     }
     if lanes.iter().any(|l| l.sections.len() != 1) || outputs > 8 {
@@ -303,6 +432,18 @@ impl Node for ConvolverNode {
         self.convolver.missed_blocks()
     }
 
+    /// The convolver's device is lost; it passes its input through and builds
+    /// itself again on a new device (see [`Convolver::device_lost`]). It has
+    /// no CPU candidate, so the graph does not switch it.
+    fn lost(&self) -> bool {
+        self.convolver.device_lost()
+    }
+
+    /// Always the GPU: there is no CPU candidate (see [`ConvolverNode`]).
+    fn placement(&self) -> Option<Device> {
+        Some(Device::Gpu)
+    }
+
     fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
         let out = &mut *outputs[0];
         out.copy_from_slice(&inputs[0][..out.len()]);
@@ -320,12 +461,20 @@ pub struct MatrixMixerNode {
     weights: Vec<f32>,
     tensor: Option<TensorMixer>,
     measured: Vec<Measured>,
+    setup: NodeSetup,
+    /// The other side: the CPU mixer of a Tensor-core mixer, or the Tensor
+    /// mixer parked after a switch to the CPU (see `fall_back`).
+    fallback: Option<Box<MatrixMixerNode>>,
 }
 
 impl MatrixMixerNode {
     /// All weights start at zero. Call off the audio thread.
     pub fn new(inputs: usize, outputs: usize, setup: &NodeSetup) -> Self {
-        let node = |tensor| Self { inputs, outputs, weights: vec![0.0; inputs * outputs], tensor, measured: Vec::new() };
+        Self::build(inputs, outputs, setup, None)
+    }
+
+    fn build(inputs: usize, outputs: usize, setup: &NodeSetup, fixed: Option<Device>) -> Self {
+        let node = |tensor| Self { inputs, outputs, weights: vec![0.0; inputs * outputs], tensor, measured: Vec::new(), setup: *setup, fallback: None };
         let mut candidates = vec![(Device::Cpu, node(None))];
         // Tensor cores wait for the GPU (tens of microseconds): no latency.
         if setup.policy != Policy::Off
@@ -334,13 +483,26 @@ impl MatrixMixerNode {
         {
             candidates.push((Device::Gpu, node(Some(tensor))));
         }
-        let (mut chosen, measured) = choose(candidates, setup).expect("the CPU candidate is always there");
+        let key = config_key(&[MIXER_KEY, inputs as u64, outputs as u64, setup.max_block as u64, setup.policy as u64, setup.offline as u64]);
+        let (mut chosen, measured) = choose_keyed(Some(key), fixed, candidates, setup).expect("the CPU candidate is always there");
+        // A Tensor-core mixer keeps the CPU mixer beside it, for a lost device.
+        if chosen.tensor.is_some() {
+            chosen.fallback = Some(Box::new(Self { inputs, outputs, weights: chosen.weights.clone(), tensor: None, measured: Vec::new(), setup: *setup, fallback: None }));
+        }
         chosen.measured = measured;
         chosen
     }
 
     /// Sets the weight of input `input` in output `output`. Real-time safe.
     pub fn set_gain(&mut self, output: usize, input: usize, gain: f32) {
+        self.store_gain(output, input, gain);
+        if let Some(other) = self.fallback.as_mut() {
+            other.store_gain(output, input, gain);
+        }
+    }
+
+    /// Sets the weight on this side only.
+    fn store_gain(&mut self, output: usize, input: usize, gain: f32) {
         if output < self.outputs && input < self.inputs {
             self.weights[output * self.inputs + input] = gain;
             if let Some(tensor) = &mut self.tensor {
@@ -359,6 +521,57 @@ impl MatrixMixerNode {
 }
 
 impl Node for MatrixMixerNode {
+    fn placement(&self) -> Option<Device> {
+        Some(self.device())
+    }
+
+    /// The Tensor-core mixer's device is lost.
+    fn lost(&self) -> bool {
+        self.tensor.as_ref().is_some_and(|t| t.lost())
+    }
+
+    /// A lost Tensor-core mixer becomes its CPU mixer; the Tensor mixer is kept.
+    fn fall_back(&mut self) -> bool {
+        if !self.lost() {
+            return false;
+        }
+        let Some(mut other) = self.fallback.take() else { return false };
+        std::mem::swap(self, &mut *other);
+        self.fallback = Some(other);
+        true
+    }
+
+    /// Builds a lost Tensor-core mixer again (its weights kept) and goes back to
+    /// the Tensor cores when that works. Off the audio thread.
+    fn revive(&mut self) {
+        self.fall_back();
+        if let Some(parked) = self.fallback.as_mut()
+            && let Some(tensor) = parked.tensor.take()
+        {
+            parked.tensor = if tensor.lost() { tensor.revive().ok() } else { Some(tensor) };
+        }
+        if self.tensor.is_none() && self.fallback.as_ref().is_some_and(|f| f.tensor.is_some() && !f.lost()) {
+            let Some(mut other) = self.fallback.take() else { return };
+            std::mem::swap(self, &mut *other);
+            self.fallback = Some(other);
+        }
+    }
+
+    /// Builds the mixer again on `device`, keeping its weights. Off the audio thread.
+    fn set_placement(&mut self, device: Device) -> bool {
+        let mut fresh = Self::build(self.inputs, self.outputs, &self.setup, Some(device));
+        if fresh.device() != device {
+            return false; // the policy does not allow it: the node stays as it was
+        }
+        for o in 0..self.outputs {
+            for i in 0..self.inputs {
+                fresh.set_gain(o, i, self.weights[o * self.inputs + i]);
+            }
+        }
+        *self = fresh;
+        true
+    }
+
     fn inputs(&self) -> usize {
         self.inputs
     }
@@ -397,6 +610,113 @@ mod tests {
         (0..count)
             .map(|i| Lane { input: 0, output: 0, sections: vec![Biquad::bandpass(100.0 + 3.0 * i as f64, 50.0, 48_000.0)] })
             .collect()
+    }
+
+    /// The wgpu side hands over a new device after a loss (by hand: its device
+    /// is marked lost, and the next `context()` opens a new one, which adopts it).
+    fn wgpu_hands_over_a_new_device() {
+        if let Ok(old) = crate::context() {
+            old.lost.store(true, Ordering::Relaxed);
+            // Kept alive on purpose: the lost Vulkan objects still hold its raw
+            // device handle and drop through it. Without this, wgpu destroys the
+            // device and their drops call into it (access violation seen).
+            std::mem::forget(old);
+        }
+        crate::context().expect("a new wgpu device");
+    }
+
+    /// G-f7 2-1 and 2-2 (hand-set loss, no device was lost): a persistent
+    /// kernel marked lost runs its CPU candidate from the next block, with the
+    /// same output as the CPU bank; `revive` builds the kernel again and goes
+    /// back to it. Skipped where there is no persistent kernel.
+    #[test]
+    fn a_lost_persistent_kernel_runs_on_the_cpu_and_goes_back_after_revive() {
+        let _serial = crate::serial();
+        let lanes = resonators(3000);
+        let mut node = IirNode::new_low_latency(&lanes, &setup(Policy::Max, false, 64));
+        if !node.is_persistent() {
+            // A real choice needs the shared device, which this run did not
+            // have: build the persistent bank as `build` does, on Ferritron's
+            // own device, and give the node its CPU candidate.
+            let modal: Vec<ModalLane> = lanes
+                .iter()
+                .map(|l| {
+                    let s = l.sections[0];
+                    ModalLane { b0: s.b0, b1: s.b1, b2: s.b2, a1: s.a1, a2: s.a2, input: l.input as u32, output: l.output as u32, pad: 0 }
+                })
+                .collect();
+            let budget = std::time::Duration::from_secs_f64(64.0 / 48_000.0 / 2.0);
+            let Ok(mut bank) = PersistentModalBank::new(&modal, 1, 1, 64, budget) else {
+                return eprintln!("skipping: no persistent kernel here ({:?})", node.device());
+            };
+            bank.settle();
+            bank.reset();
+            node.bank = Bank::Persistent(Box::new(bank));
+            node.fallback = node.cpu_twin().map(Box::new);
+        }
+        match &node.bank {
+            Bank::Persistent(bank) => bank.simulate_loss(),
+            _ => unreachable!("is_persistent"),
+        }
+        assert!(node.lost(), "the bank reports its lost device");
+        assert!(node.fall_back(), "a lost bank runs its CPU candidate");
+        assert_eq!(node.device(), Device::Cpu);
+        let mut cpu = CpuIirBank::new(&lanes, 64);
+        let mut input = vec![0.0f32; 64];
+        input[3] = 1.0;
+        let (mut got, mut want) = (vec![0.0f32; 64], vec![0.0f32; 64]);
+        node.process(&[&input], &mut [&mut got]);
+        cpu.process(&[&input], &mut [&mut want]);
+        assert_eq!(got, want, "the CPU candidate answers like the CPU bank");
+
+        wgpu_hands_over_a_new_device();
+        node.revive();
+        assert_eq!(node.device(), Device::Gpu, "built again, and back on the GPU");
+        assert!(!node.lost(), "the new kernel is not on a lost device");
+    }
+
+    /// G-f7 2-1 and 2-2 for the Tensor-core mixer (hand-set loss): the CPU
+    /// mixer answers exactly like a CPU-only mixer with the same weights, and
+    /// after `revive` the Tensor-core mixer answers within f16 precision.
+    #[test]
+    fn a_lost_matrix_mixer_runs_on_the_cpu_and_goes_back_with_its_weights() {
+        let _serial = crate::serial();
+        let (inputs, outputs, frames) = (256, 256, 512);
+        let mut mixer = MatrixMixerNode::new(inputs, outputs, &setup(Policy::Max, false, frames));
+        if mixer.device() != Device::Gpu {
+            return eprintln!("skipping: no Tensor cores here ({:?})", mixer.measurements());
+        }
+        let mut cpu = MatrixMixerNode::new(inputs, outputs, &setup(Policy::Off, false, frames));
+        for o in 0..outputs {
+            for i in (o % 3..inputs).step_by(3) {
+                let g = ((o * 31 + i * 17) % 100) as f32 / 1600.0;
+                mixer.set_gain(o, i, g);
+                cpu.set_gain(o, i, g);
+            }
+        }
+        let input: Vec<Vec<f32>> = (0..inputs).map(|c| (0..frames).map(|f| ((f + c * 5) as f32 * 0.02).sin()).collect()).collect();
+        let ins: Vec<&[f32]> = input.iter().map(|c| &c[..]).collect();
+        let run = |node: &mut MatrixMixerNode| {
+            let mut out = vec![vec![0.0f32; frames]; outputs];
+            node.process(&ins, &mut out.iter_mut().map(|c| &mut c[..]).collect::<Vec<_>>());
+            out
+        };
+        let want = run(&mut cpu);
+        if let Some(tensor) = &mixer.tensor {
+            tensor.simulate_loss();
+        }
+        assert!(mixer.lost(), "the mixer reports its lost device");
+        assert!(mixer.fall_back(), "a lost mixer runs its CPU mixer");
+        assert_eq!(mixer.device(), Device::Cpu);
+        assert!(run(&mut mixer) == want, "the CPU side answers exactly like a CPU-only mixer");
+
+        wgpu_hands_over_a_new_device();
+        mixer.revive();
+        assert_eq!(mixer.device(), Device::Gpu, "built again, with its weights, back on the Tensor cores");
+        let back = run(&mut mixer);
+        let peak = want.iter().flatten().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let worst = back.iter().flatten().zip(want.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(peak > 0.1 && worst < 5e-3 * peak, "after revive: off by {worst} (peak {peak})");
     }
 
     #[test]
@@ -616,6 +936,40 @@ mod tests {
             return eprintln!("skipping the placement check: no Tensor cores here");
         }
         assert_eq!(mixer.device(), Device::Gpu, "256x256 channels: {:?}", mixer.measurements());
+    }
+
+    /// G4: a configuration keeps the placement it got (the same size is placed
+    /// without measuring), and `set_placement` builds the node again on the
+    /// device asked for, with the same output as that device's bank.
+    #[test]
+    fn placement_is_remembered_and_can_be_fixed() {
+        let _serial = crate::serial();
+        let lanes = resonators(4000);
+        let s = setup(Policy::Max, true, 4096);
+        let mut first = IirNode::new(&lanes, &s);
+        if first.device() != Device::Gpu {
+            return eprintln!("skipping: the bank does not run on the GPU here");
+        }
+        let second = IirNode::new(&lanes, &s);
+        assert!(second.measurements().iter().all(|m| m.micros.is_infinite()), "the remembered placement is used without measuring");
+        assert_eq!(second.device(), Device::Gpu);
+        // Fix it on the CPU: the node is built again there, and plays what the CPU bank plays.
+        assert!(first.set_placement(Device::Cpu));
+        assert_eq!(first.placement(), Some(Device::Cpu));
+        let mut cpu = CpuIirBank::new(&lanes, 4096);
+        let mut input = vec![0.0f32; 4096];
+        input[0] = 1.0;
+        input[1000] = -0.5;
+        let (mut got, mut want) = (vec![0.0f32; 4096], vec![0.0f32; 4096]);
+        first.process(&[&input], &mut [&mut got]);
+        cpu.process(&[&input], &mut [&mut want]);
+        let peak = want.iter().map(|v| v.abs()).fold(1e-3f32, f32::max);
+        let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4 * peak, "fixed on the CPU: off by {worst} (peak {peak})");
+        // Policy::Off allows only the CPU: asking for the GPU is refused, and the node stays.
+        let mut off = IirNode::new(&lanes, &setup(Policy::Off, true, 4096));
+        assert!(!off.set_placement(Device::Gpu));
+        assert_eq!(off.placement(), Some(Device::Cpu));
     }
 
     #[test]

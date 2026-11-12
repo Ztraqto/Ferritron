@@ -20,6 +20,7 @@ mod imp {
 
     const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
     const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x2;
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x1;
 
     fn wide(s: &OsStr) -> Vec<u16> {
         s.encode_wide().chain(Some(0)).collect()
@@ -36,6 +37,16 @@ mod imp {
         let mut buf = vec![0u16; 32_768];
         let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
         (len > 0 && len < buf.len()).then(|| PathBuf::from(OsString::from_wide(&buf[..len])))
+    }
+
+    /// Keeps the DLL that contains this code loaded until the process exits, even when the
+    /// host unloads it (threads that never end run its code). Hot reload loads a copy, so the
+    /// original file stays writable.
+    pub fn pin_current_module() -> bool {
+        let mut module = std::ptr::null_mut();
+        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN;
+        let address = pin_current_module as *const u16;
+        unsafe { GetModuleHandleExW(flags, address, &mut module) != 0 }
     }
 
     /// A loaded private copy of a library. The copy is deleted when dropped.

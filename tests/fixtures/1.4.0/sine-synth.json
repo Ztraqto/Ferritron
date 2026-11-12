@@ -1,0 +1,12 @@
+{
+  "plugin": "dev.ferritron.examples.sine-synth",
+  "ferritron": "1.4.0",
+  "class_id": "8f20245ad96a0273b819f3de2970885d",
+  "params": [
+    {"index": 0, "id": 1089540391, "name": "音量", "flags": 0, "default": 0.8, "value": 0.21000000000000002},
+    {"index": 1, "id": 734778311, "name": "アタック", "flags": 0, "default": 0.002001000500250125, "value": 0.58},
+    {"index": 2, "id": 773217381, "name": "リリース", "flags": 0, "default": 0.03980796159231846, "value": 0.9500000000000001},
+    {"index": 3, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 0}
+  ],
+  "state": "4652544e01000000060000002711f1403333333333b347c0c7d3cb2b47e17a14ae219240655c162ecdcccccc0c8eb24000000040000000000000000003000040000080c00850ce4104000040000000efe253ed41"
+}

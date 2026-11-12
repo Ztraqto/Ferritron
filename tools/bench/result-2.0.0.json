@@ -1,0 +1,74 @@
+{
+  "arch": "x86_64",
+  "cores": 16,
+  "ferritron": "2.0.0",
+  "os": "windows",
+  "rows": [
+    {
+      "allocs": 0,
+      "block": 64,
+      "calls_per_block": 1.0,
+      "max_us": 0.19999999999999998,
+      "mean_us": 0.13893333333333308,
+      "p99_us": 0.19999999999999998,
+      "rate": 48000.0,
+      "realtime_x": 9596.928982725545,
+      "scenario": "s1"
+    },
+    {
+      "allocs": 0,
+      "block": 512,
+      "calls_per_block": 1.0,
+      "max_us": 0.39999999999999997,
+      "mean_us": 0.24838709677419352,
+      "p99_us": 0.3,
+      "rate": 48000.0,
+      "realtime_x": 42943.72294372295,
+      "scenario": "s1"
+    },
+    {
+      "allocs": 0,
+      "block": 64,
+      "calls_per_block": 2.0,
+      "max_us": 31.099999999999998,
+      "mean_us": 13.97786666666671,
+      "p99_us": 17.0,
+      "rate": 48000.0,
+      "realtime_x": 95.388900547532,
+      "scenario": "s2"
+    },
+    {
+      "allocs": 0,
+      "block": 512,
+      "calls_per_block": 16.0,
+      "max_us": 144.4,
+      "mean_us": 119.13870967741941,
+      "p99_us": 138.2,
+      "rate": 48000.0,
+      "realtime_x": 89.531493966552,
+      "scenario": "s2"
+    },
+    {
+      "allocs": 0,
+      "block": 64,
+      "calls_per_block": 0.0,
+      "max_us": 0.19999999999999998,
+      "mean_us": 0.10386666666666657,
+      "p99_us": 0.19999999999999998,
+      "rate": 48000.0,
+      "realtime_x": 12836.970474967922,
+      "scenario": "s6"
+    },
+    {
+      "allocs": 0,
+      "block": 512,
+      "calls_per_block": 0.0,
+      "max_us": 0.3,
+      "mean_us": 0.2935483870967746,
+      "p99_us": 0.3,
+      "rate": 48000.0,
+      "realtime_x": 36336.996336996286,
+      "scenario": "s6"
+    }
+  ]
+}

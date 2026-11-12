@@ -149,10 +149,10 @@ impl Process for GpuModal {
     }
 
     fn process(&mut self, ctx: &mut Context) {
-        let n = ctx.io.frames();
-        let (decay, brightness) = (ctx.params.decay.value() as f64, ctx.params.brightness.value() as f64 / 100.0);
+        let n = ctx.io().frames();
+        let (decay, brightness) = (ctx.params().decay.value() as f64, ctx.params().brightness.value() as f64 / 100.0);
         // Coefficients change per block; mallets start at their exact sample.
-        for note in ctx.notes {
+        for note in ctx.notes() {
             match note.kind {
                 NoteKind::On => self.note_on(note.key, note.velocity, note.offset as usize, decay, brightness),
                 NoteKind::Off => self.note_off(note.key),
@@ -180,12 +180,12 @@ impl Process for GpuModal {
 
         let Some(bank) = self.bank.as_mut() else { return };
         let inputs: [&[f32]; VOICES] = std::array::from_fn(|v| &self.inputs[v][..n]);
-        let volume = db_to_gain(ctx.params.volume.value());
-        let out = ctx.io.channel_mut(0);
+        let volume = db_to_gain(ctx.params().volume.value());
+        let out = ctx.io().channel_mut(0);
         bank.process(&inputs, &mut [out]);
         out.iter_mut().for_each(|s| *s *= volume);
-        for ch in 1..ctx.io.num_channels() {
-            ctx.io.copy_channel(0, ch);
+        for ch in 1..ctx.io().num_channels() {
+            ctx.io().copy_channel(0, ch);
         }
     }
 }
@@ -282,4 +282,12 @@ mod tests {
         let normal = held[at - 64..at + 64].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
         assert!(jump <= normal * 1.5 + 1e-6, "release step {jump} vs. {normal} while held");
     }
+}
+
+/// G5: parameter IDs, order and class ID are those of 1.4.0, and a state saved by 1.4.0 loads.
+#[cfg(test)]
+#[test]
+fn loads_state_saved_by_1_4_0() {
+    let n = ferritron::testing::check_fixture::<GpuModal>(include_str!("../../../tests/fixtures/1.4.0/gpu-modal.json")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(n > 0);
 }

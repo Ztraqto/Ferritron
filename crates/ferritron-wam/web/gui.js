@@ -79,6 +79,7 @@ window.ipc = { postMessage: (m) => parent.__ferritronIpc_${wam.instanceId.replac
   const id = (key) => { const p = params[key] ?? builtins[key]; if (!p) throw new Error('ferritron: unknown parameter "' + key + '"'); return p.id; };
   window.ferritron = {
     params, builtins, language: ${JSON.stringify(wam.description.language ?? "en")}, nativeContextMenu: true,
+    plugin: ${JSON.stringify({ id: wam.description.id ?? "", name: wam.description.name ?? "", vendor: wam.description.vendor ?? "" })},
     t(key, args = {}) { const text = messages[key] ?? key; return text.replace(/\\{\\$(\\w+)\\}/g, (m, n) => (n in args ? String(args[n]) : m)); },
     onChange(fn) { listeners.push(fn); },
     instance: null,
@@ -92,7 +93,7 @@ window.ipc = { postMessage: (m) => parent.__ferritronIpc_${wam.instanceId.replac
     _update(key, value, normalized, text) { const p = params[key] ?? builtins[key]; Object.assign(p, { value, normalized, text }); for (const fn of listeners) fn(key, p); },
   };
 })();
-</script>`;
+</script><script src="${new URL("extras.js", import.meta.url).href}"></script>`;
   window[`__ferritronIpc_${wam.instanceId.replace(/\W/g, "_")}`] = ipc;
   frame.srcdoc = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (h) => h + setup) : setup + html;
   frame.addEventListener("load", () => {

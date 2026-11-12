@@ -47,12 +47,15 @@ fn main() {
     build
         .cpp(true)
         .std("c++17")
+        .flag_if_supported("/EHsc")
         .include(ferritron_build::abi_include());
-    for include in ["Interfaces", "Interfaces/ACF", "Libs/AAXLibrary/include"] {
+    for include in ["Interfaces", "Interfaces/ACF", "Libs/AAXLibrary/include", "Extensions/Topology", "Extensions/MIDI", "Extensions/GUI", "Extensions/Platform"] {
         build.include(sdk.join(include));
     }
     let mut files = Vec::new();
     sources(&sdk.join("Libs/AAXLibrary/source"), &mut files);
+    // AAX_CMonolithicParameters, which the shim builds on.
+    sources(&sdk.join("Extensions/Topology"), &mut files);
     // The ACF entry points: AAX_Exports.cpp, wherever this SDK version keeps it.
     let mut all = Vec::new();
     sources(&sdk.join("Interfaces"), &mut all);

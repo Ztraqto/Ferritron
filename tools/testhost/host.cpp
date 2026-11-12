@@ -8,16 +8,27 @@
 
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/base/iplugincompatibility.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstattributes.h"
+#include "pluginterfaces/vst/ivstremapparamid.h"
 #include "pluginterfaces/vst/ivstchannelcontextinfo.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
+
+#ifdef FERRITRON_HAVE_VST2
+// Your own copy of the VST 2 SDK (VST2_SDK_DIR); Ferritron neither ships nor fetches it.
+#define VST_FORCE_DEPRECATED 0
+#include "pluginterfaces/vst2.x/aeffectx.h"
+#endif
 
 #include <chrono>
 #include <cmath>
@@ -31,6 +42,82 @@
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
+
+namespace {
+// FERRITRON_TESTHOST_DENSE=N: every block carries N automation points for the
+// target parameter (offsets spread over the block, values zig-zagging; the last is 1.0).
+struct DenseQueue : IParamValueQueue {
+	ParamID id = 0;
+	int32 count = 0, frames = 1;
+	tresult PLUGIN_API queryInterface(const TUID, void**) override { return kNoInterface; }
+	uint32 PLUGIN_API addRef() override { return 1; }
+	uint32 PLUGIN_API release() override { return 1; }
+	ParamID PLUGIN_API getParameterId() override { return id; }
+	int32 PLUGIN_API getPointCount() override { return count; }
+	tresult PLUGIN_API getPoint(int32 i, int32& offset, ParamValue& value) override {
+		if (i < 0 || i >= count)
+			return kResultFalse;
+		offset = static_cast<int32>(static_cast<int64>(i) * frames / count);
+		value = i == count - 1 ? 1.0 : (i % 2 ? 0.25 : 0.75);
+		return kResultOk;
+	}
+	tresult PLUGIN_API addPoint(int32, ParamValue, int32&) override { return kResultFalse; }
+};
+struct DenseChanges : IParameterChanges {
+	DenseQueue queue;
+	tresult PLUGIN_API queryInterface(const TUID, void**) override { return kNoInterface; }
+	uint32 PLUGIN_API addRef() override { return 1; }
+	uint32 PLUGIN_API release() override { return 1; }
+	int32 PLUGIN_API getParameterCount() override { return 1; }
+	IParamValueQueue* PLUGIN_API getParameterData(int32 i) override { return i == 0 ? &queue : nullptr; }
+	IParamValueQueue* PLUGIN_API addParameterData(const ParamID&, int32&) override { return nullptr; }
+};
+// What the plugin sends back to the host (FERRITRON_TESTHOST_OUT=1 prints each block's count).
+struct OutQueue : IParamValueQueue {
+	ParamID id = 0;
+	int32 points = 0;
+	tresult PLUGIN_API queryInterface(const TUID, void**) override { return kNoInterface; }
+	uint32 PLUGIN_API addRef() override { return 1; }
+	uint32 PLUGIN_API release() override { return 1; }
+	ParamID PLUGIN_API getParameterId() override { return id; }
+	int32 PLUGIN_API getPointCount() override { return points; }
+	tresult PLUGIN_API getPoint(int32, int32&, ParamValue&) override { return kResultFalse; }
+	tresult PLUGIN_API addPoint(int32 offset, ParamValue value, int32& index) override {
+		std::printf("host: output parameter %u = %.3f at %d\n", id, value, offset);
+		index = points++;
+		return kResultOk;
+	}
+};
+struct OutChanges : IParameterChanges {
+	OutQueue queue;
+	tresult PLUGIN_API queryInterface(const TUID, void**) override { return kNoInterface; }
+	uint32 PLUGIN_API addRef() override { return 1; }
+	uint32 PLUGIN_API release() override { return 1; }
+	int32 PLUGIN_API getParameterCount() override { return 0; }
+	IParamValueQueue* PLUGIN_API getParameterData(int32) override { return nullptr; }
+	IParamValueQueue* PLUGIN_API addParameterData(const ParamID& id, int32& index) override {
+		queue.id = id;
+		index = 0;
+		return &queue;
+	}
+};
+struct OutEvents : IEventList {
+	int32 count = 0;
+	tresult PLUGIN_API queryInterface(const TUID, void**) override { return kNoInterface; }
+	uint32 PLUGIN_API addRef() override { return 1; }
+	uint32 PLUGIN_API release() override { return 1; }
+	int32 PLUGIN_API getEventCount() override { return count; }
+	tresult PLUGIN_API getEvent(int32, Event&) override { return kResultFalse; }
+	tresult PLUGIN_API addEvent(Event& e) override {
+		if (e.type == Event::kLegacyMIDICCOutEvent)
+			std::printf("host: output MIDI controller %d = %d at %d\n", e.midiCCOut.controlNumber, e.midiCCOut.value, e.sampleOffset);
+		else
+			std::printf("host: output event type %d at %d\n", e.type, e.sampleOffset);
+		++count;
+		return kResultOk;
+	}
+};
+} // namespace
 
 namespace {
 
@@ -630,6 +717,242 @@ int runGui(IEditController* controller, const wchar_t* shotDir, int clickX, int 
 	return 0;
 }
 
+// FERRITRON_TESTHOST_CLASSES=1: lists the factory's classes and exercises what a host does with
+// a plug-in that has its own edit controller class, a compatibility class and renamed parameter
+// IDs (VST 3.7.5 / 3.7.11): the controller class is created and asked for IEditController, the
+// compatibility class for its JSON, and IRemapParamID for a parameter ID of an older version.
+// FERRITRON_TESTHOST_OLD_PARAM=N names that old ID (default: the 1.3.0 hash of Bypass is not known
+// here, so only the answer for an unknown ID is checked).
+int checkClasses(IPluginFactory* factory) {
+	// What a host shows for a class ID (FUID::toString): COM layout on Windows.
+	auto hex = [](const TUID id) {
+		uint8_t b[16];
+		std::memcpy(b, id, 16);
+#if COM_COMPATIBLE
+		std::reverse(b, b + 4);
+		std::reverse(b + 4, b + 6);
+		std::reverse(b + 6, b + 8);
+#endif
+		char out[33];
+		for (int i = 0; i < 16; ++i)
+			std::snprintf(out + i * 2, 3, "%02X", b[i]);
+		return std::string(out);
+	};
+	IPluginFactory2* factory2 = query<IPluginFactory2>(factory, IPluginFactory2_iid);
+	const int32 count = factory->countClasses();
+	std::printf("classes: %d\n", count);
+	TUID audio{}, controllerClass{}, compatClass{};
+	bool haveController = false, haveCompat = false;
+	for (int32 i = 0; i < count; ++i) {
+		PClassInfo2 two{};
+		if (!factory2 || factory2->getClassInfo2(i, &two) != kResultOk)
+			return fail("getClassInfo2 failed");
+		std::printf("class %d: %s | %s | %s | %s\n", i, hex(two.cid).c_str(), two.category, two.name, two.subCategories);
+		if (std::strcmp(two.category, "Audio Module Class") == 0 && i == 0)
+			std::memcpy(audio, two.cid, sizeof(TUID));
+		if (std::strcmp(two.category, "Component Controller Class") == 0) {
+			std::memcpy(controllerClass, two.cid, sizeof(TUID));
+			haveController = true;
+		}
+		if (std::strcmp(two.category, "Plugin Compatibility Class") == 0) {
+			std::memcpy(compatClass, two.cid, sizeof(TUID));
+			haveCompat = true;
+		}
+	}
+
+	void* obj = nullptr;
+	if (factory->createInstance(audio, IComponent_iid, &obj) != kResultOk)
+		return fail("cannot create the component");
+	auto* component = static_cast<IComponent*>(obj);
+	component->initialize(nullptr);
+	TUID named{};
+	const bool separate = component->getControllerClassId(named) == kResultOk;
+	std::printf("component: getControllerClassId -> %s%s\n", separate ? "separate controller " : "single object",
+	            separate ? hex(named).c_str() : "");
+	if (separate != haveController)
+		return fail("getControllerClassId and the factory's controller class disagree");
+	if (separate && std::memcmp(named, controllerClass, sizeof(TUID)) != 0)
+		return fail("getControllerClassId names another class than the factory lists");
+
+	IEditController* controller = nullptr;
+	if (separate) {
+		void* c = nullptr;
+		if (factory->createInstance(controllerClass, IEditController_iid, &c) != kResultOk)
+			return fail("cannot create the controller class");
+		controller = static_cast<IEditController*>(c);
+		controller->initialize(nullptr);
+		// The host hands the component's state to the controller.
+		MemoryStream state;
+		component->getState(&state);
+		state.at = 0;
+		if (controller->setComponentState(&state) != kResultOk)
+			return fail("the controller refused the component's state");
+		std::printf("controller: created as its own object, %d parameters\n", controller->getParameterCount());
+	} else {
+		controller = query<IEditController>(component, IEditController_iid);
+		if (!controller)
+			return fail("the component has no IEditController");
+	}
+
+	if (auto* remap = query<IRemapParamID>(controller, IRemapParamID_iid)) {
+		std::printf("IRemapParamID: available\n");
+		// Parameter 0's current ID maps to itself; a made up ID does not map.
+		ParameterInfo param{};
+		controller->getParameterInfo(0, param);
+		ParamID mapped = 0;
+		const bool same = remap->getCompatibleParamID(audio, param.id, mapped) == kResultTrue && mapped == param.id;
+		std::printf("IRemapParamID: parameter %u -> %s\n", param.id, same ? "same" : "different");
+		ParamID unknown = 0;
+		const bool none = remap->getCompatibleParamID(audio, 0x3ABCDEF1, unknown) != kResultTrue;
+		std::printf("IRemapParamID: unknown ID -> %s\n", none ? "no mapping" : "mapped (wrong)");
+		if (const char* old = std::getenv("FERRITRON_TESTHOST_OLD_PARAM")) {
+			ParamID next = 0;
+			const bool ok = remap->getCompatibleParamID(audio, static_cast<ParamID>(std::strtoul(old, nullptr, 10)), next) == kResultTrue;
+			std::printf("IRemapParamID: old %s -> %s%u\n", old, ok ? "" : "none ", ok ? next : 0u);
+		}
+		TUID other{};
+		other[0] = 1;
+		const bool foreign = remap->getCompatibleParamID(other, param.id, mapped) != kResultTrue;
+		std::printf("IRemapParamID: another plug-in -> %s\n", foreign ? "no mapping" : "mapped (wrong)");
+		remap->release();
+		if (!same || !none || !foreign)
+			return fail("IRemapParamID answered wrongly");
+	} else {
+		std::printf("IRemapParamID: not offered\n");
+	}
+
+	if (haveCompat) {
+		void* c = nullptr;
+		if (factory->createInstance(compatClass, IPluginCompatibility_iid, &c) != kResultOk)
+			return fail("cannot create the compatibility class");
+		auto* compat = static_cast<IPluginCompatibility*>(c);
+		MemoryStream json;
+		if (compat->getCompatibilityJSON(&json) != kResultTrue)
+			return fail("getCompatibilityJSON failed");
+		std::printf("compatibility: %.*s\n", static_cast<int>(json.data.size()), reinterpret_cast<const char*>(json.data.data()));
+		compat->release();
+	}
+	if (separate) {
+		controller->terminate();
+		controller->release();
+	}
+	component->terminate();
+	component->release();
+	std::printf("classes: ok\n");
+	return 0;
+}
+
+#ifdef FERRITRON_HAVE_VST2
+// VST 2: a plugin library that exports VSTPluginMain (and not GetPluginFactory) is loaded as a
+// VST 2 effect: its editor opens in a window (effEditGetRect / effEditOpen), the host changes a
+// parameter, clicks, resizes on request and closes it (effEditClose), with screenshots.
+HWND g_vst2Window = nullptr;
+
+VstIntPtr VSTCALLBACK vst2Callback(AEffect*, VstInt32 opcode, VstInt32 index, VstIntPtr value, void*, float opt) {
+	switch (opcode) {
+	case audioMasterVersion:
+		return 2400;
+	case audioMasterAutomate:
+		std::printf("host: automate parameter %d = %.4f\n", index, opt);
+		return 0;
+	case audioMasterBeginEdit:
+		std::printf("host: begin edit %d\n", index);
+		return 1;
+	case audioMasterEndEdit:
+		std::printf("host: end edit %d\n", index);
+		return 1;
+	case audioMasterSizeWindow:
+		std::printf("host: the editor asks for %dx%d\n", index, static_cast<int>(value));
+		if (g_vst2Window)
+			setClientSize(g_vst2Window, index, static_cast<int>(value));
+		return 1;
+	case audioMasterGetVendorString:
+		return 0;
+	default:
+		return 0;
+	}
+}
+
+int runVst2(HMODULE module, const wchar_t* shotDir, int clickX, int clickY, double scale, int resizeW, int resizeH) {
+	using Vst2Main = AEffect* (*)(audioMasterCallback);
+	auto main = reinterpret_cast<Vst2Main>(GetProcAddress(module, "VSTPluginMain"));
+	AEffect* effect = main ? main(vst2Callback) : nullptr;
+	if (!effect || effect->magic != kEffectMagic)
+		return fail("VSTPluginMain gave no AEffect");
+	auto call = [&](VstInt32 opcode, VstInt32 index = 0, VstIntPtr value = 0, void* ptr = nullptr, float opt = 0.0f) {
+		return effect->dispatcher(effect, opcode, index, value, ptr, opt);
+	};
+	call(effOpen);
+	char name[256] = {};
+	call(effGetEffectName, 0, 0, name);
+	std::printf("plugin: %s (VST 2, %d parameters, %s editor)\n", name, effect->numParams,
+	            (effect->flags & effFlagsHasEditor) ? "has an" : "no");
+	call(effSetSampleRate, 0, 0, nullptr, 48000.0f);
+	call(effSetBlockSize, 0, 256);
+	call(effMainsChanged, 0, 1);
+	if (!(effect->flags & effFlagsHasEditor)) {
+		call(effClose);
+		return fail("the plugin has no editor");
+	}
+
+	ERect* rect = nullptr;
+	if (!call(effEditGetRect, 0, 0, &rect) || !rect)
+		return fail("effEditGetRect gave nothing");
+	std::printf("editor: %dx%d\n", rect->right - rect->left, rect->bottom - rect->top);
+
+	WNDCLASSW wc{};
+	wc.lpfnWndProc = hostProc;
+	wc.hInstance = GetModuleHandleW(nullptr);
+	wc.lpszClassName = L"FerritronTestHost";
+	RegisterClassW(&wc);
+	RECT r{0, 0, rect->right - rect->left, rect->bottom - rect->top};
+	AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+	HWND hwnd = CreateWindowW(wc.lpszClassName, L"Ferritron test host (VST 2)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100,
+	                          r.right - r.left, r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+	g_vst2Window = hwnd;
+	auto attachStart = std::chrono::steady_clock::now();
+	if (!call(effEditOpen, 0, 0, hwnd))
+		return fail("effEditOpen failed");
+	std::printf("timing: editor opened in %.1f ms\n", msSince(attachStart));
+	printClientSize("opened", hwnd);
+
+	std::wstring dir = shotDir ? shotDir : L".";
+	if (scale <= 0)
+		scale = 1.0;
+	for (int i = 0; i < 4; ++i) {
+		pump(0.5);
+		call(effEditIdle);
+	}
+	screenshot(hwnd, shot(dir, L"vst2-1-initial").c_str());
+
+	effect->setParameter(effect, 0, 0.25f); // as automation would
+	std::printf("host: set parameter 0 to 0.25\n");
+	pump(0.5);
+	screenshot(hwnd, shot(dir, L"vst2-2-after-host-change").c_str());
+
+	click(hwnd, static_cast<int>(clickX * scale), static_cast<int>(clickY * scale));
+	pump(0.8);
+	std::printf("plugin: parameter 0 is now %.4f\n", effect->getParameter(effect, 0));
+	screenshot(hwnd, shot(dir, L"vst2-3-after-click").c_str());
+
+	if (resizeW > 0 && resizeH > 0) {
+		// The host resizes its window: the editor follows (effEditGetRect again, the view sizes itself).
+		setClientSize(hwnd, resizeW, resizeH);
+		pump(0.8);
+		printClientSize("resized", hwnd);
+		screenshot(hwnd, shot(dir, L"vst2-4-resized").c_str());
+	}
+
+	call(effEditClose);
+	DestroyWindow(hwnd);
+	g_vst2Window = nullptr;
+	call(effMainsChanged, 0, 0);
+	call(effClose);
+	std::printf("vst2: ok\n");
+	return 0;
+}
+#endif
+
 } // namespace
 
 extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, double gainNormalized,
@@ -644,6 +967,12 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 	std::printf("timing: LoadLibrary %.1f ms\n", msSince(loadStart));
 	using InitDll = bool (*)();
 	using GetFactory = IPluginFactory* (*)();
+#ifdef FERRITRON_HAVE_VST2
+	// The same library may hold VST 3 and VST 2 entry points: `<name>.vst2.dll` (or
+	// FERRITRON_TESTHOST_VST2=1) loads it as a VST 2 plugin.
+	if ((std::getenv("FERRITRON_TESTHOST_VST2") || std::wcsstr(binary, L".vst2.")) && GetProcAddress(module, "VSTPluginMain"))
+		return runVst2(module, guiShotDir, clickX, clickY, scale, resizeW, resizeH);
+#endif
 	if (auto init = reinterpret_cast<InitDll>(GetProcAddress(module, "InitDll")))
 		init();
 	auto getFactory = reinterpret_cast<GetFactory>(GetProcAddress(module, "GetPluginFactory"));
@@ -654,6 +983,8 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 	PClassInfo info{};
 	factory->getClassInfo(0, &info);
 	std::printf("plugin: %s\n", info.name);
+	if (std::getenv("FERRITRON_TESTHOST_CLASSES"))
+		return checkClasses(factory);
 
 	void* obj = nullptr;
 	auto createStart = std::chrono::steady_clock::now();
@@ -747,6 +1078,10 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 	ProcessSetup setup{offline ? kOffline : kRealtime, kSample32, frames, 48000.0};
 	auto activateStart = std::chrono::steady_clock::now();
 	processor->setupProcessing(setup);
+	// FERRITRON_TESTHOST_SIDECHAIN=LEVEL: the sidechain bus (if any) is switched on and fed LEVEL.
+	const char* sidechainLevel = envVar("FERRITRON_TESTHOST_SIDECHAIN");
+	if (sidechainLevel && component->getBusCount(kAudio, kInput) > 1)
+		component->activateBus(kAudio, kInput, 1, true);
 	component->setActive(true);
 	std::printf("timing: setupProcessing + setActive %.1f ms\n", msSince(activateStart));
 	std::printf("latency: %u samples\n", processor->getLatencySamples());
@@ -792,7 +1127,67 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 	data.numInputs = 1;
 	data.numOutputs = 1;
 	data.inputs = &input;
+	std::vector<float> scL(frames), scR(frames);
+	float* scs[2] = {scL.data(), scR.data()};
+	AudioBusBuffers inputs2[2]{};
+	if (sidechainLevel && component->getBusCount(kAudio, kInput) > 1) {
+		std::fill(scL.begin(), scL.end(), static_cast<float>(std::atof(sidechainLevel)));
+		std::fill(scR.begin(), scR.end(), static_cast<float>(std::atof(sidechainLevel)));
+		inputs2[0] = input;
+		inputs2[1].numChannels = 2;
+		inputs2[1].channelBuffers32 = scs;
+		data.numInputs = 2;
+		data.inputs = inputs2;
+	}
+	// FERRITRON_TESTHOST_TEMPO=BPM: the host plays at that tempo (ProcessContext).
+	ProcessContext context{};
+	if (const char* tempo = envVar("FERRITRON_TESTHOST_TEMPO")) {
+		context.state = ProcessContext::kPlaying | ProcessContext::kTempoValid;
+		context.tempo = std::atof(tempo);
+		data.processContext = &context;
+	}
 	data.outputs = &output;
+	DenseChanges dense;
+	OutChanges outChanges;
+	OutEvents outEvents;
+	if (envVar("FERRITRON_TESTHOST_OUT")) {
+		data.outputParameterChanges = &outChanges;
+		data.outputEvents = &outEvents;
+	}
+	if (const char* n = envVar("FERRITRON_TESTHOST_DENSE")) {
+		ParameterInfo first{};
+		controller->getParameterInfo(target, first);
+		dense.queue.id = first.id;
+		dense.queue.count = std::atoi(n);
+		dense.queue.frames = frames;
+		data.inputParameterChanges = &dense;
+		std::printf("host: %d automation points per block on parameter %u\n", dense.queue.count, first.id);
+	}
+
+	// FERRITRON_TESTHOST_BENCH=N (`--bench N`): time N blocks back to back (S7, S9).
+	if (const char* bench = envVar("FERRITRON_TESTHOST_BENCH")) {
+		const int n = (std::max)(1, std::atoi(bench));
+		auto block = [&] {
+			std::fill(inL.begin(), inL.end(), 0.25f);
+			std::fill(inR.begin(), inR.end(), 0.25f);
+			processor->process(data);
+		};
+		for (int i = 0; i < 500; ++i)
+			block();
+		std::vector<double> us(static_cast<size_t>(n));
+		for (int i = 0; i < n; ++i) {
+			auto t0 = std::chrono::steady_clock::now();
+			block();
+			us[static_cast<size_t>(i)] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+		}
+		double sum = 0;
+		for (double u : us)
+			sum += u;
+		std::sort(us.begin(), us.end());
+		std::printf("bench: %d blocks of %d frames, stereo, 48 kHz: mean %.2f us, p99 %.2f us, max %.2f us (x%.0f realtime)\n", n, frames, sum / n,
+		            us[static_cast<size_t>(n * 99 / 100)], us.back(), (frames / 48000.0 * 1e6) / (sum / n));
+		seconds = -1; // skip the listening loop
+	}
 
 	float last = NAN;
 	auto start = std::chrono::steady_clock::now();
@@ -803,7 +1198,7 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 		pulseId = first.id;
 	}
 	bool pulsed = false;
-	for (;;) {
+	for (; seconds >= 0;) {
 		double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 		if (pulseAt >= 0 && !pulsed && now >= pulseAt) {
 			// Parameter 0 on for one block, then off again.
@@ -829,8 +1224,8 @@ extern "C" int ferritron_testhost_run(const wchar_t* binary, double seconds, dou
 			e.processor->process(d);
 		}
 		double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-		if (outL[0] != last) {
-			last = outL[0];
+		if (outL[frames - 1] != last) {
+			last = outL[frames - 1];
 			std::printf("[%6.2fs] output = %.6f\n", t, last);
 			std::fflush(stdout);
 		}

@@ -21,7 +21,25 @@
 //! ferritron.onInstanceChange((instance) => { ... })   // the track was renamed, recolored, ...
 //! ferritron.send({ kind: "rename", name: "Lead" })   // to the plugin (InstanceHandle::on_message)
 //! ferritron.onMessage((message) => { ... })           // from the plugin (InstanceHandle::post)
+//! ferritron.onStream("spectrum", (values) => { ... }) // a Float32Array: the newest values of a
+//!                                                     // `[streams]` entry (at most every 33 ms)
+//! ferritron.plugin             // { id, name, vendor }
+//! ferritron.theme              // { dark, highContrast, reducedMotion, accent: [r, g, b] | null }
+//! ferritron.onThemeChange((theme) => { ... })         // the system theme changed
+//! ferritron.settings.get("zoom", 1); ferritron.settings.set("zoom", 1.5)   // kept across sessions
+//! ferritron.settings.onChange((key, value) => { ... })  // also when another editor of the plugin sets it
+//! await ferritron.contextMenu([{ id: "reset", label: "Reset" }, { separator: true }], { x, y })   // id or null
+//! await ferritron.openFile({ title, dir, filters: [{ name: "Audio", extensions: ["wav", "aif"] }] })   // path or null
+//! await ferritron.saveFile({ title, dir, name: "preset.json", filters: [...] })                       // path or null
 //! ```
+//!
+//! Pointer and wheel events are the browser's own and carry what the plugin needs: `shiftKey`,
+//! `ctrlKey`, `altKey`, `metaKey` on every pointer event (E1), `deltaX` / `deltaY` / `deltaMode`
+//! on `wheel` (E8; trackpads give pixel deltas), pointer capture (`setPointerCapture`) keeps a
+//! drag going outside the window and `requestPointerLock()` gives relative movement (E10), and
+//! `prefers-color-scheme` follows the system theme (E7). The editor cannot ask the host to
+//! resize its window yet (`ViewHost` has no such call), and has no host context menu or
+//! full screen: `ferritron.contextMenu` draws a menu of its own.
 //!
 //! Messages are JSON in both directions. The plugin receives them on the UI
 //! thread in the handler it set with `InstanceHandle::on_message` (usually in
@@ -171,7 +189,19 @@ const BRIDGE: &str = r#"
   const listeners = [];
   const instanceListeners = [];
   const messageListeners = [];
+  const streamListeners = {};
+  const dialogs = new Map();
+  let dialogId = 0;
   const send = (m) => window.ipc.postMessage(m);
+  // Options of a file dialog as the host side reads them: percent-encoded fields, filters as
+  // "Name|ext;ext~Name|ext".
+  const dialog = (kind, o = {}) => new Promise((resolve) => {
+    const n = ++dialogId;
+    dialogs.set(n, resolve);
+    const filters = (o.filters ?? []).map((f) => `${f.name ?? ""}|${(f.extensions ?? []).join(";")}`).join("~");
+    const enc = (v) => encodeURIComponent(v ?? "");
+    send(`dialog:${n}:${kind}:${enc(o.title)}:${enc(o.dir)}:${enc(filters)}:${enc(o.name)}`);
+  });
   const id = (key) => {
     const p = params[key] ?? builtins[key];
     if (!p) throw new Error(`ferritron: unknown parameter "${key}"`);
@@ -181,6 +211,7 @@ const BRIDGE: &str = r#"
     params,
     builtins,
     language: __LANGUAGE__,
+    plugin: __PLUGIN__,
     nativeContextMenu: false,
     t(key, args = {}) {
       const text = messages[key] ?? key;
@@ -190,7 +221,19 @@ const BRIDGE: &str = r#"
     instance: __INSTANCE__,
     onInstanceChange(fn) { instanceListeners.push(fn); },
     send(message) { send(`msg:${JSON.stringify(message)}`); },
+    _post: send,
     onMessage(fn) { messageListeners.push(fn); },
+    onStream(name, fn) { (streamListeners[name] ??= []).push(fn); },
+    openFile(options) { return dialog("open", options); },
+    saveFile(options) { return dialog("save", options); },
+    _dialog(n, path) { const resolve = dialogs.get(n); dialogs.delete(n); if (resolve) resolve(path); },
+    _stream(name, b64) {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const values = new Float32Array(bytes.buffer);
+      for (const fn of streamListeners[name] ?? []) fn(values);
+    },
     _instance(info) {
       this.instance = info;
       for (const fn of instanceListeners) fn(info);
@@ -218,6 +261,34 @@ const BRIDGE: &str = r#"
 })();
 "#;
 
+/// Theme, settings, a menu of our own, ...: the part of `window.ferritron` that needs nothing from
+/// the host (also used by the WAM page and the Android app).
+pub const EXTRAS: &str = include_str!("extras.js");
+
+/// Standard base64 (with padding), for sending binary values to the page.
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// The script that hands `values` of stream `name` to the page (`ferritron.onStream`).
+fn stream_script(name: &str, values: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    format!("ferritron._stream({},\"{}\");", json_str(name), base64(&bytes))
+}
+
+mod dialog;
 #[cfg(windows)]
 mod environment;
 #[cfg(any(windows, target_os = "macos"))]
@@ -248,6 +319,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn base64_matches_the_standard_examples() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn a_stream_script_carries_little_endian_floats() {
+        // 1.0f32 = 00 00 80 3F
+        assert_eq!(stream_script("spectrum", &[1.0]), "ferritron._stream(\"spectrum\",\"AACAPw==\");");
+    }
+
+    #[test]
     fn json_strings_are_escaped() {
         let input = format!("a\"b{}c{}</script>", '\\', '\n');
         let escaped = json_str(&input);
@@ -255,5 +341,43 @@ mod tests {
         assert!(escaped.starts_with(r#""a\"b\\c"#), "{escaped}");
         assert!(!escaped.contains('<') && !escaped.contains('\n'), "{escaped}");
         assert_eq!(json_num(f64::NAN), "0");
+    }
+    #[test]
+    fn extras_js_behaves_in_node() {
+        // The browser-side logic (theme, settings, streams, dialogs without a host) with stand-ins
+        // for the browser. Skipped (loudly) when node is not installed.
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("extras.test.js");
+        match std::process::Command::new("node").arg(&script).output() {
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(out.status.success(), "{text}
+{}", String::from_utf8_lossy(&out.stderr));
+                assert!(text.contains("all passed"), "{text}");
+            }
+            Err(e) => eprintln!("node is not available ({e}): extras.test.js was not run"),
+        }
+    }
+
+    #[test]
+    fn the_android_bridge_carries_the_same_extras() {
+        let android = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ferritron-standalone/android/bridge.js");
+        let text = std::fs::read_to_string(&android).expect("the Android bridge");
+        assert!(text.ends_with(EXTRAS), "crates/ferritron-standalone/android/bridge.js must end with extras.js");
+        assert!(text.contains("plugin: {"), "the bridge names the plugin (settings are per plugin)");
+    }
+
+    #[test]
+    fn the_wam_page_loads_extras_and_ships_them() {
+        let wam = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ferritron-wam");
+        let gui = std::fs::read_to_string(wam.join("web/gui.js")).unwrap();
+        let manifest = std::fs::read_to_string(wam.join("Cargo.toml")).unwrap();
+        assert!(gui.contains("extras.js") && manifest.contains("ferritron-web/src/extras.js"));
+        assert!(EXTRAS.contains("f.onStream") && !EXTRAS.contains('`'), "extras.js stays free of backticks (it is pasted into templates)");
+    }
+
+    #[test]
+    fn the_bridge_names_the_dialog_message_the_host_side_reads() {
+        assert!(BRIDGE.contains("dialog:${n}:${kind}") && BRIDGE.contains("_dialog(n, path)"));
+        assert!(BRIDGE.contains("__PLUGIN__") && BRIDGE.contains("openFile") && BRIDGE.contains("saveFile"));
     }
 }

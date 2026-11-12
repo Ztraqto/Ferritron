@@ -1204,7 +1204,7 @@ struct SlotWork {
 
 impl Drop for RealtimeIirBank {
     fn drop(&mut self) {
-        BANKS.unregister(&self._slot);
+        BANKS.unregister(&self._slot, &self.batcher);
     }
 }
 

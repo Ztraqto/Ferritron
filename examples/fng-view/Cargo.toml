@@ -1,0 +1,16 @@
+[package]
+name = "fng-view"
+description = "Ferritron example: a gain whose editor is drawn with Ferritron Native Graphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ferritron = { workspace = true, features = ["fng"] }
+
+[dev-dependencies]
+pollster = "1"

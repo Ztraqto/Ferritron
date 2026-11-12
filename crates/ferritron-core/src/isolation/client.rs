@@ -15,7 +15,7 @@ use std::path::Path;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::SeqCst;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -28,6 +28,9 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 static SHARED_GROUP: Mutex<Option<Arc<Group>>> = Mutex::new(None);
 /// Creating and ending groups happens one at a time.
 static MEMBERSHIP: Mutex<()> = Mutex::new(());
+
+/// Not forwarded to the child process yet (isolation): reset does nothing there.
+unsafe extern "C" fn reset(_instance: *mut c_void) {}
 
 fn original() -> &'static PluginApi {
     ORIGINAL.get().expect("isolation client used before install")
@@ -75,6 +78,7 @@ pub fn install(api: &'static PluginApi) -> Option<&'static PluginApi> {
         save_state,
         load_state,
         get_extension,
+        reset,
     }))
 }
 
@@ -289,15 +293,90 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    fn new(latency: usize) -> Self {
+    /// `max_block` is the most samples one block brings. The FIFO holds at most `latency` samples
+    /// plus one block, so it is sized for that and never grows on the audio thread.
+    fn new(latency: usize, max_block: usize) -> Self {
         let fifo = (0..MAX_CHANNELS)
             .map(|_| {
-                let mut q = VecDeque::with_capacity(2 * latency + 1);
+                let mut q = VecDeque::with_capacity(latency + max_block + 1);
                 q.extend(std::iter::repeat_n(0.0, latency));
                 q
             })
             .collect();
         Self { latency, fifo, in_flight: None }
+    }
+}
+
+/// Checks (in debug builds) that `count` more samples fit in the FIFO without growing it.
+fn check_fifo_room(fifo: &VecDeque<f32>, count: usize) {
+    debug_assert!(fifo.len() + count <= fifo.capacity(), "pipeline FIFO would grow on the audio thread");
+}
+
+/// Where a block's output events go: the host's `out_events` (null: the host gave no room), and
+/// the `out_count` it reads back. Created per call, on the audio thread, without allocating.
+struct Outputs {
+    events: *mut Event,
+    capacity: usize,
+    count: usize,
+    host_count: *mut u32,
+}
+
+impl Outputs {
+    /// The host's output room for this block (none if the host's `ProcessData` predates it).
+    fn of(d: &crate::abi::ProcessData) -> Self {
+        let has_room = d.size as usize >= size_of::<crate::abi::ProcessData>() && !d.out_count.is_null();
+        let events = if has_room { d.out_events } else { std::ptr::null_mut() };
+        Self {
+            events,
+            capacity: if events.is_null() { 0 } else { d.out_capacity as usize },
+            count: 0,
+            host_count: if has_room { d.out_count } else { std::ptr::null_mut() },
+        }
+    }
+
+    /// Adds an event the host receives; without room it is dropped.
+    fn push(&mut self, event: Event) {
+        if self.count < self.capacity {
+            // SAFETY: `events` holds `capacity` events, the host's, for the length of this call.
+            unsafe { self.events.add(self.count).write(event) };
+            self.count += 1;
+        }
+    }
+
+    /// Drops what this block has produced so far (a block that timed out or lost its child gives none).
+    fn discard(&mut self) {
+        self.count = 0;
+    }
+
+    /// Tells the host how many events it got.
+    fn finish(self) {
+        if !self.host_count.is_null() {
+            // SAFETY: the host passed `out_count` for this call.
+            unsafe { *self.host_count = self.count as u32 };
+        }
+    }
+}
+
+/// Whether an event at `offset` belongs to the piece `first..end` of a block of `frames` samples:
+/// the events past the block's end belong to its last piece.
+fn in_piece(offset: u32, first: usize, end: usize, frames: usize) -> bool {
+    let offset = offset as usize;
+    offset >= first && (offset < end || end >= frames)
+}
+
+/// Moves the child's output events `src` (offsets from the start of a piece of `len` samples that
+/// begins at `start`) into `out`, with offsets from the block's start, below `limit`. `mirror`
+/// sees each event as it is passed on (the parameter changes update the mirror).
+fn relay_events(src: &[Event], start: usize, len: usize, limit: usize, out: &mut Outputs, mut mirror: impl FnMut(&Event)) {
+    if len == 0 {
+        return;
+    }
+    for event in src {
+        let mut event = *event;
+        let at = (start + (event.offset as usize).min(len - 1)).min(limit.saturating_sub(1));
+        event.offset = at as u32;
+        mirror(&event);
+        out.push(event);
     }
 }
 
@@ -316,6 +395,17 @@ struct Client {
     /// Touched by `activate` (main thread) and `process` (audio thread),
     /// which hosts never run at the same time.
     pipeline: UnsafeCell<Option<Pipeline>>,
+    /// The sidechain buffers the shim handed over for the next block (audio thread only).
+    sidechain: UnsafeCell<([*const f32; MAX_CHANNELS], usize)>,
+    /// The audio region, sized by `activate` (main thread) and read by `process`.
+    audio: UnsafeCell<Option<AudioRegion>>,
+    /// The most channels a block brought that the region had no room for;
+    /// the next activation makes room for them.
+    wanted_channels: AtomicU32,
+    /// The host renders offline (the render extension, see `remote_set_offline`).
+    offline: AtomicBool,
+    /// Set by `activate`, cleared when a block finishes: the first block may take longer.
+    first_block: AtomicBool,
 }
 
 // SAFETY: the shared region and handles are used under the protocol in shm.rs.
@@ -331,15 +421,39 @@ impl Client {
         self.ids.iter().position(|&i| i == id)
     }
 
-    /// Applies the block's parameter changes to the mirror (after the block,
-    /// so the child sees the old values until each change's offset).
-    fn mirror_events(&self, events: &[Event]) {
-        for event in events.iter().filter(|e| e.kind == EVENT_PARAM) {
+    /// Applies a parameter event to the mirror (other kinds are ignored).
+    fn mirror_event(&self, event: &Event) {
+        if event.kind == EVENT_PARAM {
             let param = unsafe { event.data.param };
             if let Some(i) = self.index(param.id) {
                 self.shared().params[i].store(param.normalized.to_bits(), SeqCst);
             }
         }
+    }
+
+    /// Applies the block's parameter changes to the mirror (after the block,
+    /// so the child sees the old values until each change's offset).
+    fn mirror_events(&self, events: &[Event]) {
+        for event in events {
+            self.mirror_event(event);
+        }
+    }
+
+    /// Applies the parameter changes of one piece of a block (see `run_block`).
+    fn mirror_piece(&self, events: &[Event], first: usize, end: usize, frames: usize) {
+        for event in events.iter().filter(|e| in_piece(e.offset, first, end, frames)) {
+            self.mirror_event(event);
+        }
+    }
+
+    /// Passes the child's output events for the piece `start..start + len` to the host, and
+    /// applies its parameter changes to the mirror (so the host's `get_param` and the next
+    /// block's sync see the plugin's own edits). Offsets are moved to the block and kept below
+    /// `limit`, the block's length.
+    fn relay_outputs(&self, out: &mut Outputs, start: usize, len: usize, limit: usize) {
+        let shared = self.shared();
+        let n = (shared.out_count as usize).min(MAX_OUT);
+        relay_events(&shared.out[..n], start, len, limit, out, |e| self.mirror_event(e));
     }
 
     /// Activates the child's instance now (it reports its latency), if this
@@ -357,57 +471,109 @@ impl Client {
         self.done.wait(Some(2000), None)
     }
 
+    /// How long to wait for the child's current block: longer offline, and for the first block
+    /// after an activation, than in real time (see `shm.rs`).
+    fn timeout_ms(&self) -> u32 {
+        if self.offline.load(SeqCst) {
+            OFFLINE_TIMEOUT_MS
+        } else if self.first_block.load(SeqCst) {
+            FIRST_BLOCK_TIMEOUT_MS
+        } else {
+            PROCESS_TIMEOUT_MS
+        }
+    }
+
     fn fail(&self) {
         // Hung or died mid-block: stop the process; the watcher starts a new one.
         self.alive.store(false, SeqCst);
         self.group.kill();
     }
 
-    /// Runs one block in the child and waits for it.
-    unsafe fn run_block(&self, channels: &[*mut f32], frames: usize, events: &[Event]) -> bool {
-        unsafe {
-            self.send_block(channels, frames, events);
-            let finished = self.done.wait(Some(PROCESS_TIMEOUT_MS), None);
+    /// Runs one block in the child and waits for it, in pieces when the
+    /// host sends more samples than it said it would (`max_block_size`).
+    ///
+    /// Each piece's input parameter changes are mirrored after the piece, and the plugin's own
+    /// output changes after those, so the mirror ends with the plugin's final values.
+    unsafe fn run_block(&self, audio: &AudioRegion, channels: &[*mut f32], frames: usize, events: &[Event], out: &mut Outputs) -> bool {
+        if frames == 0 {
             self.mirror_events(events);
-            if !finished {
-                self.fail();
-                return false;
-            }
-            for (ch, &dst) in channels.iter().enumerate() {
-                std::ptr::copy_nonoverlapping((*self.shared).audio[ch].as_ptr(), dst, frames);
-            }
-            (*self.shared).ok != 0
+            return true;
         }
+        let mut ok = true;
+        let mut start = 0;
+        while start < frames {
+            let len = (frames - start).min(audio.frames);
+            unsafe {
+                self.send_block(audio, channels, start, len, frames, events);
+                if !self.done.wait(Some(self.timeout_ms()), None) {
+                    self.mirror_events(events);
+                    out.discard();
+                    self.fail();
+                    return false;
+                }
+                self.first_block.store(false, SeqCst);
+                for (ch, &dst) in channels.iter().enumerate() {
+                    std::ptr::copy_nonoverlapping(audio.main(ch), dst.add(start), len);
+                }
+                ok &= (*self.shared).ok != 0;
+            }
+            self.mirror_piece(events, start, start + len, frames);
+            self.relay_outputs(out, start, len, frames);
+            start += len;
+        }
+        ok
     }
 
-    unsafe fn send_block(&self, channels: &[*mut f32], frames: usize, events: &[Event]) {
+    /// Sends samples `start..start + len` of a block of `frames` samples, and
+    /// the events in that range (with offsets from `start`).
+    unsafe fn send_block(&self, audio: &AudioRegion, channels: &[*mut f32], start: usize, len: usize, frames: usize, events: &[Event]) {
         let shared = self.shared;
         unsafe {
             for (ch, &src) in channels.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(src, (*shared).audio[ch].as_mut_ptr(), frames);
+                std::ptr::copy_nonoverlapping(src.add(start), audio.main(ch), len);
             }
-            let count = events.len().min(MAX_EVENTS);
-            std::ptr::copy_nonoverlapping(events.as_ptr(), (*shared).events.as_mut_ptr(), count);
-            (*shared).frames = frames as u32;
+            let (sc, sc_len) = &*self.sidechain.get();
+            let sc_len = (*sc_len).min(audio.channels);
+            for (ch, &src) in sc.iter().enumerate().take(sc_len) {
+                std::ptr::copy_nonoverlapping(src.add(start), audio.sidechain(ch), len);
+            }
+            (*shared).sc_channels = sc_len as u32;
+            let mut count = 0;
+            for e in events {
+                if in_piece(e.offset, start, start + len, frames) && count < MAX_EVENTS {
+                    let mut e = *e;
+                    e.offset = (e.offset - start as u32).min(len.saturating_sub(1) as u32);
+                    (*shared).events[count] = e;
+                    count += 1;
+                }
+            }
+            (*shared).frames = len as u32;
             (*shared).channels = channels.len() as u32;
             (*shared).num_events = count as u32;
             (*shared).ok = 0;
+            (*shared).out_count = 0;
         }
         self.request.set();
     }
 
     /// Pipeline mode: collects the previous block, starts this one, and
     /// outputs the samples that are `latency` old.
-    unsafe fn run_pipelined(&self, pipeline: &mut Pipeline, channels: &[*mut f32], frames: usize, events: &[Event]) -> bool {
+    unsafe fn run_pipelined(&self, audio: &AudioRegion, pipeline: &mut Pipeline, channels: &[*mut f32], frames: usize, events: &[Event], out: &mut Outputs) -> bool {
         if let Some((done_frames, done_channels)) = pipeline.in_flight.take() {
-            let finished = self.done.wait(Some(PROCESS_TIMEOUT_MS), None);
+            let finished = self.done.wait(Some(self.timeout_ms()), None);
             let ok = finished && unsafe { (*self.shared).ok } != 0;
             if !finished {
                 self.fail();
+            } else {
+                self.first_block.store(false, SeqCst);
+                // The previous block's outputs come out at the start of this one (their offsets
+                // are one block old, so they are placed at the start, within this block).
+                self.relay_outputs(out, 0, done_frames, frames);
             }
             for (ch, fifo) in pipeline.fifo.iter_mut().enumerate() {
+                check_fifo_room(fifo, done_frames);
                 if ok && ch < done_channels {
-                    fifo.extend(&self.shared().audio[ch][..done_frames]);
+                    fifo.extend(unsafe { std::slice::from_raw_parts(audio.main(ch), done_frames) });
                 } else {
                     fifo.extend(std::iter::repeat_n(0.0, done_frames));
                 }
@@ -416,10 +582,11 @@ impl Client {
         // After a failure, fill in silence so the delay stays the same.
         for fifo in &mut pipeline.fifo {
             let missing = frames.saturating_sub(fifo.len());
+            check_fifo_room(fifo, missing);
             fifo.extend(std::iter::repeat_n(0.0, missing));
         }
-        if self.alive.load(SeqCst) && frames <= pipeline.latency {
-            unsafe { self.send_block(channels, frames, events) };
+        if self.alive.load(SeqCst) && frames <= pipeline.latency.min(audio.frames) {
+            unsafe { self.send_block(audio, channels, 0, frames, frames, events) };
             pipeline.in_flight = Some((frames, channels.len()));
         }
         self.mirror_events(events);
@@ -501,6 +668,11 @@ unsafe extern "C" fn create() -> *mut c_void {
             shadow,
             ids,
             pipeline: UnsafeCell::new(None),
+            sidechain: UnsafeCell::new(([std::ptr::null(); MAX_CHANNELS], 0)),
+            audio: UnsafeCell::new(None),
+            wanted_channels: AtomicU32::new(0),
+            offline: AtomicBool::new(false),
+            first_block: AtomicBool::new(false),
         });
         group.add(&client);
         Arc::into_raw(client) as *mut c_void
@@ -561,43 +733,67 @@ unsafe extern "C" fn activate(ptr: *mut c_void, sample_rate: f64, max_block_size
     if let Some(pipeline) = unsafe { &mut *client.pipeline.get() }
         && pipeline.in_flight.take().is_some()
     {
-        client.done.wait(Some(PROCESS_TIMEOUT_MS), None);
+        client.done.wait(Some(client.timeout_ms()), None);
+    }
+    // Room for the main bus's channels (and as many sidechain channels) and
+    // the largest block: a new region only when the old one is too small.
+    let frames = (max_block_size as usize).clamp(1, MAX_FRAMES);
+    let channels = (shared.layout_len as usize).max(client.wanted_channels.load(SeqCst) as usize).clamp(2, MAX_CHANNELS);
+    let audio = unsafe { &mut *client.audio.get() };
+    if audio.as_ref().is_none_or(|a| a.frames < frames || a.channels < channels) {
+        let generation = shared.audio_generation.load(SeqCst).wrapping_add(1);
+        *audio = Memory::create(&audio_name(&client.id, generation), audio_len(frames, channels))
+            .map(|memory| AudioRegion { memory, frames, channels });
+        if let Some(a) = audio.as_ref() {
+            shared.audio_frames.store(a.frames as u32, SeqCst);
+            shared.audio_channels.store(a.channels as u32, SeqCst);
+            shared.audio_generation.store(generation, SeqCst);
+        } else {
+            log(&format!("{}: cannot make room for audio", client.id));
+        }
     }
     shared.sample_rate.store(sample_rate.to_bits(), SeqCst);
     shared.max_block.store(max_block_size, SeqCst);
     shared.setup_generation.fetch_add(1, SeqCst);
     let pipelined = options() & super::PIPELINE != 0;
-    unsafe { *client.pipeline.get() = pipelined.then(|| Pipeline::new((max_block_size as usize).min(MAX_FRAMES))) };
+    let block = (max_block_size as usize).min(MAX_FRAMES);
+    unsafe { *client.pipeline.get() = pipelined.then(|| Pipeline::new(block, block)) };
+    client.first_block.store(true, SeqCst);
     // Activate the child now, so its latency is known when the host asks.
     client.reactivate();
     true
 }
 
-unsafe extern "C" fn process(
-    ptr: *mut c_void,
-    channels: *const *mut f32,
-    num_channels: u32,
-    frames: u32,
-    events: *const Event,
-    num_events: u32,
-    _executor: *const Executor,
-) -> bool {
+unsafe extern "C" fn process(ptr: *mut c_void, data: *const crate::abi::ProcessData) -> bool {
+    let Some(d) = (unsafe { data.as_ref() }).filter(|d| d.size as usize >= std::mem::offset_of!(crate::abi::ProcessData, out_events)) else { return false };
+    let mut out = Outputs::of(d);
+    let ok = unsafe { process_into(ptr, d, &mut out) };
+    out.finish();
+    ok
+}
+
+/// `process`, with the block's output events collected into `out`.
+unsafe fn process_into(ptr: *mut c_void, d: &crate::abi::ProcessData, out: &mut Outputs) -> bool {
+    let (channels, num_channels, frames, events, num_events) = (d.channels, d.num_channels, d.frames, d.events, d.num_events);
     let client = unsafe { client(ptr) };
     let events: &[Event] = if events.is_null() || num_events == 0 { &[] } else { unsafe { std::slice::from_raw_parts(events, num_events as usize) } };
     let (n, frames) = (num_channels as usize, frames as usize);
-    if n > MAX_CHANNELS || frames > MAX_FRAMES || (n > 0 && channels.is_null()) {
+    let audio = unsafe { &*client.audio.get() };
+    let Some(audio) = audio.as_ref().filter(|a| n <= a.channels && !(n > 0 && channels.is_null())) else {
+        // No room for this many channels until the next activation: the shim outputs silence.
+        client.wanted_channels.fetch_max(n.min(MAX_CHANNELS) as u32, SeqCst);
         client.mirror_events(events);
-        return false; // the shim outputs silence
-    }
+        return false;
+    };
     let channels = if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(channels, n) } };
     if let Some(pipeline) = unsafe { &mut *client.pipeline.get() } {
-        return unsafe { client.run_pipelined(pipeline, channels, frames, events) };
+        return unsafe { client.run_pipelined(audio, pipeline, channels, frames, events, out) };
     }
     if !client.alive.load(SeqCst) {
         client.mirror_events(events);
         return false;
     }
-    unsafe { client.run_block(channels, frames, events) }
+    unsafe { client.run_block(audio, channels, frames, events, out) }
 }
 
 /// Copies the mirrored parameters into the shadow instance.
@@ -634,6 +830,53 @@ unsafe extern "C" fn latency(ptr: *mut c_void) -> u32 {
 
 static LATENCY: LatencyApi = LatencyApi { get: latency };
 
+unsafe extern "C" fn remote_set_transport(ptr: *mut c_void, transport: *const crate::transport::TransportC) {
+    let client = unsafe { client(ptr) };
+    unsafe { (*client.shared).transport = transport.as_ref().copied().unwrap_or_default() };
+}
+
+unsafe extern "C" fn remote_set_sidechain(ptr: *mut c_void, channels: *const *const f32, n: u32) {
+    let client = unsafe { client(ptr) };
+    let slot = unsafe { &mut *client.sidechain.get() };
+    slot.1 = 0;
+    if channels.is_null() {
+        return;
+    }
+    for i in 0..(n as usize).min(MAX_CHANNELS) {
+        let p = unsafe { *channels.add(i) };
+        if p.is_null() {
+            slot.1 = 0;
+            return;
+        }
+        slot.0[i] = p;
+        slot.1 = i + 1;
+    }
+}
+
+unsafe extern "C" fn remote_set_layout(ptr: *mut c_void, speakers: *const u32, n: u32) {
+    let client = unsafe { client(ptr) };
+    let n = if speakers.is_null() { 0 } else { (n as usize).min(MAX_CHANNELS) };
+    unsafe {
+        (*client.shared).layout_len = n as u32;
+        for i in 0..n {
+            (*client.shared).layout[i] = *speakers.add(i);
+        }
+    }
+}
+
+unsafe extern "C" fn remote_take_requests(ptr: *mut c_void) -> u32 {
+    unsafe { client(ptr) }.shared().requests.swap(0, SeqCst)
+}
+
+unsafe extern "C" fn remote_pending(ptr: *mut c_void) -> bool {
+    unsafe { client(ptr) }.shared().requests.load(SeqCst) != 0
+}
+
+static REMOTE_TRANSPORT: crate::abi::TransportApi = crate::abi::TransportApi { set: remote_set_transport };
+static REMOTE_SIDECHAIN: crate::abi::SidechainApi = crate::abi::SidechainApi { set: remote_set_sidechain };
+static REMOTE_LAYOUT: crate::abi::LayoutApi = crate::abi::LayoutApi { set: remote_set_layout };
+static REMOTE_MAIN: crate::abi::MainApi = crate::abi::MainApi { take_requests: remote_take_requests, pending: remote_pending };
+
 /// The plugin's editor opens in a separate process too (not the audio
 /// process: an editor crash does not interrupt the sound). Its size is kept
 /// by the shadow instance, which saves the state.
@@ -649,14 +892,45 @@ unsafe extern "C" fn get_extension(id: *const c_char) -> *const c_void {
     if inner.is_null() {
         return inner;
     }
+    // Transport, sidechain, speaker layout and main-thread requests cross to the child through shared memory.
+    if name == crate::abi::EXT_TRANSPORT {
+        return &REMOTE_TRANSPORT as *const crate::abi::TransportApi as *const c_void;
+    }
+    if name == crate::abi::EXT_SIDECHAIN {
+        return &REMOTE_SIDECHAIN as *const crate::abi::SidechainApi as *const c_void;
+    }
+    if name == crate::abi::EXT_LAYOUT {
+        return &REMOTE_LAYOUT as *const crate::abi::LayoutApi as *const c_void;
+    }
+    if name == crate::abi::EXT_MAIN {
+        return &REMOTE_MAIN as *const crate::abi::MainApi as *const c_void;
+    }
     if name == crate::abi::EXT_VIEW {
         return super::editor(unsafe { &*(inner as *const crate::abi::ViewApi) }, true);
     }
     if name == crate::abi::EXT_EDITOR_SIZE {
         return &SHADOW_EDITOR_SIZE as *const crate::abi::EditorSizeApi as *const c_void;
     }
+    if name == crate::abi::EXT_RENDER {
+        return &REMOTE_RENDER as *const crate::abi::RenderApi as *const c_void;
+    }
     std::ptr::null()
 }
+
+/// The host renders offline: the client keeps the flag (for the longer block timeout), tells the
+/// child through shared memory (the child passes it on before its next block, see `server.rs`)
+/// and tells the shadow instance.
+unsafe extern "C" fn remote_set_offline(ptr: *mut c_void, offline: bool) {
+    let client = unsafe { client(ptr) };
+    client.offline.store(offline, SeqCst);
+    client.shared().offline.store(offline as u32, SeqCst);
+    let inner = unsafe { (original().get_extension)(crate::abi::EXT_RENDER.as_ptr()) } as *const crate::abi::RenderApi;
+    if let Some(inner) = unsafe { inner.as_ref() } {
+        unsafe { (inner.set_offline)(client.shadow, offline) };
+    }
+}
+
+static REMOTE_RENDER: crate::abi::RenderApi = crate::abi::RenderApi { set_offline: remote_set_offline };
 
 fn editor_size() -> Option<&'static crate::abi::EditorSizeApi> {
     let ext = unsafe { (original().get_extension)(crate::abi::EXT_EDITOR_SIZE.as_ptr()) };
@@ -675,3 +949,94 @@ unsafe extern "C" fn shadow_set_editor_size(ptr: *mut c_void, width: u32, height
 
 static SHADOW_EDITOR_SIZE: crate::abi::EditorSizeApi =
     crate::abi::EditorSizeApi { get: shadow_get_editor_size, set: shadow_set_editor_size };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host buffer of `capacity` events and the `Outputs` that writes into it.
+    fn room(buf: &mut [Event], count: &mut u32) -> Outputs {
+        Outputs { events: buf.as_mut_ptr(), capacity: buf.len(), count: 0, host_count: count }
+    }
+
+    /// The child's output events of a piece are moved to the block: offsets from the piece's
+    /// start, every parameter change reaches the mirror, and the host gets the count.
+    #[test]
+    fn a_pieces_outputs_reach_the_host_with_block_offsets() {
+        let src = [Event::param(3, 7, 0.5), Event::midi(10, 0x90, 1, 60, 100), Event::param(900, 8, 0.25)];
+        let mut buf = vec![Event::param(0, 0, 0.0); 8];
+        let mut count = 0;
+        let mut out = room(&mut buf, &mut count);
+        let mut mirrored = Vec::new();
+        // The piece is 64 samples long and starts at sample 128 of a 256-sample block.
+        relay_events(&src, 128, 64, 256, &mut out, |e| mirrored.push((e.kind, e.offset)));
+        out.finish();
+        assert_eq!(count, 3);
+        assert_eq!(buf[0].offset, 131);
+        assert_eq!(buf[1].offset, 138);
+        // An offset past the piece is kept inside it.
+        assert_eq!(buf[2].offset, 191);
+        let p = unsafe { buf[0].data.param };
+        assert_eq!((p.id, p.normalized), (7, 0.5));
+        assert_eq!(mirrored, vec![(EVENT_PARAM, 131), (crate::abi::EVENT_MIDI, 138), (EVENT_PARAM, 191)]);
+    }
+
+    /// The host's room is respected: events beyond the capacity are dropped.
+    #[test]
+    fn outputs_stop_at_the_hosts_capacity() {
+        let src = [Event::param(0, 1, 0.0), Event::param(1, 2, 0.0), Event::param(2, 3, 0.0)];
+        let mut buf = vec![Event::param(0, 0, 0.0); 2];
+        let mut count = 0;
+        let mut out = room(&mut buf, &mut count);
+        relay_events(&src, 0, 16, 16, &mut out, |_| {});
+        out.finish();
+        assert_eq!(count, 2);
+    }
+
+    /// A host with no output buffer gets a count of 0; the mirror still follows the plugin.
+    #[test]
+    fn a_host_without_room_gets_no_events() {
+        let mut count = 99;
+        let mut out = Outputs { events: std::ptr::null_mut(), capacity: 0, count: 0, host_count: &mut count };
+        let mut mirrored = 0;
+        relay_events(&[Event::param(0, 1, 0.0)], 0, 8, 8, &mut out, |_| mirrored += 1);
+        out.finish();
+        assert_eq!((count, mirrored), (0, 1));
+    }
+
+    /// A block that timed out gives no outputs, even when earlier pieces produced some.
+    #[test]
+    fn discarding_drops_the_block_so_far() {
+        let mut buf = vec![Event::param(0, 0, 0.0); 4];
+        let mut count = 0;
+        let mut out = room(&mut buf, &mut count);
+        relay_events(&[Event::param(0, 1, 0.0)], 0, 8, 16, &mut out, |_| {});
+        out.discard();
+        out.finish();
+        assert_eq!(count, 0);
+    }
+
+    /// The last piece takes the events past the block's end; the others do not.
+    #[test]
+    fn events_past_the_end_belong_to_the_last_piece() {
+        assert!(in_piece(10, 0, 16, 64));
+        assert!(!in_piece(20, 0, 16, 64), "the first piece ends at 16");
+        assert!(in_piece(20, 16, 32, 64));
+        assert!(in_piece(70, 48, 64, 64), "past the block: the last piece");
+        assert!(!in_piece(70, 0, 16, 64));
+    }
+
+    /// A host that passes `out_count` but no `out_events` gets a count of 0 and no events.
+    #[test]
+    fn a_host_with_no_event_buffer_gets_count_zero() {
+        let mut d = crate::abi::ProcessData::new(std::ptr::null(), 0, 0, std::ptr::null(), 0, std::ptr::null());
+        let mut count = 5u32;
+        d.out_count = &mut count;
+        d.out_events = std::ptr::null_mut();
+        let out = Outputs::of(&d);
+        assert!(out.events.is_null());
+        assert_eq!(out.capacity, 0);
+        out.finish();
+        assert_eq!(count, 0);
+    }
+}

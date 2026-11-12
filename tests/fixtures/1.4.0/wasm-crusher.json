@@ -1,0 +1,12 @@
+{
+  "plugin": "dev.ferritron.examples.wasm-crusher",
+  "ferritron": "1.4.0",
+  "class_id": "41562c5c574bcfd89c5c8c91f744e84a",
+  "params": [
+    {"index": 0, "id": 235936386, "name": "Bits", "flags": 0, "default": 0.2857142857142857, "value": 0.20999999999999996},
+    {"index": 1, "id": 1392419334, "name": "Crash", "flags": 0, "default": 0, "value": 1},
+    {"index": 2, "id": 1512533813, "name": "Hang", "flags": 0, "default": 0, "value": 1},
+    {"index": 3, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 0}
+  ],
+  "state": "4652544e0100000006000000821a100ec2f5285c8fc2134006a2fe52000000000000f03f356f275a000000000000f03f000000400000000000000000030000400000c0724910ee41040000400000006841dd9541"
+}

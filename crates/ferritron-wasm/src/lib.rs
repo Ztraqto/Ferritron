@@ -17,7 +17,7 @@
 //! ```
 
 use std::ffi::{c_char, c_void};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use wasmtime::{Config, Engine, Instance as WasmInstance, Linker, Memory, Module, Store, TypedFunc, Val};
@@ -30,7 +30,11 @@ const TICK_MS: u64 = 10;
 /// Most channels and events per block passed to the guest.
 const MAX_CHANNELS: usize = 8;
 const MAX_EVENTS: usize = 1024;
+/// Most events the guest may write in one block (the same as the VST3 and CLAP shims).
+const MAX_OUT: usize = 256;
 const EVENT_SIZE: usize = 24;
+// The guest's `ferritron_event` (wasm32) has the host's layout, so its bytes are copied as they are.
+const _: () = assert!(size_of::<ferritron_core::abi::Event>() == EVENT_SIZE);
 
 mod c {
     //! The host side of ferritron_abi.h (64-bit layouts).
@@ -49,6 +53,14 @@ mod c {
         pub kind: u32,
         pub class_id: [u8; 16],
         pub isolation: u32,
+        /// Added in 1.3.1 (`ferritron_plugin_info`): the shims read them.
+        pub vst3_subcategories: Str,
+        pub clap_features: Str,
+        pub audio_flags: u32,
+        pub min_channels: u32,
+        pub max_channels: u32,
+        pub sidechain_channels: u32,
+        pub vst2_id: u32,
     }
 
     #[repr(C)]
@@ -77,10 +89,13 @@ mod c {
         pub format_param: unsafe extern "C" fn(u32, f64, *mut u8, u32) -> i32,
         pub parse_param: unsafe extern "C" fn(u32, Str, *mut f64) -> bool,
         pub activate: unsafe extern "C" fn(*mut c_void, f64, u32) -> bool,
-        pub process: unsafe extern "C" fn(*mut c_void, *const *mut f32, u32, u32, *const u8, u32, *const c_void) -> bool,
+        /// C ABI v2: one `ferritron_process_data` per call.
+        pub process: unsafe extern "C" fn(*mut c_void, *const ferritron_core::abi::ProcessData) -> bool,
         pub save_state: unsafe extern "C" fn(*mut c_void, *mut u8, u32) -> u32,
         pub load_state: unsafe extern "C" fn(*mut c_void, *const u8, u32) -> bool,
         pub get_extension: unsafe extern "C" fn(*const std::ffi::c_char) -> *const c_void,
+        /// The last field of `ferritron_plugin_api`: the VST3 shim rejects a table that is shorter.
+        pub reset: unsafe extern "C" fn(*mut c_void),
     }
 
     #[repr(C)]
@@ -94,8 +109,14 @@ mod c {
     }
 }
 
-/// instance, channels, channel count, frames, events, event count, executor.
-type ProcessArgs = (u32, u32, u32, u32, u32, u32, u32);
+/// instance, address of a `ferritron_process_data` in the guest's memory (C ABI v2).
+type ProcessArgs = (u32, u32);
+
+/// The C ABI version guests are built for (`FERRITRON_ABI_VERSION`).
+const GUEST_ABI_VERSION: u32 = 2;
+/// `ferritron_process_data` with wasm32 pointers: size, frames, num_channels, num_events,
+/// channels, events, executor, out_events, out_capacity, out_count (4 bytes each).
+const GUEST_PROCESS_DATA_SIZE: usize = 40;
 
 /// The guest's functions, typed (wasm32 C ABI: pointers are u32).
 struct Guest {
@@ -105,6 +126,7 @@ struct Guest {
     alloc: TypedFunc<u32, u32>,
     create: TypedFunc<(), u32>,
     destroy: TypedFunc<u32, ()>,
+    reset: TypedFunc<u32, ()>,
     get_param: TypedFunc<(u32, u32), f64>,
     set_param: TypedFunc<(u32, u32, f64), u32>,
     to_plain: TypedFunc<(u32, f64), f64>,
@@ -127,6 +149,9 @@ struct Sandbox {
     guest: Guest,
     /// Guest memory for blocks and strings, allocated once.
     scratch: u32,
+    /// Guest memory for the events the guest writes (`MAX_OUT` of `EVENT_SIZE` bytes, 8-aligned),
+    /// followed by the `u32` count it sets. Allocated once, at load time.
+    out: u32,
 }
 
 const SCRATCH: usize = 64 * 1024;
@@ -142,7 +167,10 @@ impl Sandbox {
         }
         let guest = Guest::bind(&mut store, &instance)?;
         let scratch = guest.alloc.call(&mut store, SCRATCH as u32).map_err(|e| e.to_string())?;
-        Ok(Self { store, guest, scratch })
+        // Room for the 8-byte alignment as well.
+        let base = guest.alloc.call(&mut store, (MAX_OUT * EVENT_SIZE + 4 + 8) as u32).map_err(|e| e.to_string())?;
+        let out = base.next_multiple_of(8);
+        Ok(Self { store, guest, scratch, out })
     }
 
     /// Runs a guest call with a fresh time limit.
@@ -190,7 +218,7 @@ impl Guest {
             let d = memory.data(store);
             d.get(at as usize..at as usize + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
         };
-        if read_u32(store, api + 4) != 1 {
+        if read_u32(store, api + 4) != GUEST_ABI_VERSION {
             return Err("the guest was built for another Ferritron ABI version".into());
         }
         // Function pointers in wasm32 are indices into the function table.
@@ -230,6 +258,7 @@ impl Guest {
             alloc,
             create: typed!(12),
             destroy: typed!(16),
+            reset: typed!(72),
             param_count: typed!(20),
             param_info: typed!(24),
             get_param: typed!(28),
@@ -258,6 +287,8 @@ struct Plugin {
     /// moves into a static after loading).
     _info: Box<c::Info>,
     params: Vec<c::ParamInfo>,
+    /// (parameter ID, position in `params`), sorted by ID: found by binary search on the audio thread.
+    index: Vec<(u32, usize)>,
     api: c::Api,
 }
 
@@ -342,7 +373,7 @@ fn compile(wasm: &[u8]) -> Result<Module, String> {
     let bytes = wasm.to_vec();
     let module = std::thread::Builder::new()
         .stack_size(16 << 20)
-        .spawn(move || Module::new(engine(), &bytes).map_err(|e| format!("invalid guest module: {e}")))
+        .spawn(move || Module::new(engine(), &bytes).map_err(|e| format!("invalid guest module: {e:?}")))
         .map_err(|e| e.to_string())?
         .join()
         .map_err(|_| "compiling the guest module failed".to_string())??;
@@ -371,6 +402,15 @@ fn load(wasm: &[u8]) -> Result<Plugin, String> {
         kind: meta.u32_at(info_at + 48),
         class_id: meta.read(info_at + 52, 16).try_into().map_err(|_| "cannot read the class id")?,
         isolation: 0,
+        // wasm32 layout after `isolation` (68): two strings at 72 and 80, then five u32 from 88.
+        vst3_subcategories: leak(meta.string_at(info_at + 72)),
+        clap_features: leak(meta.string_at(info_at + 80)),
+        // The sandbox offers no sidechain extension; MIDI input and the other flags pass on.
+        audio_flags: meta.u32_at(info_at + 88) & !ferritron_core::abi::AUDIO_SIDECHAIN,
+        min_channels: meta.u32_at(info_at + 92).clamp(1, MAX_CHANNELS as u32),
+        max_channels: meta.u32_at(info_at + 96).clamp(1, MAX_CHANNELS as u32),
+        sidechain_channels: 0,
+        vst2_id: meta.u32_at(info_at + 104),
     });
     for (i, s) in info.strings.iter_mut().enumerate() {
         *s = leak(meta.string_at(info_at + 8 * i as u32));
@@ -392,15 +432,18 @@ fn load(wasm: &[u8]) -> Result<Plugin, String> {
         });
     }
     let info_ptr: *const c::Info = &*info;
+    let mut index: Vec<(u32, usize)> = params.iter().enumerate().map(|(k, p)| (p.id, k)).collect();
+    index.sort_unstable();
     Ok(Plugin {
         module,
         linker,
         meta: Mutex::new(meta),
         _info: info,
         params,
+        index,
         api: c::Api {
             struct_size: size_of::<c::Api>() as u32,
-            abi_version: 1,
+            abi_version: ferritron_core::abi::ABI_VERSION,
             info: info_ptr,
             create: host::create,
             destroy: host::destroy,
@@ -417,6 +460,7 @@ fn load(wasm: &[u8]) -> Result<Plugin, String> {
             save_state: host::save_state,
             load_state: host::load_state,
             get_extension: host::get_extension,
+            reset: host::reset,
         },
     })
 }
@@ -483,12 +527,27 @@ fn ticker_stop() {
     }
 }
 
-/// A plugin instance: its own sandbox, so instances cannot touch each other.
-struct Instance {
+/// What calls into the guest need: its sandbox and the guest's state. Behind the instance's
+/// mutex, so the guest runs on one thread at a time.
+struct Live {
     sandbox: Sandbox,
     core: u32,
     failed: bool,
     latency: u32,
+}
+
+/// A plugin instance: its own sandbox, so instances cannot touch each other.
+///
+/// The guest is called under `live`. Parameter values are kept beside it: `set_param` and
+/// `get_param` (any thread, e.g. the editor) only touch `values`, and an edit reaches the guest
+/// at the start of the next block (`dirty`). So a host thread never calls into the guest while
+/// the audio thread does (D1).
+struct Instance {
+    live: std::sync::Mutex<Live>,
+    /// Normalized values in the order of `Plugin::params`, as `f64` bits.
+    values: Box<[AtomicU64]>,
+    /// Set when `values[i]` was changed and has not reached the guest yet.
+    dirty: Box<[AtomicBool]>,
 }
 
 mod host {
@@ -499,22 +558,120 @@ mod host {
         PLUGIN.get().and_then(Option::as_ref).expect("table handed out only after loading")
     }
 
-    unsafe fn instance<'a>(p: *mut c_void) -> &'a mut Instance {
-        unsafe { &mut *(p as *mut Instance) }
+    unsafe fn instance<'a>(p: *mut c_void) -> &'a Instance {
+        unsafe { &*(p as *const Instance) }
+    }
+
+    /// The guest, locked (host threads other than the audio thread wait for it).
+    fn lock_live(i: &Instance) -> std::sync::MutexGuard<'_, Live> {
+        i.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The position of parameter `id` in `Plugin::params` (and in `Instance::values`).
+    fn index_of(id: u32) -> Option<usize> {
+        let index = &plugin().index;
+        index.binary_search_by_key(&id, |&(id, _)| id).ok().map(|at| index[at].1)
+    }
+
+    /// Copies every parameter's value from the guest into `values`. A value the guest does not
+    /// give back is left as it is. The caller holds the guest.
+    fn refresh(i: &Instance, live: &mut Live) {
+        let core = live.core;
+        for (k, param) in plugin().params.iter().enumerate() {
+            if let Some(value) = live.sandbox.call(|s, g| g.get_param.call(s, (core, param.id))) {
+                i.values[k].store(value.to_bits(), Ordering::Release);
+            }
+        }
+    }
+
+    /// Sends the edits still waiting in `values` (`dirty`) to the guest. The caller holds the guest.
+    fn flush_dirty(i: &Instance, live: &mut Live) {
+        let core = live.core;
+        for (k, param) in plugin().params.iter().enumerate() {
+            if i.dirty[k].swap(false, Ordering::AcqRel) {
+                let value = f64::from_bits(i.values[k].load(Ordering::Acquire));
+                live.sandbox.call(|s, g| g.set_param.call(s, (core, param.id, value)));
+            }
+        }
+    }
+
+    /// Writes the parameter changes among the block's events (`raw`, `EVENT_SIZE` bytes each)
+    /// into `values`. With `pending`, they are also marked dirty: they reach the guest at the
+    /// next block (used when this block is silent and the guest does not get them now).
+    fn record_params(i: &Instance, raw: &[u8], pending: bool) {
+        for event in raw.chunks_exact(EVENT_SIZE) {
+            let kind = u32::from_ne_bytes(event[4..8].try_into().unwrap());
+            if kind != ferritron_core::abi::EVENT_PARAM {
+                continue;
+            }
+            let id = u32::from_ne_bytes(event[8..12].try_into().unwrap());
+            let value = f64::from_ne_bytes(event[16..24].try_into().unwrap());
+            if let Some(k) = index_of(id) {
+                i.values[k].store(value.to_bits(), Ordering::Release);
+                if pending {
+                    i.dirty[k].store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Hands the events the guest wrote in this block to the host. `memory` is the guest's memory,
+    /// `out` the start of the output area (`Sandbox::out`). Up to the host's room, the events go
+    /// into `d.out_events` and `*d.out_count` gets their number. Parameter changes also reach
+    /// `values`, whether or not the host has room, except where an edit is still waiting for the
+    /// guest (`dirty`): that edit is the newer one. Reads and copies only: no allocation.
+    fn pass_out_events(i: &Instance, memory: &[u8], out: u32, d: &ferritron_core::abi::ProcessData) {
+        // Fields beyond the caller's `size` are not there: read `out_capacity` and `out_count` only when they are.
+        let full = d.size as usize >= size_of::<ferritron_core::abi::ProcessData>();
+        let host_count = if full { d.out_count } else { std::ptr::null_mut() };
+        let room = if full && !host_count.is_null() && !d.out_events.is_null() { d.out_capacity as usize } else { 0 };
+        let word = |at: usize| memory.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        let count = (word(out as usize + MAX_OUT * EVENT_SIZE) as usize).min(MAX_OUT);
+        let mut copied = 0usize;
+        for k in 0..count {
+            let at = out as usize + k * EVENT_SIZE;
+            let Some(event) = memory.get(at..at + EVENT_SIZE) else { break };
+            if u32::from_le_bytes(event[4..8].try_into().unwrap()) == ferritron_core::abi::EVENT_PARAM {
+                let id = u32::from_le_bytes(event[8..12].try_into().unwrap());
+                let normalized = f64::from_le_bytes(event[16..24].try_into().unwrap());
+                if let Some(p) = index_of(id).filter(|&p| !i.dirty[p].load(Ordering::Acquire)) {
+                    i.values[p].store(normalized.to_bits(), Ordering::Release);
+                }
+            }
+            if copied < room {
+                // SAFETY: `copied < room` is within the host's capacity; the layouts match (see the assert above).
+                unsafe { std::ptr::copy_nonoverlapping(event.as_ptr(), (d.out_events as *mut u8).add(copied * EVENT_SIZE), EVENT_SIZE) };
+                copied += 1;
+            }
+        }
+        if !host_count.is_null() {
+            // SAFETY: non-null, and within the caller's struct (`full`).
+            unsafe { *host_count = copied as u32 };
+        }
     }
 
     pub unsafe extern "C" fn create() -> *mut c_void {
         let p = plugin();
         let Ok(mut sandbox) = Sandbox::new(&p.module, &p.linker) else { return std::ptr::null_mut() };
         let Some(core) = sandbox.call(|s, g| g.create.call(s, ())).filter(|&c| c != 0) else { return std::ptr::null_mut() };
+        let count = p.params.len();
+        let instance = Instance {
+            live: std::sync::Mutex::new(Live { sandbox, core, failed: false, latency: 0 }),
+            values: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            dirty: (0..count).map(|_| AtomicBool::new(false)).collect(),
+        };
+        refresh(&instance, &mut lock_live(&instance));
         ticker_start();
-        Box::into_raw(Box::new(Instance { sandbox, core, failed: false, latency: 0 })) as *mut c_void
+        Box::into_raw(Box::new(instance)) as *mut c_void
     }
 
     pub unsafe extern "C" fn destroy(p: *mut c_void) {
-        let mut instance = unsafe { Box::from_raw(p as *mut Instance) };
-        let core = instance.core;
-        instance.sandbox.call(|s, g| g.destroy.call(s, core));
+        let instance = unsafe { Box::from_raw(p as *mut Instance) };
+        {
+            let mut live = lock_live(&instance);
+            let core = live.core;
+            live.sandbox.call(|s, g| g.destroy.call(s, core));
+        }
         drop(instance);
         ticker_stop();
     }
@@ -534,16 +691,20 @@ mod host {
         true
     }
 
+    /// Reads the host's copy: the guest is not called (it may be busy in the audio thread).
     pub unsafe extern "C" fn get_param(p: *mut c_void, id: u32) -> f64 {
         let i = unsafe { instance(p) };
-        let core = i.core;
-        i.sandbox.call(|s, g| g.get_param.call(s, (core, id))).unwrap_or(0.0)
+        index_of(id).map_or(0.0, |k| f64::from_bits(i.values[k].load(Ordering::Acquire)))
     }
 
+    /// Stores the value and marks it; the guest gets it before the next block (its answer is not
+    /// checked). Returns false for a parameter the plugin does not have.
     pub unsafe extern "C" fn set_param(p: *mut c_void, id: u32, value: f64) -> bool {
         let i = unsafe { instance(p) };
-        let core = i.core;
-        i.sandbox.call(|s, g| g.set_param.call(s, (core, id, value))).is_some_and(|ok| ok != 0)
+        let Some(k) = index_of(id) else { return false };
+        i.values[k].store(value.to_bits(), Ordering::Release);
+        i.dirty[k].store(true, Ordering::Release);
+        true
     }
 
     fn meta() -> std::sync::MutexGuard<'static, Sandbox> {
@@ -599,93 +760,163 @@ mod host {
         true
     }
 
+    pub unsafe extern "C" fn reset(p: *mut c_void) {
+        let i = unsafe { instance(p) };
+        let mut live = lock_live(i);
+        let core = live.core;
+        if live.sandbox.call(|s, g| g.reset.call(s, core)).is_none() {
+            live.failed = true;
+        }
+    }
+
     pub unsafe extern "C" fn activate(p: *mut c_void, rate: f64, max_block: u32) -> bool {
         let i = unsafe { instance(p) };
-        let core = i.core;
-        let ok = i.sandbox.call(|s, g| g.activate.call(s, (core, rate, max_block))).is_some_and(|ok| ok != 0);
-        i.latency = match &i.sandbox.guest.latency {
-            Some(latency) => {
-                let f = latency.clone();
-                i.sandbox.call(|s, _| f.call(s, core)).unwrap_or(0)
-            }
+        let mut live = lock_live(i);
+        flush_dirty(i, &mut live);
+        let core = live.core;
+        let ok = live.sandbox.call(|s, g| g.activate.call(s, (core, rate, max_block))).is_some_and(|ok| ok != 0);
+        let latency = live.sandbox.guest.latency.clone();
+        let latency = match latency {
+            Some(f) => live.sandbox.call(|s, _| f.call(s, core)).unwrap_or(0),
             None => 0,
         };
-        i.failed = !ok;
+        live.latency = latency;
+        live.failed = !ok;
+        refresh(i, &mut live);
         ok
     }
 
-    pub unsafe extern "C" fn process(
-        p: *mut c_void,
-        channels: *const *mut f32,
-        num_channels: u32,
-        frames: u32,
-        events: *const u8,
-        num_events: u32,
-        _executor: *const c_void,
-    ) -> bool {
+    pub unsafe extern "C" fn process(p: *mut c_void, data: *const ferritron_core::abi::ProcessData) -> bool {
+        let Some(d) = (unsafe { data.as_ref() }).filter(|d| d.size as usize >= std::mem::offset_of!(ferritron_core::abi::ProcessData, out_events))
+        else {
+            return false;
+        };
+        // The count stays 0 unless the guest's events are handed over below.
+        if d.size as usize >= size_of::<ferritron_core::abi::ProcessData>() && !d.out_count.is_null() {
+            unsafe { *d.out_count = 0 };
+        }
+        let (channels, num_channels, frames) = (d.channels, d.num_channels, d.frames);
+        let (events, num_events) = (d.events as *const u8, d.num_events);
+        if num_channels > 0 && channels.is_null() || num_events > 0 && events.is_null() {
+            return false;
+        }
         let i = unsafe { instance(p) };
         let (n_ch, n_ev) = (num_channels as usize, (num_events as usize).min(MAX_EVENTS));
-        let silence = |i: &mut Instance| {
+        // The block's events as the guest gets them (`n_ev` of `EVENT_SIZE` bytes each).
+        let raw: &[u8] = if n_ev > 0 { unsafe { std::slice::from_raw_parts(events, n_ev * EVENT_SIZE) } } else { &[] };
+        let zero_channels = || {
             for ch in 0..n_ch {
                 unsafe { std::slice::from_raw_parts_mut(*channels.add(ch), frames as usize) }.fill(0.0);
             }
-            i.failed = true;
-            false
         };
-        // Layout in the guest's scratch memory: channel pointers, events, audio.
-        let pointers = i.sandbox.scratch;
-        let events_at = pointers + (MAX_CHANNELS * 4) as u32;
+        // Another thread (an edit, a saved state) holds the guest: this block is silent, and the
+        // plugin is not failed for it. Its parameter changes are kept for the next block.
+        let Ok(mut guard) = i.live.try_lock() else {
+            zero_channels();
+            record_params(i, raw, true);
+            return false;
+        };
+        let live: &mut Live = &mut guard;
+        let core = live.core;
+        // Edits made since the last block reach the guest first.
+        flush_dirty(i, live);
+        // Layout in the guest's scratch memory: the process data, channel pointers, events, audio.
+        let data_at = live.sandbox.scratch;
+        let pointers = data_at + GUEST_PROCESS_DATA_SIZE as u32;
+        let events_at = (pointers + (MAX_CHANNELS * 4) as u32).next_multiple_of(8);
         let audio = events_at + (MAX_EVENTS * EVENT_SIZE) as u32;
-        let needed = (MAX_CHANNELS * 4 + MAX_EVENTS * EVENT_SIZE) + n_ch * frames as usize * 4;
-        if i.failed || n_ch > MAX_CHANNELS || needed > SCRATCH {
-            return silence(i);
+        let needed = (audio - data_at) as usize + n_ch * frames as usize * 4;
+        if live.failed || n_ch > MAX_CHANNELS || needed > SCRATCH {
+            zero_channels();
+            live.failed = true;
+            return false;
         }
+        let out_at = live.sandbox.out;
+        let out_count_at = out_at + (MAX_OUT * EVENT_SIZE) as u32;
         {
-            let memory = i.sandbox.guest.memory;
-            let data = memory.data_mut(&mut i.sandbox.store);
+            let memory = live.sandbox.guest.memory;
+            let data = memory.data_mut(&mut live.sandbox.store);
             let mut put = |at: usize, bytes: &[u8]| data[at..at + bytes.len()].copy_from_slice(bytes);
+            // Nothing written yet: the guest sets the count when it returns.
+            put(out_count_at as usize, &0u32.to_le_bytes());
             for ch in 0..n_ch {
                 let at = audio as usize + ch * frames as usize * 4;
                 put(pointers as usize + ch * 4, &(at as u32).to_le_bytes());
                 let samples = unsafe { std::slice::from_raw_parts(*channels.add(ch), frames as usize) };
+                #[cfg(target_endian = "little")]
+                {
+                    // SAFETY: f32 has no padding; the bytes of `samples` are `frames * 4` initialized bytes.
+                    let bytes = unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4) };
+                    put(at, bytes);
+                }
+                #[cfg(not(target_endian = "little"))]
                 for (k, s) in samples.iter().enumerate() {
                     put(at + k * 4, &s.to_le_bytes());
                 }
             }
             if n_ev > 0 {
-                put(events_at as usize, unsafe { std::slice::from_raw_parts(events, n_ev * EVENT_SIZE) });
+                put(events_at as usize, raw);
+            }
+            // The guest's room for its own events: `out_events`, `out_capacity`, `out_count`.
+            let fields = [GUEST_PROCESS_DATA_SIZE as u32, frames, num_channels, n_ev as u32, pointers, events_at, 0, out_at, MAX_OUT as u32, out_count_at];
+            for (k, v) in fields.iter().enumerate() {
+                put(data_at as usize + 4 * k, &v.to_le_bytes());
             }
         }
-        let core = i.core;
+        // The guest gets these changes in this block: the host's copy takes them now.
+        record_params(i, raw, false);
         let ok = {
             // WebAssembly cannot set the FPU flags itself: flush denormals here.
             let _denormals = DenormalGuard::new();
-            i.sandbox.call(|s, g| g.process.call(s, (core, pointers, num_channels, frames, events_at, n_ev as u32, 0)))
+            live.sandbox.call(|s, g| g.process.call(s, (core, data_at)))
         };
         match ok {
             Some(ok) => {
-                let memory = i.sandbox.guest.memory;
-                let data = memory.data(&i.sandbox.store);
+                let memory = live.sandbox.guest.memory;
+                let data = memory.data(&live.sandbox.store);
                 for ch in 0..n_ch {
                     let at = audio as usize + ch * frames as usize * 4;
                     let out = unsafe { std::slice::from_raw_parts_mut(*channels.add(ch), frames as usize) };
+                    #[cfg(target_endian = "little")]
+                    {
+                        let bytes = &data[at..at + out.len() * 4]; // panics like the old loop when out of range
+                        // SAFETY: `bytes` holds `out.len() * 4` bytes; `out` is `out.len()` f32s; they do not overlap
+                        // (guest memory and the host's buffer).
+                        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len()) };
+                    }
+                    #[cfg(not(target_endian = "little"))]
                     for (k, s) in out.iter_mut().enumerate() {
                         *s = f32::from_le_bytes(data[at + k * 4..at + k * 4 + 4].try_into().unwrap());
                     }
                 }
+                // The events are handed over whatever the guest returned: they were written before it returned.
+                pass_out_events(i, data, out_at, d);
                 ok != 0
             }
             // A trap or the time limit: this plugin goes silent, the host lives on.
-            None => silence(i),
+            None => {
+                zero_channels();
+                live.failed = true;
+                false
+            }
         }
     }
 
+    /// The state is at most the scratch area (`SCRATCH`). A larger one is not saved: this returns
+    /// 0, which the shims save as an empty state, and the reason goes to stderr.
     pub unsafe extern "C" fn save_state(p: *mut c_void, buf: *mut u8, cap: u32) -> u32 {
         let i = unsafe { instance(p) };
-        let (core, at) = (i.core, i.sandbox.scratch);
-        let size = i.sandbox.call(|s, g| g.save_state.call(s, (core, at, SCRATCH as u32))).unwrap_or(0);
-        if !buf.is_null() && size <= cap && size as usize <= SCRATCH {
-            let bytes = i.sandbox.read(at, size as usize);
+        let mut live = lock_live(i);
+        // An edit that has not reached the guest yet belongs in the state.
+        flush_dirty(i, &mut live);
+        let (core, at) = (live.core, live.sandbox.scratch);
+        let size = live.sandbox.call(|s, g| g.save_state.call(s, (core, at, SCRATCH as u32))).unwrap_or(0);
+        if size as usize > SCRATCH {
+            eprintln!("ferritron-wasm: the state is {size} bytes, more than the {SCRATCH} the guest can hand over; it is not saved");
+            return 0;
+        }
+        if !buf.is_null() && size <= cap {
+            let bytes = live.sandbox.read(at, size as usize);
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len()) };
         }
         size
@@ -697,19 +928,27 @@ mod host {
             return false;
         }
         let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) };
-        let (core, at) = (i.core, i.sandbox.scratch);
-        i.sandbox.write(at, bytes) && i.sandbox.call(|s, g| g.load_state.call(s, (core, at, len))).is_some_and(|ok| ok != 0)
+        let mut live = lock_live(i);
+        // Edits waiting for the next block are older than the state: they must not overwrite it.
+        for dirty in i.dirty.iter() {
+            dirty.store(false, Ordering::Release);
+        }
+        let (core, at) = (live.core, live.sandbox.scratch);
+        let ok = live.sandbox.write(at, bytes) && live.sandbox.call(|s, g| g.load_state.call(s, (core, at, len))).is_some_and(|ok| ok != 0);
+        refresh(i, &mut live);
+        ok
     }
 
     unsafe extern "C" fn latency(p: *mut c_void) -> u32 {
-        unsafe { instance(p) }.latency
+        lock_live(unsafe { instance(p) }).latency
     }
 
     unsafe extern "C" fn set_offline(p: *mut c_void, offline: bool) {
         let i = unsafe { instance(p) };
-        let core = i.core;
-        if let Some(f) = i.sandbox.guest.set_offline.clone() {
-            i.sandbox.call(|s, _| f.call(s, (core, offline as u32)));
+        let mut live = lock_live(i);
+        let core = live.core;
+        if let Some(f) = live.sandbox.guest.set_offline.clone() {
+            live.sandbox.call(|s, _| f.call(s, (core, offline as u32)));
         }
     }
 

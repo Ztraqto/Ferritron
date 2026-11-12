@@ -11,6 +11,7 @@
 //! the token the hub keeps in the user's Ferritron folder, so only the
 //! user's own processes can take part.
 
+use ferritron_core::mcp::{nonce, proof, verify};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -23,26 +24,51 @@ use std::time::Duration;
 
 /// How long a plugin may take to answer.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long each line of the handshake may take.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Reads the token, creating a random one if there is none yet.
 pub fn ensure_token(path: &Path) -> std::io::Result<String> {
     if let Ok(token) = std::fs::read_to_string(path)
         && !token.trim().is_empty() {
+            restrict(path)?;
             return Ok(token.trim().to_string());
         }
-    use std::hash::{BuildHasher, Hasher};
-    let mut token = String::new();
-    for i in 0..4u64 {
-        // RandomState is seeded from the operating system's randomness.
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(i ^ std::process::id() as u64);
-        token.push_str(&format!("{:016x}", h.finish()));
-    }
+    // 32 random bytes from the operating system, as 64 hex characters.
+    let token = ferritron_core::mcp::random_hex(32);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, &token)?;
+    write_private(path, &token)?;
     Ok(token)
+}
+
+/// Writes the token file so that only its owner can read it: mode 0600 on Unix (also on a file
+/// that already exists). On Windows the file stays in the user's own Ferritron folder, whose
+/// default access list already allows only that user, so nothing is changed there.
+fn write_private(path: &Path, token: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    restrict(path)?;
+    file.write_all(token.as_bytes())
+}
+
+/// Restricts an existing token file to its owner (Unix only, see `write_private`).
+fn restrict(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// One DAW process with Ferritron plugins that have AI access on.
@@ -81,15 +107,31 @@ impl Hub {
         Ok(hub)
     }
 
-    /// One incoming connection: plugins of a DAW process, or a relay.
-    fn serve(&self, stream: TcpStream) {
+    /// One incoming connection: plugins of a DAW process, or a relay. Challenge and response
+    /// come first: the client proves it holds the token, and it must answer within the timeout.
+    /// The token itself is never sent (see `ferritron_core::mcp::proof`).
+    fn serve(&self, mut stream: TcpStream) {
+        if stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
+            return;
+        }
         let Ok(read) = stream.try_clone() else { return };
         let mut lines = BufReader::new(read).lines();
         let Some(Ok(first)) = lines.next() else { return };
         let Ok(hello) = serde_json::from_str::<Value>(&first) else { return };
-        if hello["token"].as_str() != Some(self.token.as_str()) {
+        let Some(client_nonce) = hello["nonce"].as_str() else { return };
+        let hub_nonce = nonce();
+        let challenge = json!({ "type": "challenge", "nonce": hub_nonce, "proof": proof(self.token.as_str(), "hub", client_nonce, &hub_nonce) });
+        if writeln!(stream, "{challenge}").is_err() {
+            return;
+        }
+        let Some(Ok(answer)) = lines.next() else { return };
+        let Ok(auth) = serde_json::from_str::<Value>(&answer) else { return };
+        let proven = auth["type"].as_str() == Some("auth")
+            && auth["proof"].as_str().is_some_and(|p| verify(self.token.as_str(), "client", &hub_nonce, client_nonce, p));
+        if !proven {
             return; // not one of the user's processes
         }
+        let _ = stream.set_read_timeout(None);
         match hello["role"].as_str() {
             Some("plugins") => self.serve_plugins(stream, hello["process"].clone(), lines),
             Some("bridge") => self.serve_bridge(stream, lines),
@@ -213,11 +255,25 @@ pub struct Bridge {
 }
 
 impl Bridge {
+    /// Connects and runs the handshake: the hub must prove it holds `token` before any call is sent.
     pub fn connect(port: u16, token: &str) -> std::io::Result<Bridge> {
         let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-        writeln!(stream, "{}", json!({ "type": "hello", "role": "bridge", "token": token }))?;
-        let reader = BufReader::new(stream.try_clone()?).lines();
-        Ok(Bridge { writer: Mutex::new(stream), reader: Mutex::new(reader), next: AtomicU64::new(1) })
+        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let client_nonce = nonce();
+        writeln!(stream, "{}", json!({ "type": "hello", "role": "bridge", "nonce": client_nonce }))?;
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let challenge: Value = serde_json::from_str(&line).map_err(std::io::Error::other)?;
+        let hub_nonce = challenge["nonce"].as_str().unwrap_or_default();
+        let proven = challenge["type"].as_str() == Some("challenge")
+            && challenge["proof"].as_str().is_some_and(|p| verify(token, "hub", &client_nonce, hub_nonce, p));
+        if !proven {
+            return Err(std::io::Error::other("the server on the port did not prove that it is the Ferritron hub"));
+        }
+        writeln!(stream, "{}", json!({ "type": "auth", "proof": proof(token, "client", hub_nonce, &client_nonce) }))?;
+        stream.set_read_timeout(None)?;
+        Ok(Bridge { writer: Mutex::new(stream), reader: Mutex::new(reader.lines()), next: AtomicU64::new(1) })
     }
 
     pub fn call_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
@@ -304,5 +360,45 @@ pub fn serve_stdio(call: &dyn Fn(&str, &Value) -> Result<Value, String>) {
             && writeln!(stdout, "{reply}").and_then(|_| stdout.flush()).is_err() {
                 break;
             }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port nobody listens on right now (the hub binds it next).
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn a_bridge_with_the_token_is_answered_and_one_without_it_is_refused() {
+        let port = free_port();
+        let _hub = Hub::start(port, "secret-token".into()).unwrap();
+        let bridge = Bridge::connect(port, "secret-token").unwrap();
+        assert_eq!(bridge.call_tool("list_plugins", &json!({})).unwrap(), json!([]));
+        assert!(Bridge::connect(port, "wrong-token").is_err(), "the hub's proof does not verify with another token");
+    }
+
+    #[test]
+    fn a_hub_drops_a_client_that_cannot_prove_the_token() {
+        let port = free_port();
+        let _hub = Hub::start(port, "secret-token".into()).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let client_nonce = nonce();
+        writeln!(stream, "{}", json!({ "type": "hello", "role": "bridge", "nonce": client_nonce })).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let challenge: Value = serde_json::from_str(&line).unwrap();
+        let hub_nonce = challenge["nonce"].as_str().unwrap();
+        assert!(verify("secret-token", "hub", &client_nonce, hub_nonce, challenge["proof"].as_str().unwrap()));
+        // Answer with a proof made from the wrong token, then try a call: the hub must close, not reply.
+        let _ = writeln!(stream, "{}", json!({ "type": "auth", "proof": proof("wrong-token", "client", hub_nonce, &client_nonce) }));
+        let _ = writeln!(stream, "{}", json!({ "id": 1, "name": "list_plugins", "arguments": {} }));
+        let mut rest = String::new();
+        assert_eq!(reader.read_line(&mut rest).unwrap_or(0), 0, "the hub closes the connection");
     }
 }

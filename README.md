@@ -40,10 +40,21 @@ Rust で書かれた、シンプルで速く、拡張しやすいオーディオ
   エミュレータ（x86_64、API 34）で音・エディタ・保存を確認し、実機ではまだ）
 - 🚧 実装済み・型検査済みですが、Mac の実機ではまだビルドも実行もしていません
   （[macOS 開発者募集](#macos-開発者募集)）。iPhone / iPad 向けも同じです
-- 🧪 Avid の AAX SDK が手元にないまま、公開されている API に沿って書いたコードです。
-  コンパイルもまだしていません（SDK を持つ開発者の確認を募集しています）
+- 🧪 Avid の AAX SDK（2.10.0）に対してビルドとリンクまで確認しました。Pro Tools がないため、
+  実行はしていません（Pro Tools を持つ開発者の確認を募集しています）
 - ⚠️ コードはありますが、確認していません
 - — 対応していません
+
+
+**2.0.0 で確かめた範囲**: 2.0.0 の変更（C ABI v2、制御周期のオートメーション、組み込みバイパス、
+出力イベントなど）は Windows で、`Harness` のテスト、VST3 の検査用ホスト（`ferritron-testhost`）、
+LV2 とスタンドアロンの経路で確かめました。2.0.0 で、全例が Steinberg の VST3 validator に合格し
+（24 例すべて 537 件）、clap-validator 0.4.1 では 23 例中 21 例が失敗 0 でした（残る 2 例は、自分で
+パラメータを動かす例と、起動時の値を既定値と変える例で、意図どおりの挙動です）。DAW では、FL Studio 2026 の
+プラグインの走査で VST2 が読み込まれて「ok」になりました。VST3 と CLAP を DAW に挿して音を通す確認は
+2.0.0 ではまだしていません。AAX は AAX SDK に対してビルドのみ（Pro Tools がないため
+未実行）、AU・AUv3・iOS は型確認のみです。AVX-512 と NEON の SIMD は実行していません。詳しくは
+[CHANGELOG.md](CHANGELOG.md) と [docs/performance.md](docs/performance.md) を参照してください。
 
 ## macOS 開発者募集
 
@@ -89,22 +100,22 @@ struct Gain;
 #[ferritron::plugin]
 impl Process for Gain {
     fn process(&mut self, ctx: &mut Context) {
-        let gain = db_to_gain(ctx.params.gain.value());
-        ctx.io.for_each_sample(|s| *s *= gain);
+        let gain = db_to_gain(ctx.params().gain.value());
+        ctx.io().for_each_sample(|s| *s *= gain);
     }
 }
 ```
 
 `Cargo.toml` の `[lib]` に `crate-type = ["cdylib"]` が必要です。パラメータは
 プロジェクトファイルで一度だけ宣言します。`#[ferritron::plugin]` がそこから、型付きの
-`ctx.params` 構造体、変わらないパラメータ ID、各形式のエントリポイントを生成します。
+`ctx.params()` 構造体、変わらないパラメータ ID、各形式のエントリポイントを生成します。
 [examples/gain](examples/gain) を参照してください。
 
 ### エディタ（HTML / JS）
 
 Web の UI をフォルダに置いて宣言します。UI はプラグインに埋め込まれ、システムの
 WebView（Windows では WebView2）で表示されます。ローカルサーバーは不要で、VST3 と
-CLAP のどちらでも動きます。
+CLAP のどちらでも動きます。エディタは自分のページの中にとどまり、他のサイトへのリンクはエディタの中で開きません。
 
 ```toml
 # gain.ferritroject
@@ -152,6 +163,8 @@ title.textContent = ferritron.t("ui-title");       // from locales/<lang>/*.ftl
 - **組み込みスイッチ**: `ferritron.builtins` には `"ferritron.bypass"` と、`[quality]`
   がある場合は `"ferritron.quality"` が、`ferritron.params` と同じ形で入っています。
   `ferritron.set` / `edit` / `onChange` はこれらのキーでも動きます。
+  完全バイパスを解いた後は、プラグインを `reset` してから再び動かします。バイパスの間に
+  止まらなかったノートや、古いディレイ・残響の中身は出てきません。
 
 - **HiDPI**: サイズは論理ピクセルで、エディタはホストの拡大率（VST3
   `IPlugViewContentScaleSupport`、CLAP `set_scale`）、なければウィンドウの DPI に合わせて
@@ -238,6 +251,14 @@ impl GpuEditor for Editor {
 そのまま使えます。別プロセスのエディタ（`[view] process = true`）でも同じです。
 [examples/gpu-view](examples/gpu-view)（1つのシェーダーで描くレベルバー）を参照してください。
 
+文字を入力するエディタは、`Ui::set_text_input` で入力欄の位置（論理ピクセル）を知らせます。Windows では、
+日本語などの入力の変換窓がその位置に出ます（実際の IME では確かめていません）。
+
+`FngAdapter` で作ったエディタ（Ferritron Native Graphics）は、GPU のデバイスが使えないとき、または
+失われたまま 3 回続けて作り直せないとき、ウィンドウの中で CPU が描きます（Windows のみ）。GPU の作り直しは
+5 秒ごとに試します。`FERRITRON_GPU_VIEW=cpu` を設定すると、最初から CPU で描きます。GPU が必要なエディタは、
+GPU がないと開きません。
+
 ### 無音時の停止と書き出し時の音質
 
 **待機中のプラグインは負荷ゼロ。** プラグインの入力が無音（-120 dBFS 未満）のまま、
@@ -259,13 +280,13 @@ fn tail(&self) -> Tail {
   音を切ることはありません。
 - `Tail::Infinite`: 停止しません（ジェネレーター、テストトーンなど）。
 
-**書き出し時は自動で最高音質。** `ctx.quality` は、ホストがオフラインでレンダリング
+**書き出し時は自動で最高音質。** `ctx.quality()` は、ホストがオフラインでレンダリング
 している間（書き出し、バウンス、フリーズ）は `Quality::Best`、ユーザーが再生や編集を
 している間は `Quality::Normal` です。ホストが指示したブロックからすぐ切り替わります。
 各レベルで何をするかはプラグインが決めます:
 
 ```rust
-let taps = if ctx.quality.is_best() { 512 } else { 64 };   // oversampling, filter length, ...
+let taps = if ctx.quality().is_best() { 512 } else { 64 };   // oversampling, filter length, ...
 ```
 
 プロジェクトファイルに `[quality]` を書くと、ユーザーが手動で選べる「音質」スイッチ
@@ -316,7 +337,7 @@ ctx.parallel_for(&mut self.voices, |voice| voice.render(frames));   // then mix 
 // in activate():
 self.reverb = ferritron_gpu::Convolver::new(&impulse_response, setup.max_block_size)?;
 // in process():
-self.reverb.process(ctx.io.channel_mut(0));
+self.reverb.process(ctx.io().channel_mut(0));
 ```
 
 2秒の畳み込みリバーブ [examples/gpu-reverb](examples/gpu-reverb) を参照してください。
@@ -443,6 +464,25 @@ graph.node_mut::<Gain>(wet).unwrap().set(0.5);     // change a node
 までを CPU に残し、1,024 以上を GPU に移します。オフラインでは 256 フィルタから GPU が
 勝ちます。`examples/gpu-reverb` はグラフとして作られ、`examples/gpu-modal` は `IirNode`
 を使っています。
+
+`Graph::placement(id)` は、ノードがどこで動いているか（CPU か GPU か）を返します。`Graph::set_placement(id, device)` で
+配置を固定できます。固定すると、ノードは作り直され、グラフは準備し直されます（レイテンシが変わることがあるので、
+プラグインは `request_latency` を呼びます）。GPU のノードは、設定ごとに選んだ配置を覚えます。どちらもオーディオスレッドの
+外で呼んでください。
+
+GPU が失われると、`IirNode`、`KernelNode`、`MatrixMixerNode` は、次の制御周期（`Graph::process` の呼び出しの始め）から
+それぞれの CPU の候補へ切り替わります。状態は引き継がれず、フィルタや遅延の中身は空から始まるので、音に短い切れ目が出ます。
+切り替えでレイテンシが変わると `Graph::take_latency_changed()` が一度だけ真になるので、プラグインは `request_latency` を
+呼んでください（補償は次の `prepare` まで古いままです）。
+
+`ConvolverNode` には CPU の候補が無いので切り替えません。畳み込みは自分の GPU スレッドで作り直し、失敗したら
+5 秒ごとに再試行します。
+
+グラフを `prepare` するとき（プラグインの `activate` で呼ぶ場合）、各ノードの `revive` が呼ばれます。
+`ferritron-vulkan` の `PersistentModalBank::revive` と `TensorMixer::revive` は、失われたデバイスの後でバンクや
+ミキサーを作り直し、作れれば GPU へ戻します（作れなければ CPU の候補のまま）。これらに 5 秒ごとの再試行はありません。
+
+どれも確かめたのは、手で立てた「失われた」印だけです。実際のデバイス喪失は起こしていないので、実機では確かめていません。
 
 #### GPU ステージの融合
 
@@ -658,6 +698,12 @@ Ferritron はホストが有効にした各オーディオソースをメモリ�
 [examples/ara-stretch](examples/ara-stretch) は両方の既定の実装を使っています。
 どちらのサンプルも、ARA SDK の `ARATestHost` のすべてのケースに VST3 と CLAP で合格します。
 
+#### 制限
+
+- **サンプルレート。** ブリッジは、音声ファイルのサンプルレートがホストのサンプルレートと同じ区間だけを描きます。違うファイル（例: 48 kHz のプロジェクトに置いた 44.1 kHz のファイル）は無音になります。Ferritron は再標本化をしません。
+- **メモリ。** 音声ファイルは全体をメモリに読みます。大きさは「チャンネル数 × サンプル数 × 4 バイト」です（1 時間のステレオ、48 kHz で約 1.4 GB）。読めなかったファイルの区間は無音になります。
+- **最大のブロック。** ホストが告げた最大のブロック長より長い区間は描かれず、無音になります（それより長いブロックで起きます）。
+
 ### クラッシュの隔離
 
 既定では、プラグインのコードで起きたパニックは捕捉され、プラグインは無音を出力します。
@@ -692,6 +738,8 @@ pipeline = false      # true: blocks run one block late, in parallel with the ho
   コードをそこで読み込み直します。
 - `FERRITRON_ISOLATION_SHARE=plugin|instance` と `FERRITRON_ISOLATION_PIPELINE=0|1` で
   プロジェクトファイルの設定を上書きできます。
+- **待ち時間の上限**: ホストが 1 ブロックを待つのは、通常 250 ms までです。オフライン描画
+  （書き出しなど）の間は 30 秒まで、`activate` の後の最初のブロックは 5 秒まで待ちます。
 
 Windows と macOS に対応しています。Windows では子プロセスは `rundll32` で動くプラグインの
 ライブラリで、macOS では小さなヘルパー `ferritron-host` です。`cargo ferritron bundle` が
@@ -737,8 +785,10 @@ claude mcp add ferritron -- ferritron-mcp
 接続します（どの DAW のプロセス、どのトラックにいるかも報告します）。AI クライアントは
 それらの一覧を取得し、パラメータを読み書きし（エディタでの編集と同じように DAW に
 伝わります）、プラグインの前後の音声をレベル付きの WAV ファイルとして取得できます。
-ハブは 127.0.0.1 だけで待ち受け、ユーザーの Ferritron フォルダにあるトークンを提示した
-プロセスだけを受け入れます。別の AI クライアントが2つ目の `ferritron-mcp` を起動すると
+ハブは 127.0.0.1 だけで待ち受け、ユーザーの Ferritron フォルダにあるトークンを持っていることを
+証明したプロセスだけを受け入れます。トークンそのものは送りません。ハブ、プラグイン、ブリッジは
+HMAC-SHA256 のチャレンジと応答で互いにトークンを持っていることを確かめるので、ポートで待つ
+別のプログラムはトークンを得られません。Unix ではトークンのファイルは所有者だけが読めます。別の AI クライアントが2つ目の `ferritron-mcp` を起動すると
 最初のハブに中継するので、ハブは常に1つです。
 
 ツール: `list_plugins`、`get_parameters`、`set_parameter`、`capture_audio`。
@@ -780,18 +830,25 @@ if let Some(r) = level.read(&mut v) { /* r.age tells how fresh */ }
 ### インストゥルメント
 
 `[plugin]` に `kind = "instrument"` を設定します。プラグインは音声入力の代わりにノートを
-受け取ります。`ctx.notes` には、そのブロックのノートオン／オフがサンプル位置付きで
+受け取ります。`ctx.notes()` には、そのブロックのノートオン／オフがサンプル位置付きで
 入っています。16ボイスのサインシンセ [examples/sine-synth](examples/sine-synth) を参照して
 ください。
 
 ```rust
-for note in ctx.notes {
+for note in ctx.notes() {
     match note.kind {
         NoteKind::On => { /* start a voice at note.offset: note.key, note.velocity */ }
         NoteKind::Off => { /* release it */ }
     }
 }
 ```
+
+声の終わり: CLAP のホストには、各声の終わり（`NOTE_END`）をノートオフが届いた時点で Ferritron が
+返します。ホストはそれで、その声の変調を解放できます。リリースの尾があるプラグインは
+`Process::REPORTS_VOICE_END = true` にし、尾が終わったときに `ctx.voice_ended(offset, voice, note_id)`
+を自分で呼びます。ホストの `NOTE_CHOKE` はノートオフとして届きます。同じキーで重なったノートの声は
+名乗りません。`VoiceMods` は、離した声の変調を `end(id)` を呼ぶまで保つので、リリースの間も変調が
+効きます。新しいノートは空いている声を使い、空きが無いときは離した声を使います。
 
 ### スタンドアロンアプリ・スマートフォン・Web・LV2・AAX
 
@@ -812,8 +869,10 @@ AUv3、Android アプリ、ブラウザの WAM にもなります。どれも同
 - **スタンドアロン**（機能 `standalone`、既定で有効）: 既定のオーディオ出力（エフェクトは
   入力も）とすべての MIDI 入力で動き、プラグインのエディタをウィンドウに出します。状態は
   Ferritron のデータフォルダの `standalone/<プラグイン ID>.state` に保存され、次回の起動で
-  戻ります。アプリの実行ファイルは `cargo ferritron` がコンパイルする小さなランチャーです
+  戻ります。`ctx.midi_out` の MIDI は、Windows と Linux では `standalone/midi-out.txt` の 1 行目に書いた名前の MIDI 出力へ送ります（環境変数 `FERRITRON_MIDI_OUT` でも指定できます）。見つかった MIDI 出力の名前は `standalone/midi-out-ports.txt` に書かれるので、そこから選んでコピーできます。何も指定しなければ送りません。アプリの実行ファイルは `cargo ferritron` がコンパイルする小さなランチャーです
   （Windows では Visual Studio Build Tools の C コンパイラを使います）。
+  制限: ノートオン・オフ以外の MIDI（コントローラ、ピッチベンド、プレッシャー）、トランスポート、
+  サイドチェーン入力はプラグインに渡しません。入出力は 2 チャンネル固定です。
 - **Android**: AAudio で低遅延に動くアプリです（Android 9 以上）。エディタは WebView の中で
   動き、ページからは DAW の中と同じ `window.ferritron` が使えます。HTML/JS のエディタが
   ないプラグインには、パラメータから作った画面（インストゥルメントは鍵盤つき）が出ます。
@@ -836,9 +895,12 @@ AUv3、Android アプリ、ブラウザの WAM にもなります。どれも同
   `file://` では動かないので、`python -m http.server` などで開いてください。
 - **LV2**（機能 `lv2`、既定で有効。SDK 不要）: パラメータごとのコントロールポート、MIDI、
   状態、レイテンシ、書き出し（freewheel）に対応します。Turtle（`manifest.ttl`、`plugin.ttl`）は
-  プロジェクトファイルから生成されます。エディタは Windows と macOS で出ます。プラグインが自分で
-  変えたパラメータ（`InstanceHandle`、MCP）はホストに記録されません（LV2 のコントロール
-  ポートはホストのものだからです）。
+  プロジェクトファイルから生成されます。エディタは Windows と macOS で出ます。
+  プラグインは MIDI 出力のポート（`midi_out`）を持ち、`ctx.midi_out` の内容を送ります。
+  LV2 ではコントロールポートの値はホストのものです。プラグインが自分で変えたパラメータ
+  （`InstanceHandle`、MCP）は、ホストへは通知されません。プラグインの中から選んだプリセット
+  （`load_values`、`presets::load`）は、プロジェクトの保存と読み込みの後も残ります。
+  ホストの画面のつまみは、利用者が動かすまで古い値を表示することがあります。
 - **AAX**（機能 `aax`、既定では無効）: Avid の AAX SDK は登録した開発者だけが入手できるため、
   ご自身で入手して `AAX_SDK_DIR` に置いてください（見つからないときは警告を出し、AAX なしで
   ビルドします）。Pro Tools は PACE の wraptool で署名したプラグインだけを読み込みます
@@ -875,6 +937,12 @@ assert!(h.process(&mut [&mut l, &mut r]));
 
 [examples/instances](examples/instances) を参照してください。プラグインとエディタが
 ホストのプロセス内にあるときだけ使えます（`[isolation]` やエディタの別プロセス化では不可）。
+
+`[vst3] controller_id` を指定すると、VST3 のコントローラのインスタンスは `instances::<P>()` の一覧と
+MCP に出ません。ホストが同じプロセスでプロセッサとコントローラをつなげば、エディタはプロセッサ側の
+インスタンスにつながり、`[streams]`、`store`、`on_message` もプロセッサ側に届きます（編集画面の経路は
+未確認です）。コントローラの状態は保存されません。
+`controller_id` は既存のプラグインを移行するためだけに使ってください。
 
 ### パラメータの型
 
@@ -921,6 +989,89 @@ param-gain = ゲイン
 - `cargo ferritron bundle` は新しく追加した `.ftl` ファイルを検知します。通常の
   `cargo build` では、新しいファイルを追加した後に、追跡されているいずれかのファイルを
   編集してください（または `cargo clean -p <package>` を実行）。
+
+## 2.0 で増えたもの
+
+2.0.0 の新しい機能の要点です。移行の手順は [docs/migration-2.0.md](docs/migration-2.0.md)、
+数字は [docs/performance.md](docs/performance.md) にあります。
+
+### パラメータの流れ
+
+```toml
+[process]
+automation    = "control"   # 既定。"sample"（1.x と同じ）、"events"（ctx.param_events() で自分で読む）
+control_block = 32          # 制御周期（サンプル）
+
+[params]
+cutoff = { type = "float", range = [20, 20000], default = 1000, scale = "log", smooth = "20ms" }
+
+[params.band]               # 繰り返しパラメータ: ctx.params().band[i].freq
+repeat = 8
+[params.band.fields]
+freq = { type = "float", range = [20, 20000], default = 1000 }
+```
+
+- オートメーションは制御周期の先頭で反映され、変化のない周期は 1 回の `process` にまとまります
+  （密なオートメーションで `process` の呼び出しが 512 → 16 回/ブロック）。
+- `smooth` を付けた浮動小数点パラメータは `value()` が平滑化後の値、`target()` がホストの値です。
+  `ctx.ramp(&p, &mut buf)` でサンプルごとの値が得られます。
+- `ctx.changed(&p)` / `any_changed()` / `changed_indices()` で前回から変わったものが分かります。
+- `ctx.set_param` と `ctx.midi_out` はオーディオスレッドからホストへ値と MIDI を送ります（割り当てなし）。
+
+### スレッドとメモリ
+
+- `Process::scratch` と `ctx.scratch::<f32>(n)`: `activate` で確保した作業領域を、割り当てなしで借ります。
+- ワーカー（`#[ferritron::plugin(worker = ...)]`）と `[streams]`: 重い解析をオーディオスレッドの外で行い、
+  結果をエディタへ流します（`examples/analyzer`）。
+- データストリームとタップへの書き込みは、オーディオスレッドからだけ行います。2 つのスレッドが
+  同時に書くと、後の書き込みは捨てられ、バッファは壊れません。
+- `[isolation] mode = "process"` の共有メモリは、実際のチャンネル数と最大ブロック長で確保します
+  （ステレオ 512 サンプルで 1 インスタンス約 41 KB。1.4.0 は約 2.1 MB）。
+
+### DSP 部品（`ferritron::dsp`、feature `dsp`、既定でオン）
+
+SIMD（`F32x4`、`F32x8`、実行時の ISA 選択、`FERRITRON_ISA=scalar`）、`Biquad` / `BiquadX4` / `BiquadX8`、
+`DelayLine`、`Smoother`、`Fft`、`PartitionedConvolver`、`Oversampler`、`Dither` など。コアには依存しません。
+
+### 設定（プロジェクトをまたぐ値）
+
+```rust
+let settings = ferritron::settings::<MyPlugin>();
+settings.set("theme", "dark");
+let zoom = settings.get_or("zoom", 1.0);
+let _watch = settings.on_change(|key, value| { /* ほかのインスタンスやプロセスの変更も届く */ });
+```
+
+プラグイン ID ごとの JSON ファイル（Windows は `%APPDATA%\Ferritron\settings`）に保存され、
+複数のプロセスが同時に書いても消えません。Web エディタの `ferritron.settings` も同じファイルを使います。
+
+### メインスレッドへの通知・プリセット・ノートごとの変調・インスタンスの監視
+
+```rust
+// オーディオスレッドから（割り当てなし）。ハンドラはホストのメインスレッドで動きます。
+ctx.notify(PROGRAM_CHANGED);
+instance.on_notify(|code, handle| { /* ファイルを読む、エディタに知らせる */ });
+
+// ほかのインスタンスとエディタの変化（Ferritron の 1 本のスレッドが全体に配ります）
+let _watch = ferritron::instances_watch(|event| { /* Added / Removed / Changed / Params / Editor* */ });
+let owner = ferritron::SingletonView::owner_of(MY_PLUGIN_ID); // 共有の表示を担当するエディタ
+```
+
+- `[presets]` はホストのプリセット一覧になります（VST3 のプログラムリスト、CLAP の `preset-load` と
+  プリセット探索、VST2 のプログラム）。ユーザープリセットは `presets::save_user` / `load_user`。
+- `poly = true` の浮動小数点パラメータは、CLAP でノートごとに変調できます。`Process::VOICES` を言う楽器には
+  CLAP のノートエクスプレッションと VST3 Note Expression が届きます（`ctx.voice_events()`）。
+- `TrackInfo` にトラックの種類・挿した位置・チャンネル数が加わりました。ミュート・ソロ・フェーダーは
+  どの形式にも伝える仕組みがありません（[docs/host-mixer-info.md](docs/host-mixer-info.md)）。
+- 確かめた範囲: Harness のテスト、VST3 validator、clap-validator。DAW の中ではまだ試していません。
+
+### テスト
+
+`ferritron::testing::Harness` に、index / ID でのパラメータ操作、ホストに見える `flags`、
+`host_latency()`、`load_values`、`set_automation_mode`、任意のイベント列（`process_events`）、
+`memory_report()`、`assert_no_alloc()`（feature `alloc-check`）が加わりました。
+`testing::check_fixture` は、以前のバージョンが保存した状態とパラメータ ID の一覧
+（`tests/fixtures/1.4.0/`）を読み、ID・クラス ID・保存値が変わっていないことを確かめます。
 
 ## ビルド
 
@@ -996,7 +1147,8 @@ Mac の実機ではまだビルドも実行もしていません。** 状況は
 
 **Linux** も同じ方法で動きます（`cargo ferritron bundle gain` は
 `<name>.vst3/Contents/x86_64-linux/<name>.so` と `<name>.clap` を書き出し、`--install` は
-`~/.vst3` と `~/.clap` にコピーします）。Linux にはまだエディタがありません。ホット
+`~/.vst3` と `~/.clap` にコピーします）。Linux にはまだエディタがありません。Linux の VST3 では、別スレッドからの値の変更と
+レイテンシの変更をメインスレッドでホストへ届けません（それを行う周期的な処理がまだないためです）。ホット
 リロードとプロセス分離は macOS と同じ POSIX のコードを使いますが、Linux では未テストです
 （分離には `ferritron-host` ヘルパーが必要で、これは VST3 のようなディレクトリ形式の
 バンドルにしか入りません）。すべてのサンプルは Linux（Docker 上の Debian と GCC で確認）
@@ -1056,6 +1208,26 @@ cargo ferritron bundle gain
 ます。これらを `C:\Program Files\Common Files\VST3\` と `...\Common Files\CLAP\` に
 コピーするか、管理者のシェルで `--install` を付けて実行してください。その後、DAW で
 プラグインを再スキャンします。
+
+毎回のバンドルの後にすることは、プロジェクトファイルの `[bundle]` に書いておけます
+（`cargo ferritron bundle` が読みます。プラグインには入りません）:
+
+```toml
+[bundle]
+install = true          # 毎回、各形式をインストール先にコピーする（--install と同じ）
+shortcuts = true        # target/bundled に各形式のインストール先へのショートカットを置く
+shortcut_prefix = "_"   # ショートカットの名前の先頭（既定 "_"）
+```
+
+- `shortcuts`: `_VST3 Plugins`、`_CLAP Plugins` のように `<先頭><形式> Plugins` の名前で、
+  バンドルした形式ごとに作ります（Windows は `.lnk`、ほかはシンボリックリンク）。インストール先の
+  ない形式（スタンドアロン）は作りません。フォルダがまだなくても作り、警告を出します。
+  その回だけ作るなら `--shortcuts`、その回だけ作らないなら `--no-shortcuts`。
+- `install`: `--install` と同じコピーを毎回します。`--target` と `--pgo` のビルドではしません。
+  管理者の権限が要るフォルダに書けなかったときは警告にとどめ、バンドルは成功にします
+  （`--install` を付けたときはこれまでどおりエラー）。その回だけしないなら `--no-install`。
+- VST2 のインストール先は、ホストがレジストリから読むフォルダ（`HKLM\SOFTWARE\VST` の
+  `VSTPluginsPath`）、なければ `%COMMONPROGRAMFILES%\VST2` です。環境変数 `VSTPLUGINS` で変えられます。
 
 #### Audio Unit（macOS）
 
@@ -1232,10 +1404,14 @@ C ABI には `ferritron.describe.v1` が加わりました。パラメータの�
 
 ## バージョン
 
-Ferritron のすべてのクレートは1つのバージョンを共有します（現在 **1.3.0**）。
+Ferritron のすべてのクレートは1つのバージョンを共有します（現在 **2.0.0**）。
 [CHANGELOG.md](CHANGELOG.md) を参照してください。プラグインでは
-`ferritron = { path = "...", version = "1.3.0" }` で固定できます。`ferritron::VERSION` と
+`ferritron = { path = "...", version = "2.0.0" }` で固定できます。`ferritron::VERSION` と
 `cargo ferritron --version` で確認できます。
+
+> **Ferritron 1.4.x 以前は非推奨です。** 新しい開発には 2.0.0 を使い、既存のプラグインも
+> 移行してください。手順は [docs/migration-2.0.md](docs/migration-2.0.md) と [CHANGELOG.md](CHANGELOG.md) の「Moving up from 1.4.x」を参照してください。
+> 古い版は修正されません。古い版を使うプラグインを `cargo ferritron bundle` すると警告が出ます。
 
 ## ライセンス
 

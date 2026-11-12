@@ -5,7 +5,7 @@
 //! The parts every platform shares; each platform's module opens the audio
 //! device and calls [`Renderer::render`] from its callback.
 
-use ferritron_core::abi::{EXT_HOST2, Event, PluginApi};
+use ferritron_core::abi::{EVENT_MIDI, EXT_HOST2, Event, PluginApi};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -14,8 +14,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// The longest block passed to the plugin; device callbacks are split.
 pub const MAX_BLOCK: usize = 1024;
 const MAX_NOTES: usize = 256;
+/// Events the plugin may write per block (the `out_events` the renderer passes).
+const MAX_OUT: usize = 256;
 /// Input buffered between the input and output callbacks, in frames.
 const RING_FRAMES: usize = 16384;
+/// MIDI messages the plugin queued and the MIDI thread has not sent yet.
+const MIDI_OUT_MESSAGES: usize = 1024;
+
+/// One MIDI message the plugin asked to send: `len` bytes of `bytes` (2 or 3).
+#[derive(Clone, Copy, Default)]
+pub struct MidiMessage {
+    pub len: u8,
+    pub bytes: [u8; 3],
+}
 
 /// What the UI thread, MIDI threads and the audio callback share.
 pub struct Shared {
@@ -25,7 +36,9 @@ pub struct Shared {
     /// Notes from MIDI or the UI, taken by the next block.
     notes: Mutex<Vec<Event>>,
     /// Stereo input, interleaved (effects).
-    input: Ring,
+    input: Ring<[f32; 2]>,
+    /// MIDI the plugin sends (`ctx.midi_out`), taken by the MIDI output thread.
+    pub(crate) midi_out: Ring<MidiMessage>,
 }
 
 // SAFETY: the instance's functions may be called from the threads the ABI
@@ -46,6 +59,7 @@ impl Shared {
             instrument: unsafe { (*api.info).kind == 1 },
             notes: Mutex::new(Vec::with_capacity(MAX_NOTES)),
             input: Ring::new(RING_FRAMES * 2),
+            midi_out: Ring::new(MIDI_OUT_MESSAGES),
         });
         // Editors find their instance through this pointer (the view host's ctx).
         let host2 = unsafe { (api.get_extension)(EXT_HOST2.as_ptr()) } as *const ferritron_core::abi::HostApi2;
@@ -147,12 +161,19 @@ pub struct Renderer {
     shared: &'static Shared,
     buffers: [Vec<f32>; 2],
     events: Vec<Event>,
+    /// The events the plugin writes for the host side (`out_events`), filled by `process`.
+    out: [Event; MAX_OUT],
 }
 
 impl Renderer {
     /// `shared` must outlive the renderer (the app keeps it until it exits).
     pub fn new(shared: &'static Shared) -> Self {
-        Self { shared, buffers: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]], events: Vec::with_capacity(MAX_NOTES) }
+        Self {
+            shared,
+            buffers: [vec![0.0; MAX_BLOCK], vec![0.0; MAX_BLOCK]],
+            events: Vec::with_capacity(MAX_NOTES),
+            out: [Event::param(0, 0, 0.0); MAX_OUT],
+        }
     }
 
     /// Fills `out` (interleaved, `channels` per frame) with the plugin's output.
@@ -212,43 +233,65 @@ impl Renderer {
             self.events.extend(notes.drain(..));
         }
         let channels = [left.as_mut_ptr(), right.as_mut_ptr()];
+        let mut out_count = 0u32;
         let ok = unsafe {
-            (shared.api.process)(shared.instance, channels.as_ptr(), 2, n as u32, self.events.as_ptr(), self.events.len() as u32, std::ptr::null())
+            let mut d = ferritron_core::abi::ProcessData::new(channels.as_ptr(), 2, n as u32, self.events.as_ptr(), self.events.len() as u32, std::ptr::null());
+            d.out_events = self.out.as_mut_ptr();
+            d.out_capacity = MAX_OUT as u32;
+            d.out_count = &mut out_count;
+            (shared.api.process)(shared.instance, &d)
         };
         if !ok {
             left[..n].fill(0.0);
             right[..n].fill(0.0);
+            return;
+        }
+        // Queue the MIDI the plugin wrote; the MIDI thread sends it. Never waits: a full queue drops the message.
+        let written = (out_count as usize).min(MAX_OUT);
+        for event in &self.out[..written] {
+            if event.kind != EVENT_MIDI {
+                continue;
+            }
+            // SAFETY: `kind` is EVENT_MIDI, so the `midi` member is the one the plugin wrote.
+            let midi = unsafe { event.data.midi };
+            let len = match midi.status & 0xf0 {
+                0x80 | 0x90 | 0xa0 | 0xb0 | 0xe0 => 3,
+                0xc0 | 0xd0 => 2,
+                _ => continue,
+            };
+            // Data bytes are 7 bits; the status byte carries the channel.
+            let message = MidiMessage { len, bytes: [(midi.status & 0xf0) | (midi.channel & 0x0f), midi.data1 & 0x7f, midi.data2 & 0x7f] };
+            shared.midi_out.push(message);
         }
     }
 }
 
-/// A single-producer, single-consumer ring of stereo frames.
-struct Ring {
-    data: Box<[std::cell::UnsafeCell<[f32; 2]>]>,
+/// A single-producer, single-consumer ring: the audio thread pushes, another thread pops.
+pub(crate) struct Ring<T> {
+    data: Box<[std::cell::UnsafeCell<T>]>,
     read: AtomicUsize,
     write: AtomicUsize,
 }
 
-// SAFETY: one producer (the input callback) and one consumer (the output
-// callback); each slot is written before `write` publishes it.
-unsafe impl Sync for Ring {}
+// SAFETY: one producer and one consumer; each slot is written before `write` publishes it.
+unsafe impl<T: Send> Sync for Ring<T> {}
 
-impl Ring {
-    fn new(frames: usize) -> Self {
-        Self { data: (0..frames).map(|_| std::cell::UnsafeCell::new([0.0; 2])).collect(), read: AtomicUsize::new(0), write: AtomicUsize::new(0) }
+impl<T: Copy + Default> Ring<T> {
+    fn new(len: usize) -> Self {
+        Self { data: (0..len).map(|_| std::cell::UnsafeCell::new(T::default())).collect(), read: AtomicUsize::new(0), write: AtomicUsize::new(0) }
     }
 
-    fn push(&self, frame: [f32; 2]) {
+    fn push(&self, value: T) {
         let (w, r) = (self.write.load(Ordering::Relaxed), self.read.load(Ordering::Acquire));
         let next = (w + 1) % self.data.len();
         if next == r {
-            return; // full: the output side stopped reading
+            return; // full: the consumer stopped reading
         }
-        unsafe { *self.data[w].get() = frame };
+        unsafe { *self.data[w].get() = value };
         self.write.store(next, Ordering::Release);
     }
 
-    fn pop(&self) -> Option<[f32; 2]> {
+    pub(crate) fn pop(&self) -> Option<T> {
         let (r, w) = (self.read.load(Ordering::Relaxed), self.write.load(Ordering::Acquire));
         if r == w {
             return None;
@@ -280,6 +323,6 @@ pub mod view_host {
     pub unsafe extern "C" fn end(_ctx: *mut c_void, _id: u32) {}
 
     pub fn for_shared(s: &Shared) -> ferritron_core::abi::ViewHost {
-        ferritron_core::abi::ViewHost { ctx: s.ctx(), get_param: get, begin_edit: begin, perform_edit: perform, end_edit: end }
+        ferritron_core::abi::ViewHost { ctx: s.ctx(), get_param: get, begin_edit: begin, perform_edit: perform, end_edit: end, request_resize: None }
     }
 }

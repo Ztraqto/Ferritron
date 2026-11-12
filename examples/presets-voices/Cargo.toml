@@ -1,0 +1,13 @@
+[package]
+name = "presets-voices"
+description = "Ferritron example: built-in display formats (N1), factory presets (N4) and per-voice parameter modulation (N5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron = { workspace = true }

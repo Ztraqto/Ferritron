@@ -1,0 +1,13 @@
+[plugin]
+id     = "dev.ferritron.examples.web-extras"
+name   = "Ferritron Web Extras"
+vendor = "Ztraqto"
+
+[params]
+gain = { type = "float", range = [-60, 12], default = 0, unit = "dB" }
+
+[view]
+backend    = "web"
+entry      = "ui"
+size       = [560, 420]
+background = "#16181d"

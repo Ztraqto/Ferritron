@@ -30,6 +30,12 @@ binary = "{name}.vst3/Contents/{arch}/{name}.{ext}"
 ext = { windows = "vst3", linux = "so" }
 arch = { windows-x86_64 = "x86_64-win", windows-aarch64 = "arm64-win", linux-x86_64 = "x86_64-linux", linux-aarch64 = "aarch64-linux" }
 install = { windows = "{COMMONPROGRAMFILES}/VST3", linux = "{HOME}/.vst3", macos = "{HOME}/Library/Audio/Plug-Ins/VST3" }
+# moduleinfo.json (VST 3.7.5): the classes, `[vst3] controller_id` and `compatibility`, for hosts that
+# read them without loading the plug-in. The class ID text differs per system (see `vst3_uid_string`).
+files = { "{name}.vst3/Contents/Resources/moduleinfo.json" = "moduleinfo.json" }
+
+[package.metadata.ferritron.format.windows]
+files = { "{name}.vst3/Contents/Resources/moduleinfo.json" = "moduleinfo-windows.json" }
 
 # macOS: a bundle with Info.plist; one binary for every architecture.
 [package.metadata.ferritron.format.macos]

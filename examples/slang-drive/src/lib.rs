@@ -45,12 +45,12 @@ impl Process for SlangDrive {
 
     fn process(&mut self, ctx: &mut Context) {
         let Some(node) = self.node.as_mut() else { return };
-        node.set(0, db_to_gain(ctx.params.drive.value()));
-        node.set(1, db_to_gain(ctx.params.output.value()));
-        let (n, channels) = (ctx.io.frames(), ctx.io.num_channels().min(CHANNELS));
+        node.set(0, db_to_gain(ctx.params().drive.value()));
+        node.set(1, db_to_gain(ctx.params().output.value()));
+        let (n, channels) = (ctx.io().frames(), ctx.io().num_channels().min(CHANNELS));
         for (ch, input) in self.inputs.iter_mut().enumerate() {
             if ch < channels {
-                input[..n].copy_from_slice(ctx.io.channel_mut(ch));
+                input[..n].copy_from_slice(ctx.io().channel_mut(ch));
             } else {
                 input[..n].fill(0.0);
             }
@@ -59,7 +59,7 @@ impl Process for SlangDrive {
         let [left, right] = &mut self.outputs[..] else { return };
         node.process(&ins, &mut [&mut left[..n], &mut right[..n]]);
         for ch in 0..channels {
-            ctx.io.channel_mut(ch).copy_from_slice(&self.outputs[ch][..n]);
+            ctx.io().channel_mut(ch).copy_from_slice(&self.outputs[ch][..n]);
         }
     }
 }
@@ -192,4 +192,12 @@ mod tests {
         gpu.process(&ones.iter().map(|c| &c[..]).collect::<Vec<_>>(), &mut out.iter_mut().map(|c| &mut c[..]).collect::<Vec<_>>(), &values);
         assert!((out[0][0] - 0.01).abs() < 1e-6, "reset clears the state: {}", out[0][0]);
     }
+}
+
+/// G5: parameter IDs, order and class ID are those of 1.4.0, and a state saved by 1.4.0 loads.
+#[cfg(test)]
+#[test]
+fn loads_state_saved_by_1_4_0() {
+    let n = ferritron::testing::check_fixture::<SlangDrive>(include_str!("../../../tests/fixtures/1.4.0/slang-drive.json")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(n > 0);
 }

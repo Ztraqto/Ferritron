@@ -47,22 +47,22 @@ impl Process for GainMatch {
     }
 
     fn process(&mut self, ctx: &mut Context) {
-        let n = ctx.io.frames();
+        let n = ctx.io().frames();
         if n == 0 {
             return;
         }
-        let channels = ctx.io.num_channels();
+        let channels = ctx.io().num_channels();
         let mut sum = 0.0;
         for ch in 0..channels {
-            sum += ctx.io.channel_mut(ch).iter().map(|s| s * s).sum::<f32>();
+            sum += ctx.io().channel_mut(ch).iter().map(|s| s * s).sum::<f32>();
         }
         let ms = sum / (n * channels.max(1)) as f32;
         let a = 1.0 - (-(n as f32) / (AVERAGE * self.sample_rate)).exp();
         self.level += (ms - self.level) * a;
 
-        let group = (ctx.params.group.value() as usize).clamp(1, GROUPS) - 1;
+        let group = (ctx.params().group.value() as usize).clamp(1, GROUPS) - 1;
         let Some(Some(port)) = self.ports.get(group) else { return };
-        if ctx.params.mode.index() == 0 {
+        if ctx.params().mode.index() == 0 {
             // Before: tell the group.
             port.publish(&[self.level]);
             return;
@@ -79,7 +79,7 @@ impl Process for GainMatch {
         for i in 0..n {
             self.gain += (target - self.gain) * step;
             for ch in 0..channels {
-                ctx.io.channel_mut(ch)[i] *= self.gain;
+                ctx.io().channel_mut(ch)[i] *= self.gain;
             }
         }
     }
@@ -147,4 +147,12 @@ mod tests {
         let out = pair(14.0, &mut reopened, 0.125);
         assert!((20.0 * (out / rms(&sine(0.5, 0))).log10()).abs() < 0.2);
     }
+}
+
+/// G5: parameter IDs, order and class ID are those of 1.4.0, and a state saved by 1.4.0 loads.
+#[cfg(test)]
+#[test]
+fn loads_state_saved_by_1_4_0() {
+    let n = ferritron::testing::check_fixture::<GainMatch>(include_str!("../../../tests/fixtures/1.4.0/gain-match.json")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(n > 0);
 }

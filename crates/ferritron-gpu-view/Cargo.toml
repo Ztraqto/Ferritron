@@ -7,7 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Editors drawn with Ferritron Native Graphics (`FngEditor`, `FngAdapter`), on the GPU and,
+# when the window has no GPU, on the CPU (`cpu` backend).
+fng = ["dep:ferritron-native-graphics", "ferritron-native-graphics/cpu"]
+
 [dependencies]
+ferritron-native-graphics = { workspace = true, optional = true }
 ferritron-core.workspace = true
 wgpu = "30"
 

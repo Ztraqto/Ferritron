@@ -12,8 +12,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #include "ferritron_abi.h"
+#include "ferritron_events.h"
 
 #include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/base/iplugincompatibility.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
@@ -23,7 +25,10 @@
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/vst/ivstmessage.h"
+#include "pluginterfaces/vst/ivstnoteexpression.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstremapparamid.h"
 #include "pluginterfaces/vst/ivstunits.h"
 #include "pluginterfaces/vst/vstspeaker.h"
 #ifdef FERRITRON_HAVE_ARA
@@ -41,9 +46,11 @@
 #include <algorithm>
 #include <mutex>
 #include <cmath>
+#include <cstdio>
 #include <atomic>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace Steinberg;
@@ -51,8 +58,47 @@ using namespace Steinberg::Vst;
 
 namespace {
 
-constexpr int32 kChannels = 2; // most channels per bus: stereo, or mono when the host asks
-constexpr uint32_t kMaxEvents = 1024; // automation points and notes per block
+constexpr int32 kChannels = 32; // most channels per bus
+// Hidden parameters that carry MIDI controllers to the plugin (IMidiMapping): per channel,
+// controllers 0..127, 128 = channel pressure, 129 = pitch bend, 130 = program change.
+constexpr ParamID kMidiParamBase = 0x40001000u;
+constexpr int32 kMidiCtrls = 131;
+constexpr int32 kMidiParamCount = 16 * kMidiCtrls;
+constexpr bool isMidiParam(ParamID id) { return id >= kMidiParamBase && id < kMidiParamBase + 16 * 256; }
+
+// A VST3 speaker bit as a Ferritron speaker id (FERRITRON_SPEAKER_*).
+uint32_t speakerId(int bit) {
+	switch (bit) {
+	case 0: return FERRITRON_SPEAKER_L;
+	case 1: return FERRITRON_SPEAKER_R;
+	case 2: return FERRITRON_SPEAKER_C;
+	case 3: return FERRITRON_SPEAKER_LFE;
+	case 4: return FERRITRON_SPEAKER_LS;
+	case 5: return FERRITRON_SPEAKER_RS;
+	case 6: return FERRITRON_SPEAKER_LC;
+	case 7: return FERRITRON_SPEAKER_RC;
+	case 8: return FERRITRON_SPEAKER_CS;
+	case 9: return FERRITRON_SPEAKER_LSS;
+	case 10: return FERRITRON_SPEAKER_RSS;
+	case 11: return FERRITRON_SPEAKER_TC;
+	case 12: return FERRITRON_SPEAKER_TFL;
+	case 13: return FERRITRON_SPEAKER_TFC;
+	case 14: return FERRITRON_SPEAKER_TFR;
+	case 15: return FERRITRON_SPEAKER_TRL;
+	case 16: return FERRITRON_SPEAKER_TRC;
+	case 17: return FERRITRON_SPEAKER_TRR;
+	case 18: return FERRITRON_SPEAKER_LFE2;
+	case 19: return FERRITRON_SPEAKER_C; // mono
+	case 24: return FERRITRON_SPEAKER_TSL;
+	case 25: return FERRITRON_SPEAKER_TSR;
+	case 28: return FERRITRON_SPEAKER_BFL;
+	case 29: return FERRITRON_SPEAKER_BFC;
+	case 30: return FERRITRON_SPEAKER_BFR;
+	case 35: return FERRITRON_SPEAKER_BRL;
+	default: return FERRITRON_SPEAKER_OTHER + static_cast<uint32_t>(bit);
+	}
+}
+constexpr uint32_t kMaxEvents = 2048; // automation points and notes per block; more are applied at once, untimed
 
 bool sameIid(const void* a, const TUID b) {
 	return a && std::memcmp(a, b, sizeof(TUID)) == 0;
@@ -159,6 +205,80 @@ bool writeAll(IBStream* stream, const std::vector<uint8_t>& data) {
 	return true;
 }
 
+
+// --- VST3 options the macro generates (`ferritron_vst3_options`) --------------
+//
+// Layout (see `vst3_options` in ferritron-macros): version 1, flags (1 controller class,
+// 2 compatibility class), controller ID, compatibility class ID, replaced class IDs, and
+// (old, new) pairs of parameter IDs for IRemapParamID. A plugin without the symbol has none.
+extern "C" const uint8_t ferritron_vst3_options[];
+extern "C" const uint8_t ferritron_vst3_no_options[] = {0};
+#if defined(_MSC_VER)
+#pragma comment(linker, "/alternatename:ferritron_vst3_options=ferritron_vst3_no_options")
+#endif
+
+struct Vst3Options {
+	bool controller = false;
+	bool compat = false;
+	uint8_t controllerId[16] = {};
+	uint8_t compatId[16] = {};
+	std::vector<std::vector<uint8_t>> replaces; // the digits in the order written
+	std::vector<std::pair<uint32_t, uint32_t>> remap;
+};
+
+const Vst3Options& options() {
+	static const Vst3Options parsed = [] {
+		Vst3Options o;
+		const uint8_t* b = ferritron_vst3_options;
+		if (!b || b[0] != 1)
+			return o;
+		o.controller = (b[1] & 1) != 0;
+		o.compat = (b[1] & 2) != 0;
+		std::memcpy(o.controllerId, b + 2, 16);
+		std::memcpy(o.compatId, b + 18, 16);
+		size_t at = 34;
+		for (int n = b[at++]; n > 0; --n, at += 16)
+			o.replaces.emplace_back(b + at, b + at + 16);
+		for (int pairs = b[at++]; pairs > 0; --pairs, at += 8) {
+			uint32_t oldId, newId;
+			std::memcpy(&oldId, b + at, 4);
+			std::memcpy(&newId, b + at + 4, 4);
+			o.remap.emplace_back(oldId, newId);
+		}
+		return o;
+	}();
+	return parsed;
+}
+
+// The 32 hex digits a host shows for 16 bytes of class ID (FUID::toString).
+std::string uidString(const uint8_t* id) {
+	uint8_t b[16];
+	std::memcpy(b, id, 16);
+#if COM_COMPATIBLE
+	std::reverse(b, b + 4);
+	std::reverse(b + 4, b + 6);
+	std::reverse(b + 6, b + 8);
+#endif
+	static const char* hex = "0123456789ABCDEF";
+	std::string out;
+	for (uint8_t x : b) {
+		out += hex[x >> 4];
+		out += hex[x & 15];
+	}
+	return out;
+}
+
+// 16 bytes as plain hex digits, the way the replaced plug-in's own moduleinfo.json wrote them.
+std::string plainHex(const uint8_t* id) {
+	static const char* hex = "0123456789ABCDEF";
+	std::string out;
+	for (int i = 0; i < 16; ++i) {
+		out += hex[id[i] >> 4];
+		out += hex[id[i] & 15];
+	}
+	return out;
+}
+
 // --- Plugin instance ---------------------------------------------------------
 
 // IComponent and IEditController both declare setState/getState with the same
@@ -185,6 +305,9 @@ protected:
 
 class Plugin;
 
+// Only Ferritron objects answer this: how the two halves of a `[vst3] controller_id` plugin find each other.
+static const TUID kPeerIid = INLINE_UID(0x67A0600B, 0x7D414892, 0xBFE127FA, 0x577935D1);
+
 /* Edits the plugin makes by itself (e.g. an AI client through the Ferritron
    MCP hub) arrive on any thread. They are queued and handed to the host on
    the main thread: on Windows by a timer that lives while plugins do, on
@@ -200,6 +323,7 @@ struct Edit {
 };
 std::mutex lock;
 std::vector<Edit> queue;
+std::vector<Plugin*> registry; // live plugins, for the main-thread poll (guarded by `lock`)
 int plugins = 0;
 #ifdef _WIN32
 UINT_PTR timer = 0;
@@ -228,16 +352,44 @@ class Plugin final : public ComponentBase,
                      public IAudioProcessor,
                      public ControllerBase,
                      public IProcessContextRequirements,
+                     public IMidiMapping,
+                     public IRemapParamID,
+                     public IUnitInfo,
+                     public INoteExpressionController,
 #ifdef FERRITRON_HAVE_ARA
                      public ARA::IPlugInEntryPoint,
                      public ARA::IPlugInEntryPoint2,
 #endif
-                     public ChannelContext::IInfoListener {
+                     public ChannelContext::IInfoListener,
+                     public IConnectionPoint {
 public:
 	Plugin(const ferritron_plugin_api* api, void* core)
 	: api(api), core(core), instrument(api->info->kind == FERRITRON_PLUGIN_INSTRUMENT) {
 		link = static_cast<const ferritron_host_api*>(api->get_extension(FERRITRON_EXT_HOST));
 		track = static_cast<const ferritron_track_api*>(api->get_extension(FERRITRON_EXT_TRACK));
+		transportApi = static_cast<const ferritron_transport_api*>(api->get_extension(FERRITRON_EXT_TRANSPORT));
+		mainApi = static_cast<const ferritron_main_api*>(api->get_extension(FERRITRON_EXT_MAIN));
+		findProgramParam();
+		if (const auto* v = static_cast<const ferritron_voices_api*>(api->get_extension(FERRITRON_EXT_VOICES)))
+			voices = v->capacity(core);
+		sidechainApi = static_cast<const ferritron_sidechain_api*>(api->get_extension(FERRITRON_EXT_SIDECHAIN));
+		layoutApi = static_cast<const ferritron_layout_api*>(api->get_extension(FERRITRON_EXT_LAYOUT));
+		const ferritron_plugin_info& pi = *api->info;
+		hasSidechain = (pi.audio_flags & FERRITRON_AUDIO_SIDECHAIN) != 0 && sidechainApi && !instrument;
+		midiIn = (pi.audio_flags & FERRITRON_AUDIO_MIDI_INPUT) != 0;
+		midiMap = midiIn && (pi.audio_flags & FERRITRON_AUDIO_HOST_CC) == 0;
+		minCh = static_cast<int32>(pi.min_channels);
+		maxCh = static_cast<int32>(pi.max_channels);
+		if (maxCh < minCh)
+			maxCh = minCh;
+		passthrough = (pi.audio_flags & FERRITRON_AUDIO_PASSTHROUGH) != 0;
+		scFixed = static_cast<int32>(pi.sidechain_channels);
+		// Stereo when the plugin allows it, else the narrowest it accepts.
+		busChannels = std::clamp<int32>(2, minCh, maxCh);
+		mainArr = arrangementOf(busChannels);
+		scChannels = scFixed > 0 ? scFixed : busChannels;
+		scArr = arrangementOf(scChannels);
+		applyLayout();
 		// Edits the plugin makes by itself; ctx is `this`, as for the editor's view host.
 		if (auto* link2 = static_cast<const ferritron_host_api2*>(api->get_extension(FERRITRON_EXT_HOST2))) {
 			ferritron_host_callbacks2 callbacks{
@@ -253,6 +405,7 @@ public:
 			link->attach(core, &callbacks);
 		}
 		std::lock_guard<std::mutex> guard(host_edits::lock);
+		host_edits::registry.push_back(this);
 #ifdef _WIN32
 		if (host_edits::plugins++ == 0) // created on the host's main thread
 			host_edits::timer = SetTimer(nullptr, 0, 30, host_edits::tick);
@@ -262,10 +415,13 @@ public:
 	}
 
 	~Plugin() {
+		unpeer();
 		{
 			std::lock_guard<std::mutex> guard(host_edits::lock);
 			auto& q = host_edits::queue;
 			q.erase(std::remove_if(q.begin(), q.end(), [this](const host_edits::Edit& e) { return e.plugin == this; }), q.end());
+			auto& reg = host_edits::registry;
+			reg.erase(std::remove(reg.begin(), reg.end(), this), reg.end());
 #ifdef _WIN32
 			if (--host_edits::plugins == 0 && host_edits::timer) {
 				KillTimer(nullptr, host_edits::timer);
@@ -281,6 +437,8 @@ public:
 
 	// ChannelContext::IInfoListener: the track the plugin sits on.
 	tresult PLUGIN_API setChannelContextInfos(IAttributeList* list) override {
+		if (separateController && peer) // a connected controller: the processor's instance is the one that has the track
+			return peer->setChannelContextInfos(list);
 		if (!list || (!link && !track))
 			return kResultOk;
 		String128 name{};
@@ -327,6 +485,11 @@ public:
 				info.index = static_cast<uint32_t>(index - 1); // VST3 counts from 1
 				info.flags |= FERRITRON_TRACK_HAS_INDEX;
 			}
+			int64 location = 0;
+			if (list->getInt(ChannelContext::kChannelPluginLocationKey, location) == kResultOk && location >= 0 && location <= 2) {
+				info.location = static_cast<uint32_t>(location);
+				info.flags |= FERRITRON_TRACK_HAS_LOCATION;
+			}
 			track->set_track_info(core, &info);
 		} else if (hasName) {
 			link->set_track_name(core, ferritron_str{utf8, static_cast<uint32_t>(len)});
@@ -336,14 +499,15 @@ public:
 
 	// An edit the plugin made by itself, on the main thread.
 	void hostEdited(uint32_t kind, uint32_t id, double normalized) {
-		if (!handler)
+		IComponentHandler* h = hostHandler();
+		if (!h)
 			return;
 		if (kind == host_edits::ONE_SHOT || kind == FERRITRON_EDIT_BEGIN)
-			handler->beginEdit(id);
+			h->beginEdit(id);
 		if (kind == host_edits::ONE_SHOT || kind == FERRITRON_EDIT_PERFORM)
-			handler->performEdit(id, normalized);
+			h->performEdit(id, normalized);
 		if (kind == host_edits::ONE_SHOT || kind == FERRITRON_EDIT_END)
-			handler->endEdit(id);
+			h->endEdit(id);
 	}
 
 	// FUnknown
@@ -356,10 +520,22 @@ public:
 			*obj = static_cast<IAudioProcessor*>(this);
 		else if (sameIid(requested, IEditController_iid))
 			*obj = static_cast<IEditController*>(this);
+		else if (midiMap && sameIid(requested, IMidiMapping_iid))
+			*obj = static_cast<IMidiMapping*>(this);
+		else if (!options().remap.empty() && sameIid(requested, IRemapParamID_iid))
+			*obj = static_cast<IRemapParamID*>(this);
 		else if (sameIid(requested, IProcessContextRequirements_iid))
 			*obj = static_cast<IProcessContextRequirements*>(this);
+		else if (programCount > 0 && sameIid(requested, IUnitInfo_iid))
+			*obj = static_cast<IUnitInfo*>(this);
+		else if (voices > 0 && sameIid(requested, INoteExpressionController_iid))
+			*obj = static_cast<INoteExpressionController*>(this);
 		else if (sameIid(requested, ChannelContext::IInfoListener_iid))
 			*obj = static_cast<ChannelContext::IInfoListener*>(this);
+		else if (sameIid(requested, IConnectionPoint_iid))
+			*obj = static_cast<IConnectionPoint*>(this);
+		else if (sameIid(requested, kPeerIid))
+			*obj = this;
 #ifdef FERRITRON_HAVE_ARA
 		else if (ara && sameIid(requested, ARA::IPlugInEntryPoint_iid))
 			*obj = static_cast<ARA::IPlugInEntryPoint*>(this);
@@ -392,8 +568,34 @@ public:
 	}
 
 	// IComponent
-	tresult PLUGIN_API getControllerClassId(TUID) override {
-		return kResultFalse; // no separate controller: query IEditController from this object
+	tresult PLUGIN_API getControllerClassId(TUID classId) override {
+		if (!options().controller)
+			return kResultFalse; // no separate controller: query IEditController from this object
+		std::memcpy(classId, options().controllerId, sizeof(TUID));
+		return kResultOk;
+	}
+
+	// IRemapParamID: Ferritron 1.3.0 hashed the IDs of its built-in parameters (Bypass, Quality,
+	// AI Access); from 1.4.0 they are fixed values from 0x40000000. A host replacing a plug-in of
+	// this class (an older version of this one) asks where an automated parameter went.
+	tresult PLUGIN_API getCompatibleParamID(const TUID pluginToReplaceUID, ParamID oldParamID, ParamID& newParamID) override {
+		if (!pluginToReplaceUID || std::memcmp(pluginToReplaceUID, api->info->class_id, sizeof(TUID)) != 0)
+			return kResultFalse; // the parameters of other plug-ins are not known here
+		for (const auto& pair : options().remap) {
+			if (pair.first == oldParamID) {
+				newParamID = pair.second;
+				return kResultTrue;
+			}
+		}
+		// Every other parameter kept its ID.
+		for (uint32_t i = 0, n = api->param_count(); i < n; ++i) {
+			ferritron_param_info info{};
+			if (api->param_info(i, &info) && info.id == oldParamID) {
+				newParamID = oldParamID;
+				return kResultTrue;
+			}
+		}
+		return kResultFalse;
 	}
 
 	tresult PLUGIN_API setIoMode(IoMode) override { return kResultOk; }
@@ -401,10 +603,13 @@ public:
 	// Effects: one stereo audio input and output. Instruments: one note input
 	// (event bus) and one stereo audio output.
 	int32 PLUGIN_API getBusCount(MediaType type, BusDirection dir) override {
-		if (type == kAudio)
-			return dir == kOutput || (dir == kInput && !instrument) ? 1 : 0;
+		if (type == kAudio) {
+			if (dir == kOutput)
+				return 1;
+			return (instrument ? 0 : 1) + (hasSidechain ? 1 : 0);
+		}
 		if (type == kEvent)
-			return dir == kInput && instrument ? 1 : 0;
+			return dir == kInput && (instrument || midiIn) ? 1 : 0;
 		return 0;
 	}
 
@@ -417,18 +622,57 @@ public:
 			return kInvalidArgument;
 		bus.mediaType = type;
 		bus.direction = dir;
-		bus.channelCount = type == kAudio ? busChannels : 16;
-		const char* name = type == kEvent ? "Notes" : dir == kInput ? "Input" : "Output";
+		const bool side = type == kAudio && dir == kInput && index == 1;
+		bus.channelCount = type == kAudio ? (side ? scChannels : busChannels) : 16;
+		const char* name = type == kEvent ? "Notes" : side ? "Sidechain" : dir == kInput ? "Input" : "Output";
 		copyUtf16(bus.name, 128, name, std::strlen(name));
-		bus.busType = kMain;
-		bus.flags = BusInfo::kDefaultActive;
+		bus.busType = side ? kAux : kMain;
+		bus.flags = side ? 0 : BusInfo::kDefaultActive; // the sidechain starts inactive
 		return kResultOk;
 	}
 
 	tresult PLUGIN_API getRoutingInfo(RoutingInfo&, RoutingInfo&) override { return kNotImplemented; }
 
-	tresult PLUGIN_API activateBus(MediaType type, BusDirection dir, int32 index, TBool) override {
-		return isBus(type, dir, index) ? kResultOk : kInvalidArgument;
+	tresult PLUGIN_API activateBus(MediaType type, BusDirection dir, int32 index, TBool state) override {
+		if (!isBus(type, dir, index))
+			return kInvalidArgument;
+		if (type == kAudio && dir == kInput && index == 1)
+			scActive = state != 0;
+		return kResultOk;
+	}
+
+	// The VST3 arrangement with `n` channels that hosts use (mono, stereo, 5.1, 7.1, ...), else the first n speakers.
+	static SpeakerArrangement arrangementOf(int32 n) {
+		switch (n) {
+		case 1: return SpeakerArr::kMono;
+		case 2: return SpeakerArr::kStereo;
+		case 3: return SpeakerArr::k30Cine;
+		case 4: return SpeakerArr::k40Music;
+		case 5: return SpeakerArr::k50;
+		case 6: return SpeakerArr::k51;
+		case 8: return SpeakerArr::k71Cine;
+		default: return n >= 64 ? ~SpeakerArrangement{0} : ((SpeakerArrangement{1} << n) - 1);
+		}
+	}
+
+	// Tells the plugin which speaker each channel of the main bus is.
+	void applyLayout() {
+		if (!layoutApi)
+			return;
+		uint32_t ids[kChannels];
+		uint32_t n = 0;
+		for (int bit = 0; bit < 64 && n < kChannels; ++bit)
+			if (mainArr & (SpeakerArrangement{1} << bit))
+				ids[n++] = speakerId(bit);
+		layoutApi->set(core, ids, n);
+	}
+
+	// IMidiMapping: controllers reach the plugin as hidden parameters.
+	tresult PLUGIN_API getMidiControllerAssignment(int32 busIndex, int16 channel, CtrlNumber number, ParamID& id) override {
+		if (!midiMap || busIndex != 0 || channel < 0 || channel > 15 || number < 0 || number >= kMidiCtrls)
+			return kResultFalse;
+		id = kMidiParamBase + static_cast<ParamID>(channel) * 256 + static_cast<ParamID>(number);
+		return kResultTrue;
 	}
 
 #ifdef FERRITRON_HAVE_ARA
@@ -448,7 +692,43 @@ public:
 	}
 #endif
 
+	// Main thread, from the shim's timer: work the plugin asked of the host from other threads
+	// (a new latency, parameter values changed in bulk).
+	void pollMain() {
+		// A latency change found in setActive is reported here, not from inside setActive.
+		if (latencyPending) {
+			latencyPending = false;
+			if (IComponentHandler* h = hostHandler())
+				h->restartComponent(kLatencyChanged);
+		}
+		if (!mainApi)
+			return;
+		uint32_t bits = mainApi->take_requests(core);
+		if (bits & FERRITRON_REQUEST_LATENCY) {
+			auto* ext = static_cast<const ferritron_latency_api*>(api->get_extension(FERRITRON_EXT_LATENCY));
+			uint32 now = ext ? ext->get(core) : 0;
+			if (now != latency) {
+				latency = now;
+				if (IComponentHandler* h = hostHandler())
+					h->restartComponent(kLatencyChanged);
+			}
+		}
+		IComponentHandler* h = hostHandler();
+		if ((bits & FERRITRON_REQUEST_VALUES) && h) {
+			h->restartComponent(kParamValuesChanged);
+			// Not an automation edit, but the project has changed: mark it dirty.
+			static const TUID kComponentHandler2Iid = INLINE_UID(0xF040B4B3, 0xA36045EC, 0xABCDC045, 0xB4D5A2CC);
+			IComponentHandler2* handler2 = nullptr;
+			if (h->queryInterface(kComponentHandler2Iid, reinterpret_cast<void**>(&handler2)) == kResultOk && handler2) {
+				handler2->setDirty(true);
+				handler2->release();
+			}
+		}
+	}
+
 	tresult PLUGIN_API setActive(TBool state) override {
+		if (state)
+			applyLayout();
 		if (ara)
 			ara->set_rendering(core, state != 0, sampleRate, static_cast<uint32_t>(busChannels), static_cast<uint32_t>(std::max<int32>(maxBlockSize, 0)));
 		if (state) {
@@ -460,8 +740,14 @@ public:
 			uint32 now = ext ? ext->get(core) : 0;
 			if (now != latency) {
 				latency = now;
+#ifdef _WIN32
+				// Some hosts do not like restartComponent inside setActive: the main-thread timer
+				// reports it on its next poll (pollMain). Other platforms have no such poll yet.
+				latencyPending = true;
+#else
 				if (handler)
 					handler->restartComponent(kLatencyChanged);
+#endif
 			}
 		}
 		return kResultOk; // a failed plugin outputs silence instead of failing the host
@@ -490,28 +776,56 @@ public:
 	Editor* openEditor = nullptr;
 
 	tresult getComponentStateImpl(IBStream* stream) override {
-		std::vector<uint8_t> data(api->save_state(core, nullptr, 0));
-		api->save_state(core, data.data(), static_cast<uint32_t>(data.size()));
-		return writeAll(stream, data) ? kResultOk : kResultFalse;
+		// The size can grow between the size query and the copy: try again, never save zeros.
+		for (int attempt = 0; attempt < 3; ++attempt) {
+			const uint32_t size = api->save_state(core, nullptr, 0);
+			std::vector<uint8_t> data(size);
+			const uint32_t written = api->save_state(core, data.data(), size);
+			if (written <= size) {
+				data.resize(written);
+				return writeAll(stream, data) ? kResultOk : kResultFalse;
+			}
+		}
+		return kResultFalse;
 	}
 
 	// IAudioProcessor
 	tresult PLUGIN_API setBusArrangements(SpeakerArrangement* inputs, int32 numIns, SpeakerArrangement* outputs,
 	                                      int32 numOuts) override {
-		// Stereo or mono; effects keep the input's layout.
-		auto supported = [](SpeakerArrangement a) { return a == SpeakerArr::kStereo || a == SpeakerArr::kMono; };
+		// Any arrangement whose channel count the plugin accepts; effects keep the input's layout.
+		auto supported = [&](SpeakerArrangement a) {
+			int32 n = SpeakerArr::getChannelCount(a);
+			return passthrough ? (n >= 1 && n <= kChannels) : (n >= minCh && n <= maxCh);
+		};
+		const int32 wantIns = instrument ? 0 : 1;
 		bool out = numOuts == 1 && outputs && supported(outputs[0]);
-		bool in = instrument ? numIns == 0 : numIns == 1 && inputs && out && inputs[0] == outputs[0];
+		bool in = numIns >= wantIns && numIns <= wantIns + (hasSidechain ? 1 : 0) && (numIns == 0 || inputs) && out &&
+		          (instrument || inputs[0] == outputs[0]);
 		if (!(in && out))
 			return kResultFalse;
-		busChannels = outputs[0] == SpeakerArr::kMono ? 1 : 2;
+		if (hasSidechain && numIns == wantIns + 1) {
+			int32 sc = SpeakerArr::getChannelCount(inputs[wantIns]);
+			if (sc < 1 || sc > kChannels || (scFixed > 0 && sc != scFixed))
+				return kResultFalse;
+			scArr = inputs[wantIns];
+			scChannels = sc;
+		}
+		mainArr = outputs[0];
+		busChannels = SpeakerArr::getChannelCount(mainArr);
+		passing = busChannels < minCh || busChannels > maxCh;
+		if (hasSidechain && scFixed == 0 && numIns != wantIns + 1) {
+			scArr = mainArr;
+			scChannels = busChannels;
+		}
+		if (!passing)
+			applyLayout();
 		return kResultTrue;
 	}
 
 	tresult PLUGIN_API getBusArrangement(BusDirection dir, int32 index, SpeakerArrangement& arr) override {
 		if (!isBus(kAudio, dir, index))
 			return kInvalidArgument;
-		arr = busChannels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
+		arr = dir == kInput && index == 1 ? scArr : mainArr;
 		return kResultOk;
 	}
 
@@ -536,39 +850,13 @@ public:
 		// Gather automation points and notes, sorted by sample offset, without allocating.
 		ferritron_event events[kMaxEvents];
 		uint32_t numEvents = 0;
-		auto insert = [&](const ferritron_event& ev) {
-			uint32_t at = numEvents++;
-			while (at > 0 && events[at - 1].offset > ev.offset) {
-				events[at] = events[at - 1];
-				--at;
-			}
-			events[at] = ev;
-		};
-		if (IParameterChanges* changes = data.inputParameterChanges) {
-			for (int32 i = 0, n = changes->getParameterCount(); i < n; ++i) {
-				IParamValueQueue* queue = changes->getParameterData(i);
-				if (!queue)
-					continue;
-				ParamID id = queue->getParameterId();
-				for (int32 p = 0, points = queue->getPointCount(); p < points; ++p) {
-					int32 offset = 0;
-					ParamValue value = 0;
-					if (queue->getPoint(p, offset, value) != kResultOk)
-						continue;
-					if (numEvents == kMaxEvents) {
-						api->set_param(core, id, value); // overflow: apply now, without timing
-						continue;
-					}
-					ferritron_event ev{};
-					ev.offset = static_cast<uint32_t>(std::max<int32>(offset, 0));
-					ev.type = FERRITRON_EVENT_PARAM;
-					ev.data.param.id = id;
-					ev.data.param.normalized = value;
-					insert(ev);
-				}
-			}
-		}
-		if (IEventList* list = instrument ? data.inputEvents : nullptr) {
+		// Parameter changes that did not fit in `events`: applied after the block, in order.
+		constexpr uint32_t kMaxLate = 256;
+		ferritron_event late[kMaxLate];
+		uint32_t numLate = 0;
+		// Collected in the order the host gives them, sorted once below (O(n log n)).
+		auto insert = [&](const ferritron_event& ev) { events[numEvents++] = ev; };
+		if (IEventList* list = (instrument || midiIn) ? data.inputEvents : nullptr) {
 			for (int32 i = 0, n = list->getEventCount(); i < n && numEvents < kMaxEvents; ++i) {
 				Event e{};
 				if (list->getEvent(i, e) != kResultOk)
@@ -582,16 +870,131 @@ public:
 				} else if (e.type == Event::kNoteOffEvent) {
 					ev.type = FERRITRON_EVENT_NOTE_OFF;
 					ev.data.note = {e.noteOff.noteId, e.noteOff.channel, e.noteOff.pitch, e.noteOff.velocity};
+				} else if (e.type == Event::kNoteExpressionValueEvent) {
+					// VST3 Note Expression: the standard types share CLAP's numbers (0 volume .. 5
+					// brightness); values come normalized and go out in CLAP's units.
+					const auto& x = e.noteExpressionValue;
+					if (x.typeId > kBrightnessTypeID)
+						continue;
+					double v = x.value;
+					if (x.typeId == kVolumeTypeID)
+						v *= 4.0; // linear gain, 0.25 = 0 dB
+					else if (x.typeId == kTuningTypeID)
+						v = 240.0 * (v - 0.5); // semitones
+					ev.type = FERRITRON_EVENT_NOTE_EXPRESSION;
+					ev.data.voice.note_id = x.noteId;
+					ev.data.voice.key = -1;
+					ev.data.voice.channel = -1;
+					ev.data.voice.target = x.typeId;
+					ev.data.voice.value = static_cast<float>(v);
+				} else if (e.type == Event::kPolyPressureEvent) {
+					ev.type = FERRITRON_EVENT_MIDI;
+					ev.data.midi.status = 0xA0;
+					ev.data.midi.channel = static_cast<uint8_t>(e.polyPressure.channel & 15);
+					ev.data.midi.data1 = static_cast<uint8_t>(e.polyPressure.pitch & 127);
+					ev.data.midi.data2 = static_cast<uint8_t>(std::clamp(e.polyPressure.pressure, 0.0f, 1.0f) * 127.0f + 0.5f);
+				} else if (e.type == Event::kLegacyMIDICCOutEvent) {
+					const auto& cc = e.midiCCOut;
+					ev.type = FERRITRON_EVENT_MIDI;
+					ev.data.midi.channel = static_cast<uint8_t>(cc.channel & 15);
+					if (cc.controlNumber < 128) {
+						ev.data.midi.status = 0xB0;
+						ev.data.midi.data1 = cc.controlNumber;
+						ev.data.midi.data2 = static_cast<uint8_t>(cc.value & 127);
+					} else if (cc.controlNumber == 128) {
+						ev.data.midi.status = 0xD0;
+						ev.data.midi.data1 = static_cast<uint8_t>(cc.value & 127);
+					} else if (cc.controlNumber == 129) {
+						ev.data.midi.status = 0xE0;
+						ev.data.midi.data1 = static_cast<uint8_t>(cc.value & 127);
+						ev.data.midi.data2 = static_cast<uint8_t>(cc.value2 & 127);
+					} else if (cc.controlNumber == 130) {
+						ev.data.midi.status = 0xC0;
+						ev.data.midi.data1 = static_cast<uint8_t>(cc.value & 127);
+					} else {
+						continue;
+					}
 				} else {
 					continue;
 				}
 				insert(ev);
 			}
 		}
+		if (IParameterChanges* changes = data.inputParameterChanges) {
+			for (int32 i = 0, n = changes->getParameterCount(); i < n; ++i) {
+				IParamValueQueue* queue = changes->getParameterData(i);
+				if (!queue)
+					continue;
+				ParamID id = queue->getParameterId();
+				for (int32 p = 0, points = queue->getPointCount(); p < points; ++p) {
+					int32 offset = 0;
+					ParamValue value = 0;
+					if (queue->getPoint(p, offset, value) != kResultOk)
+						continue;
+					if (numEvents == kMaxEvents) {
+						// Overflow: keep it for after the block (notes already have their room); apply now if that is full too.
+						if (numLate < kMaxLate) {
+							ferritron_event& ev = late[numLate++];
+							ev = ferritron_event{};
+							ev.type = FERRITRON_EVENT_PARAM;
+							ev.data.param.id = id;
+							ev.data.param.normalized = value;
+						} else {
+							api->set_param(core, id, value);
+						}
+						continue;
+					}
+					ferritron_event ev{};
+					ev.offset = static_cast<uint32_t>(std::max<int32>(offset, 0));
+					if (midiMap && isMidiParam(id)) {
+						// A controller the host mapped (IMidiMapping): becomes a MIDI message.
+						const uint32_t ch = (id - kMidiParamBase) / 256, ctrl = (id - kMidiParamBase) % 256;
+						const auto v7 = static_cast<uint8_t>(std::clamp(value, 0.0, 1.0) * 127.0 + 0.5);
+						ev.type = FERRITRON_EVENT_MIDI;
+						ev.data.midi.channel = static_cast<uint8_t>(ch);
+						if (ctrl < 128) {
+							ev.data.midi.status = 0xB0;
+							ev.data.midi.data1 = static_cast<uint8_t>(ctrl);
+							ev.data.midi.data2 = v7;
+						} else if (ctrl == 128) {
+							ev.data.midi.status = 0xD0;
+							ev.data.midi.data1 = v7;
+						} else if (ctrl == 129) {
+							const auto n = static_cast<uint32_t>(std::clamp(value, 0.0, 1.0) * 16383.0 + 0.5);
+							ev.data.midi.status = 0xE0;
+							ev.data.midi.data1 = static_cast<uint8_t>(n & 0x7F);
+							ev.data.midi.data2 = static_cast<uint8_t>(n >> 7);
+						} else if (ctrl == 130) {
+							ev.data.midi.status = 0xC0;
+							ev.data.midi.data1 = v7;
+						} else {
+							continue;
+						}
+						insert(ev);
+						continue;
+					}
+					ev.type = FERRITRON_EVENT_PARAM;
+					ev.data.param.id = id;
+					ev.data.param.normalized = value;
+					insert(ev);
+				}
+			}
+		}
+		if (!ferritron_events_sorted(events, numEvents)) {
+			ferritron_event scratch[kMaxEvents];
+			ferritron_sort_events(events, scratch, numEvents);
+		}
+		// Overflowed parameter changes, applied in their order after the block.
+		auto applyLate = [&] {
+			for (uint32_t i = 0; i < numLate; ++i)
+				api->set_param(core, late[i].data.param.id, late[i].data.param.normalized);
+			numLate = 0;
+		};
 		auto flushEvents = [&] {
 			for (uint32_t i = 0; i < numEvents; ++i)
 				if (events[i].type == FERRITRON_EVENT_PARAM)
 					api->set_param(core, events[i].data.param.id, events[i].data.param.normalized);
+			applyLate();
 		};
 
 		// A call without audio only flushes parameters.
@@ -628,6 +1031,52 @@ public:
 			ptrs[ch] = dst;
 		}
 
+		// The sidechain input, if the host connected it (read-only; the plugin treats a missing one as silence).
+		if (sidechainApi) {
+			if (hasSidechain && scActive && data.numInputs > 1 && data.inputs && data.inputs[1].channelBuffers32 && data.inputs[1].numChannels > 0)
+				sidechainApi->set(core, data.inputs[1].channelBuffers32, static_cast<uint32_t>(std::min(data.inputs[1].numChannels, kChannels)));
+			else
+				sidechainApi->set(core, nullptr, 0);
+		}
+
+		// The host's transport (tempo, time signature, play state, position) for this block.
+		if (transportApi) {
+			ferritron_transport t{};
+			if (const ProcessContext* c = data.processContext) {
+				if (c->state & ProcessContext::kTempoValid) {
+					t.flags |= FERRITRON_TRANSPORT_TEMPO;
+					t.tempo = c->tempo;
+				}
+				if (c->state & ProcessContext::kTimeSigValid) {
+					t.flags |= FERRITRON_TRANSPORT_TIME_SIGNATURE;
+					t.numerator = static_cast<uint16_t>(c->timeSigNumerator);
+					t.denominator = static_cast<uint16_t>(c->timeSigDenominator);
+				}
+				if (c->state & ProcessContext::kPlaying)
+					t.flags |= FERRITRON_TRANSPORT_PLAYING;
+				if (c->state & ProcessContext::kRecording)
+					t.flags |= FERRITRON_TRANSPORT_RECORDING;
+				if (c->state & ProcessContext::kProjectTimeMusicValid) {
+					t.flags |= FERRITRON_TRANSPORT_POSITION_BEATS;
+					t.position_beats = c->projectTimeMusic;
+				}
+				if (c->state & ProcessContext::kBarPositionValid) {
+					t.flags |= FERRITRON_TRANSPORT_BAR_START;
+					t.bar_start_beats = c->barPositionMusic;
+				}
+				t.flags |= FERRITRON_TRANSPORT_POSITION_SAMPLES;
+				t.position_samples = c->projectTimeSamples;
+				if (c->state & ProcessContext::kCycleValid) {
+					t.flags |= FERRITRON_TRANSPORT_LOOP_RANGE;
+					t.loop_start = c->cycleStartMusic;
+					t.loop_end = c->cycleEndMusic;
+				}
+				if (c->state & ProcessContext::kCycleActive)
+					t.flags |= FERRITRON_TRANSPORT_LOOPING;
+			}
+			transportApi->set(core, &t);
+		}
+
 		// An ARA playback renderer plays its regions at the song position; the plugin processes the result.
 		if (ara) {
 			const ProcessContext* context = data.processContext;
@@ -646,16 +1095,88 @@ public:
 
 		// VST3 has no host thread pool; Ferritron's own workers are used instead.
 		bool silent = false;
-		if (!api->process(core, ptrs, static_cast<uint32_t>(channels), static_cast<uint32_t>(frames), events, numEvents,
-		                  nullptr)) {
+		// Events the plugin writes (parameter moves, MIDI out) come back here.
+		constexpr uint32_t kMaxOut = 256;
+		ferritron_event outEvents[kMaxOut];
+		uint32_t outCount = 0;
+		const ferritron_process_data pd = {sizeof(pd), static_cast<uint32_t>(frames), static_cast<uint32_t>(channels), numEvents, ptrs, events, nullptr, outEvents, kMaxOut, &outCount};
+		if (passing) {
+			flushEvents(); // out of range: the input goes out unchanged
+		} else if (!api->process(core, &pd)) {
 			for (int32 ch = 0; ch < channels; ++ch)
 				std::memset(ptrs[ch], 0, frames * sizeof(float));
 		} else {
 			silent = sleepExt && sleepExt->silent(core);
+			sendOutEvents(data, outEvents, outCount);
 		}
+		applyLate();
 		// A sleeping plugin outputs silence: say so, hosts can skip work downstream.
 		out.silenceFlags = silent ? (uint64(1) << channels) - 1 : 0;
 		return kResultOk;
+	}
+
+	// Hands what the plugin produced during the block to the host: parameter
+	// moves as output parameter changes, MIDI as output events.
+	void sendOutEvents(ProcessData& data, const ferritron_event* out, uint32_t count) {
+		for (uint32_t i = 0; i < count; ++i) {
+			const ferritron_event& ev = out[i];
+			if (ev.type == FERRITRON_EVENT_PARAM && data.outputParameterChanges) {
+				int32 index = 0;
+				if (IParamValueQueue* queue = data.outputParameterChanges->addParameterData(ev.data.param.id, index)) {
+					int32 point = 0;
+					queue->addPoint(static_cast<int32>(ev.offset), ev.data.param.normalized, point);
+				}
+			} else if (ev.type == FERRITRON_EVENT_MIDI && data.outputEvents) {
+				Event e{};
+				e.busIndex = 0;
+				e.sampleOffset = static_cast<int32>(ev.offset);
+				const auto& m = ev.data.midi;
+				const int16 channel = m.channel & 15;
+				if (m.status == 0x90 || m.status == 0x80) {
+					const bool on = m.status == 0x90 && m.data2 > 0;
+					e.type = on ? Event::kNoteOnEvent : Event::kNoteOffEvent;
+					if (on) {
+						e.noteOn.channel = channel;
+						e.noteOn.pitch = m.data1;
+						e.noteOn.velocity = m.data2 / 127.0f;
+						e.noteOn.noteId = -1;
+					} else {
+						e.noteOff.channel = channel;
+						e.noteOff.pitch = m.data1;
+						e.noteOff.velocity = m.data2 / 127.0f;
+						e.noteOff.noteId = -1;
+					}
+				} else if (m.status == 0xA0) {
+					e.type = Event::kPolyPressureEvent;
+					e.polyPressure.channel = channel;
+					e.polyPressure.pitch = m.data1;
+					e.polyPressure.pressure = m.data2 / 127.0f;
+					e.polyPressure.noteId = -1;
+				} else {
+					e.type = Event::kLegacyMIDICCOutEvent;
+					e.midiCCOut.channel = static_cast<int8>(channel);
+					e.midiCCOut.value = 0;
+					e.midiCCOut.value2 = 0;
+					if (m.status == 0xB0) {
+						e.midiCCOut.controlNumber = m.data1;
+						e.midiCCOut.value = static_cast<int8>(m.data2);
+					} else if (m.status == 0xD0) {
+						e.midiCCOut.controlNumber = 128;
+						e.midiCCOut.value = static_cast<int8>(m.data1);
+					} else if (m.status == 0xE0) {
+						e.midiCCOut.controlNumber = 129;
+						e.midiCCOut.value = static_cast<int8>(m.data1);
+						e.midiCCOut.value2 = static_cast<int8>(m.data2);
+					} else if (m.status == 0xC0) {
+						e.midiCCOut.controlNumber = 130;
+						e.midiCCOut.value = static_cast<int8>(m.data1);
+					} else {
+						continue;
+					}
+				}
+				data.outputEvents->addEvent(e);
+			}
+		}
 	}
 
 	uint32 PLUGIN_API getTailSamples() override {
@@ -666,16 +1187,44 @@ public:
 	}
 
 	// IEditController
-	tresult PLUGIN_API setComponentState(IBStream*) override {
-		return kResultOk; // already applied through IComponent::setState on this same object
+	tresult PLUGIN_API setComponentState(IBStream* state) override {
+		// One object: already applied through IComponent::setState. A controller of its own
+		// (`[vst3] controller_id`) is a second instance, which takes the component's state here.
+		if (separateController && peer)
+			return kResultOk; // the processor took the state in IComponent::setState
+		return separateController ? setComponentStateImpl(state) : kResultOk;
 	}
+
+	/// This object was created as the controller class (`[vst3] controller_id`).
+	bool separateController = false;
 
 	tresult setControllerStateImpl(IBStream*) override { return kResultOk; }
 	tresult getControllerStateImpl(IBStream*) override { return kResultOk; }
 
-	int32 PLUGIN_API getParameterCount() override { return static_cast<int32>(api->param_count()); }
+	int32 PLUGIN_API getParameterCount() override {
+		return static_cast<int32>(api->param_count()) + (midiMap ? kMidiParamCount : 0);
+	}
 
 	tresult PLUGIN_API getParameterInfo(int32 index, ParameterInfo& out) override {
+		const int32 own = static_cast<int32>(api->param_count());
+		if (midiMap && index >= own && index < own + kMidiParamCount) {
+			const int32 i = index - own;
+			const int32 ch = i / kMidiCtrls, ctrl = i % kMidiCtrls;
+			out.id = kMidiParamBase + static_cast<ParamID>(ch) * 256 + static_cast<ParamID>(ctrl);
+			char title[64];
+			if (ctrl < 128)
+				std::snprintf(title, sizeof(title), "MIDI Ch%d CC%d", ch + 1, ctrl);
+			else
+				std::snprintf(title, sizeof(title), "MIDI Ch%d %s", ch + 1, ctrl == 128 ? "Pressure" : ctrl == 129 ? "Pitch Bend" : "Program");
+			copyUtf16(out.title, 128, title, std::strlen(title));
+			copyUtf16(out.shortTitle, 128, title, std::strlen(title));
+			copyUtf16(out.units, 128, "", 0);
+			out.stepCount = 0;
+			out.defaultNormalizedValue = ctrl == 129 ? 0.5 : 0.0;
+			out.unitId = kRootUnitId;
+			out.flags = ParameterInfo::kIsHidden;
+			return kResultOk;
+		}
 		ferritron_param_info info{};
 		if (index < 0 || !api->param_info(static_cast<uint32_t>(index), &info))
 			return kInvalidArgument;
@@ -691,8 +1240,131 @@ public:
 			out.flags |= ParameterInfo::kIsList;
 		if (info.flags & FERRITRON_PARAM_BYPASS)
 			out.flags |= ParameterInfo::kIsBypass;
-		if (info.flags & FERRITRON_PARAM_HIDDEN)
+		if (info.flags & FERRITRON_PARAM_PROGRAM)
+			out.flags = ParameterInfo::kIsProgramChange | ParameterInfo::kIsList; // shown in the host's program list
+		else if (info.flags & FERRITRON_PARAM_HIDDEN)
 			out.flags |= ParameterInfo::kIsHidden;
+		return kResultOk;
+	}
+
+	// IUnitInfo (plugins with [presets]): one root unit with one program list, the factory
+	// presets. The list's program-change parameter is Ferritron's built-in Program parameter;
+	// setting it loads the preset on the main thread.
+	static constexpr ProgramListID kProgramListId = 1;
+
+	// Finds the Program parameter once (constructor).
+	void findProgramParam() {
+		const uint32_t n = api->param_count();
+		for (uint32_t i = 0; i < n; ++i) {
+			ferritron_param_info info{};
+			if (api->param_info(i, &info) && (info.flags & FERRITRON_PARAM_PROGRAM)) {
+				programParam = info.id;
+				programCount = static_cast<int32>(info.step_count) + 1;
+				return;
+			}
+		}
+	}
+
+	int32 PLUGIN_API getUnitCount() override { return 1; }
+
+	tresult PLUGIN_API getUnitInfo(int32 unitIndex, UnitInfo& info) override {
+		if (unitIndex != 0)
+			return kInvalidArgument;
+		info.id = kRootUnitId;
+		info.parentUnitId = kNoParentUnitId;
+		copyUtf16(info.name, 128, "Root", 4);
+		info.programListId = programCount > 0 ? kProgramListId : kNoProgramListId;
+		return kResultOk;
+	}
+
+	int32 PLUGIN_API getProgramListCount() override { return programCount > 0 ? 1 : 0; }
+
+	tresult PLUGIN_API getProgramListInfo(int32 listIndex, ProgramListInfo& info) override {
+		if (listIndex != 0 || programCount <= 0)
+			return kInvalidArgument;
+		info.id = kProgramListId;
+		copyUtf16(info.name, 128, "Factory", 7);
+		info.programCount = programCount;
+		return kResultOk;
+	}
+
+	tresult PLUGIN_API getProgramName(ProgramListID listId, int32 programIndex, String128 name) override {
+		if (listId != kProgramListId || programIndex < 0 || programIndex >= programCount)
+			return kInvalidArgument;
+		char buf[256];
+		int32_t len = api->format_param(programParam, api->to_normalized(programParam, programIndex), buf, sizeof(buf));
+		if (len < 0)
+			return kResultFalse;
+		copyUtf16(name, 128, buf, static_cast<size_t>(len));
+		return kResultOk;
+	}
+
+	tresult PLUGIN_API getProgramInfo(ProgramListID, int32, Steinberg::Vst::CString, String128) override { return kResultFalse; }
+	tresult PLUGIN_API hasProgramPitchNames(ProgramListID, int32) override { return kResultFalse; }
+	tresult PLUGIN_API getProgramPitchName(ProgramListID, int32, int16, String128) override { return kResultFalse; }
+	UnitID PLUGIN_API getSelectedUnit() override { return kRootUnitId; }
+	tresult PLUGIN_API selectUnit(UnitID) override { return kResultOk; }
+	tresult PLUGIN_API getUnitByBus(MediaType, BusDirection, int32, int32, UnitID& unitId) override {
+		unitId = kRootUnitId;
+		return kResultOk;
+	}
+	tresult PLUGIN_API setUnitProgramData(int32, int32, IBStream*) override { return kNotImplemented; }
+
+	ParamID programParam = 0;
+	int32 programCount = 0;
+
+	// INoteExpressionController (instruments that say how many voices they play,
+	// Process::VOICES): the standard expressions, volume to brightness.
+	uint32_t voices = 0;
+
+	int32 PLUGIN_API getNoteExpressionCount(int32 busIndex, int16) override { return voices > 0 && busIndex == 0 ? kBrightnessTypeID + 1 : 0; }
+
+	tresult PLUGIN_API getNoteExpressionInfo(int32 busIndex, int16, int32 index, NoteExpressionTypeInfo& info) override {
+		if (voices == 0 || busIndex != 0 || index < 0 || index > static_cast<int32>(kBrightnessTypeID))
+			return kInvalidArgument;
+		static const char* const titles[] = {"Volume", "Pan", "Tuning", "Vibrato", "Expression", "Brightness"};
+		static const char* const units[] = {"", "", "st", "", "", ""};
+		info = NoteExpressionTypeInfo{};
+		info.typeId = static_cast<NoteExpressionTypeID>(index);
+		copyUtf16(info.title, 128, titles[index], std::strlen(titles[index]));
+		copyUtf16(info.shortTitle, 128, titles[index], std::strlen(titles[index]));
+		copyUtf16(info.units, 128, units[index], std::strlen(units[index]));
+		info.unitId = kRootUnitId;
+		info.valueDesc.minimum = 0.0;
+		info.valueDesc.maximum = 1.0;
+		info.valueDesc.defaultValue = index == kVolumeTypeID ? 0.25 : (index == kPanTypeID || index == kTuningTypeID) ? 0.5 : 0.0;
+		info.valueDesc.stepCount = 0;
+		info.associatedParameterId = kNoParamId;
+		info.flags = (index == kPanTypeID || index == kTuningTypeID) ? NoteExpressionTypeInfo::kIsBipolar : 0;
+		return kResultOk;
+	}
+
+	tresult PLUGIN_API getNoteExpressionStringByValue(int32, int16, NoteExpressionTypeID id, NoteExpressionValue v, String128 string) override {
+		char buf[64];
+		if (id == kVolumeTypeID)
+			std::snprintf(buf, sizeof(buf), v <= 0.0 ? "-inf dB" : "%.1f dB", 20.0 * std::log10(4.0 * v));
+		else if (id == kTuningTypeID)
+			std::snprintf(buf, sizeof(buf), "%+.2f st", 240.0 * (v - 0.5));
+		else if (id <= kBrightnessTypeID)
+			std::snprintf(buf, sizeof(buf), "%.0f%%", v * 100.0);
+		else
+			return kInvalidArgument;
+		copyUtf16(string, 128, buf, std::strlen(buf));
+		return kResultOk;
+	}
+
+	tresult PLUGIN_API getNoteExpressionValueByString(int32, int16, NoteExpressionTypeID id, const TChar* string, NoteExpressionValue& value) override {
+		std::string text = toUtf8(const_cast<TChar*>(string));
+		double x = 0;
+		if (id > kBrightnessTypeID || std::sscanf(text.c_str(), "%lf", &x) != 1)
+			return kResultFalse;
+		if (id == kVolumeTypeID)
+			value = std::pow(10.0, x / 20.0) / 4.0;
+		else if (id == kTuningTypeID)
+			value = x / 240.0 + 0.5;
+		else
+			value = x / 100.0;
+		value = std::clamp(value, 0.0, 1.0);
 		return kResultOk;
 	}
 
@@ -719,10 +1391,18 @@ public:
 		return api->to_normalized(id, value);
 	}
 
-	ParamValue PLUGIN_API getParamNormalized(ParamID id) override { return api->get_param(core, id); }
+	ParamValue PLUGIN_API getParamNormalized(ParamID id) override {
+		if (isMidiParam(id))
+			return id % 256 == 129 ? 0.5 : 0.0;
+		Plugin* values = valuesOwner();
+		return values->api->get_param(values->core, id);
+	}
 
 	tresult PLUGIN_API setParamNormalized(ParamID id, ParamValue value) override {
-		return api->set_param(core, id, value) ? kResultOk : kInvalidArgument;
+		if (isMidiParam(id))
+			return kResultOk; // controllers are events, not state
+		Plugin* values = valuesOwner();
+		return values->api->set_param(values->core, id, value) ? kResultOk : kInvalidArgument;
 	}
 
 	tresult PLUGIN_API setComponentHandler(IComponentHandler* next) override {
@@ -741,18 +1421,79 @@ public:
 	// so it can record automation.
 	double editorGet(ParamID id) { return api->get_param(core, id); }
 	void editorBegin(ParamID id) {
-		if (handler)
-			handler->beginEdit(id);
+		if (IComponentHandler* h = hostHandler())
+			h->beginEdit(id);
 	}
 	void editorPerform(ParamID id, ParamValue value) {
 		api->set_param(core, id, value);
-		if (handler)
-			handler->performEdit(id, api->get_param(core, id));
+		if (IComponentHandler* h = hostHandler())
+			h->performEdit(id, api->get_param(core, id));
 	}
 	void editorEnd(ParamID id) {
-		if (handler)
-			handler->endEdit(id);
+		if (IComponentHandler* h = hostHandler())
+			h->endEdit(id);
 	}
+
+	// The host's handler: this object's, else the connected partner's (`[vst3] controller_id`: the host
+	// gives the handler to the controller, the editor's edits come from the processor's instance).
+	IComponentHandler* hostHandler() const { return handler ? handler : (peer ? peer->handler : nullptr); }
+
+	// The processor's object when this is a connected controller: it owns the parameter values.
+	Plugin* valuesOwner() { return separateController && peer ? peer : this; }
+
+	// IConnectionPoint: the host connects the processor and the controller of a `[vst3] controller_id`
+	// plugin. Only objects of this plugin in this process are connected (a host that puts a proxy between
+	// them gets no link: the parts then run apart, as before).
+	tresult PLUGIN_API connect(IConnectionPoint* other) override {
+		if (!other)
+			return kInvalidArgument;
+		Plugin* that = nullptr;
+		if (other->queryInterface(kPeerIid, reinterpret_cast<void**>(&that)) != kResultOk || !that)
+			return kResultFalse;
+		that->release(); // the reference queryInterface added; the host keeps its own
+		if (that == this || that->api != api || separateController == that->separateController || (peer && peer != that) ||
+		    (that->peer && that->peer != this))
+			return kResultFalse;
+		if (peer == that)
+			return kResultOk;
+		peer = that;
+		that->peer = this;
+		// The controller holds the processor while they are connected (one reference, no cycle).
+		Plugin* controller = separateController ? this : that;
+		Plugin* processor = separateController ? that : this;
+		if (!controller->peerOwned) {
+			processor->addRef();
+			controller->peerOwned = true;
+		}
+		return kResultOk;
+	}
+
+	tresult PLUGIN_API disconnect(IConnectionPoint*) override {
+		unpeer();
+		return kResultOk;
+	}
+
+	tresult PLUGIN_API notify(IMessage*) override { return kResultOk; }
+
+	// Clears the link on both sides; the controller's reference to the processor goes with it.
+	void unpeer() {
+		Plugin* that = peer;
+		if (!that)
+			return;
+		peer = nullptr;
+		if (that->peer == this)
+			that->peer = nullptr;
+		Plugin* controller = separateController ? this : that;
+		Plugin* processor = separateController ? that : this;
+		if (controller->peerOwned) {
+			controller->peerOwned = false;
+			processor->release(); // may destroy `this`: nothing of it is used after this
+		}
+	}
+
+	// The processor (or the other half) this object is connected to, if any.
+	Plugin* peer = nullptr;
+	bool peerOwned = false;
 
 	// Editor size in logical pixels; kept while the plugin lives, so a
 	// reopened editor has the size the user chose.
@@ -760,7 +1501,12 @@ public:
 	uint32_t editorHeight = 0;
 
 	// IProcessContextRequirements
-	uint32 PLUGIN_API getProcessContextRequirements() override { return 0; }
+	uint32 PLUGIN_API getProcessContextRequirements() override {
+		return transportApi ? (IProcessContextRequirements::kNeedTempo | IProcessContextRequirements::kNeedTimeSignature |
+		                       IProcessContextRequirements::kNeedProjectTimeMusic | IProcessContextRequirements::kNeedBarPositionMusic |
+		                       IProcessContextRequirements::kNeedTransportState | IProcessContextRequirements::kNeedCycleMusic)
+		                    : 0;
+	}
 
 private:
 	const ferritron_plugin_api* api;
@@ -769,15 +1515,29 @@ private:
 	const ferritron_render_api* renderExt = static_cast<const ferritron_render_api*>(api->get_extension(FERRITRON_EXT_RENDER));
 	const ferritron_sleep_api* sleepExt = static_cast<const ferritron_sleep_api*>(api->get_extension(FERRITRON_EXT_SLEEP));
 	bool liveOffline = false; // last told to the plugin from process()
-	int32 busChannels = kChannels;
+	int32 busChannels = 2;
 	const bool instrument;
 	std::atomic<uint32> refs{1};
 	IComponentHandler* handler = nullptr;
 	const ferritron_host_api* link = nullptr;
 	const ferritron_track_api* track = nullptr;
+	const ferritron_transport_api* transportApi = nullptr;
+	const ferritron_main_api* mainApi = nullptr;
+	const ferritron_sidechain_api* sidechainApi = nullptr;
+	const ferritron_layout_api* layoutApi = nullptr;
+	bool hasSidechain = false;
+	bool midiIn = false;
+	bool midiMap = false;
+	bool passthrough = false;
+	bool scActive = false;
+	bool passing = false; // an arrangement outside the plugin's range: the audio passes through
+	int32 minCh = 1, maxCh = 2, scFixed = 0, scChannels = 2;
+	SpeakerArrangement mainArr = SpeakerArr::kStereo;
+	SpeakerArrangement scArr = SpeakerArr::kStereo;
 	SampleRate sampleRate = 44100.0;
 	int32 maxBlockSize = 1024;
 	uint32 latency = 0;
+	bool latencyPending = false; // a latency change from setActive, reported by the next pollMain
 	bool offline = false;
 };
 
@@ -808,16 +1568,33 @@ void CALLBACK tick(HWND, UINT, UINT_PTR, DWORD) {
 	drain(nullptr);
 }
 #endif
+// Main thread only. True while `plugin` is still registered. A call into the host (restartComponent,
+// performEdit) may make the host destroy an instance, so the check is made again before each call.
+bool alive(Plugin* plugin) {
+	std::lock_guard<std::mutex> guard(lock);
+	return std::find(registry.begin(), registry.end(), plugin) != registry.end();
+}
 #if defined(_WIN32) || defined(__APPLE__)
 void drain(void*) {
 	std::vector<Edit> pending;
+	std::vector<Plugin*> live;
 	{
 		std::lock_guard<std::mutex> guard(lock);
 		pending.swap(queue);
+		live = registry;
+	}
+	// Plugins are created and destroyed on this thread. A plugin the host destroys during the
+	// poll is skipped from then on (its edits were removed from the queue by ~Plugin).
+	for (Plugin* plugin : live) {
+		if (alive(plugin))
+			plugin->pollMain();
 	}
 	for (auto& e : pending) {
-		// A plugin destroyed meanwhile removed its edits from the queue under the lock.
-		deliver(e.plugin, e.kind, e.id, e.normalized);
+		// Checked under the lock, then delivered outside it: deliver() calls the host, and the
+		// host may take the same lock or destroy the plugin. Nothing else destroys a plugin
+		// between this check and the call, because drain and ~Plugin run on the same thread.
+		if (alive(e.plugin))
+			deliver(e.plugin, e.kind, e.id, e.normalized);
 	}
 }
 #endif
@@ -830,6 +1607,13 @@ public:
 		host.ctx = plugin;
 		host.get_param = [](void* ctx, uint32_t id) { return static_cast<Plugin*>(ctx)->editorGet(id); };
 		host.begin_edit = [](void* ctx, uint32_t id) { static_cast<Plugin*>(ctx)->editorBegin(id); };
+		host.request_resize = [](void* ctx, uint32_t w, uint32_t h) -> bool {
+			auto* open = static_cast<Plugin*>(ctx)->openEditor;
+			if (!open || !open->frame)
+				return false;
+			ViewRect size(0, 0, static_cast<int32>(w), static_cast<int32>(h));
+			return open->frame->resizeView(open, &size) == kResultOk;
+		};
 		host.perform_edit = [](void* ctx, uint32_t id, double v) { static_cast<Plugin*>(ctx)->editorPerform(id, v); };
 		host.end_edit = [](void* ctx, uint32_t id) { static_cast<Plugin*>(ctx)->editorEnd(id); };
 		uint32_t w = 0, h = 0;
@@ -1034,7 +1818,9 @@ IPlugView* PLUGIN_API Plugin::createView(FIDString name) {
 	if (!name || std::strcmp(name, ViewType::kEditor) != 0)
 		return nullptr;
 	auto* viewApi = static_cast<const ferritron_view_api*>(api->get_extension(FERRITRON_EXT_VIEW));
-	return viewApi ? new Editor(this, viewApi) : nullptr;
+	// A connected controller opens the processor's editor: that instance has the values, streams and messages.
+	Plugin* owner = separateController && peer ? peer : this;
+	return viewApi ? new Editor(owner, viewApi) : nullptr;
 }
 
 // --- Factory -----------------------------------------------------------------
@@ -1070,6 +1856,54 @@ private:
 };
 #endif
 
+// The "Plugin Compatibility Class" (VST 3.7.5): for hosts that find no moduleinfo.json in the
+// bundle, it writes the same `Compatibility` list as JSON: this plug-in's class takes over
+// the classes in `[vst3] compatibility = { replaces = [...] }`.
+class Compatibility final : public IPluginCompatibility {
+public:
+	explicit Compatibility(const uint8_t* classId) { std::memcpy(id, classId, sizeof(id)); }
+
+	tresult PLUGIN_API queryInterface(const TUID requested, void** obj) override {
+		if (!obj)
+			return kInvalidArgument;
+		if (sameIid(requested, FUnknown_iid) || sameIid(requested, IPluginCompatibility_iid)) {
+			*obj = static_cast<IPluginCompatibility*>(this);
+			addRef();
+			return kResultOk;
+		}
+		*obj = nullptr;
+		return kNoInterface;
+	}
+	uint32 PLUGIN_API addRef() override { return ++refs; }
+	uint32 PLUGIN_API release() override {
+		uint32 remaining = --refs;
+		if (remaining == 0)
+			delete this;
+		return remaining;
+	}
+
+	tresult PLUGIN_API getCompatibilityJSON(IBStream* stream) override {
+		std::string json = "[";
+		if (!options().replaces.empty()) {
+			json += "{\"New\":\"" + uidString(id) + "\",\"Old\":[";
+			bool first = true;
+			for (const auto& old : options().replaces) {
+				if (!first)
+					json += ",";
+				first = false;
+				json += "\"" + plainHex(old.data()) + "\"";
+			}
+			json += "]}";
+		}
+		json += "]";
+		return writeAll(stream, std::vector<uint8_t>(json.begin(), json.end())) ? kResultTrue : kResultFalse;
+	}
+
+private:
+	uint8_t id[16];
+	std::atomic<uint32> refs{1};
+};
+
 class Factory final : public IPluginFactory3 {
 public:
 	explicit Factory(const ferritron_plugin_api* api) : api(api), info(*api->info) {}
@@ -1100,7 +1934,25 @@ public:
 		return kResultOk;
 	}
 
-	int32 PLUGIN_API countClasses() override { return araApi(api) ? 2 : 1; }
+	// Class 0 is the component; then ARA's main factory (with ARA), the edit controller
+	// (`[vst3] controller_id`) and the compatibility class (`[vst3] compatibility`).
+	enum class Kind { Audio, Ara, Controller, Compat, None };
+	Kind kindAt(int32 index) const {
+		int32 i = 0;
+		if (index == i++)
+			return Kind::Audio;
+		if (araApi(api) && index == i++)
+			return Kind::Ara;
+		if (options().controller && index == i++)
+			return Kind::Controller;
+		if (options().compat && index == i++)
+			return Kind::Compat;
+		return Kind::None;
+	}
+
+	int32 PLUGIN_API countClasses() override {
+		return 1 + (araApi(api) ? 1 : 0) + (options().controller ? 1 : 0) + (options().compat ? 1 : 0);
+	}
 
 	// Class 1 (with ARA): the ARA main factory. Its ID is the plugin's with the last byte flipped.
 	void araClassId(TUID out) const {
@@ -1117,10 +1969,21 @@ public:
 		setName(out);
 		return kResultOk;
 	}
+	// The controller and compatibility classes (same fields as the ARA class, other IDs).
+	template <typename Info, typename SetName>
+	tresult extraClassInfo(Info* out, Kind kind, SetName setName) {
+		std::memcpy(out->cid, kind == Kind::Controller ? options().controllerId : options().compatId, sizeof(TUID));
+		out->cardinality = PClassInfo::kManyInstances;
+		copyUtf8(out->category, PClassInfo::kCategorySize, str(kind == Kind::Controller ? kVstComponentControllerClass : kPluginCompatibilityClass));
+		setName(out);
+		return kResultOk;
+	}
 
 	tresult PLUGIN_API getClassInfo(int32 index, PClassInfo* out) override {
-		if (index == 1 && out && araApi(api))
+		if (out && kindAt(index) == Kind::Ara)
 			return araClassInfo(out, [&](PClassInfo* o) { copyUtf8(o->name, PClassInfo::kNameSize, info.name); });
+		if (out && (kindAt(index) == Kind::Controller || kindAt(index) == Kind::Compat))
+			return extraClassInfo(out, kindAt(index), [&](PClassInfo* o) { copyUtf8(o->name, PClassInfo::kNameSize, str(extraName(kindAt(index)).c_str())); });
 		if (index != 0 || !out)
 			return kInvalidArgument;
 		std::memcpy(out->cid, info.class_id, sizeof(TUID));
@@ -1131,7 +1994,16 @@ public:
 	}
 
 	tresult PLUGIN_API getClassInfo2(int32 index, PClassInfo2* out) override {
-		if (index == 1 && out && araApi(api))
+		if (out && (kindAt(index) == Kind::Controller || kindAt(index) == Kind::Compat))
+			return extraClassInfo(out, kindAt(index), [&](PClassInfo2* o) {
+				copyUtf8(o->name, PClassInfo::kNameSize, str(extraName(kindAt(index)).c_str()));
+				o->classFlags = 0;
+				copyUtf8(o->subCategories, PClassInfo2::kSubCategoriesSize, str(""));
+				copyUtf8(o->vendor, PClassInfo2::kVendorSize, info.vendor);
+				copyUtf8(o->version, PClassInfo2::kVersionSize, info.version);
+				copyUtf8(o->sdkVersion, PClassInfo2::kVersionSize, str(kVstVersionString));
+			});
+		if (out && kindAt(index) == Kind::Ara)
 			return araClassInfo(out, [&](PClassInfo2* o) {
 				copyUtf8(o->name, PClassInfo::kNameSize, info.name);
 				o->classFlags = 0;
@@ -1147,7 +2019,7 @@ public:
 		copyUtf8(out->category, PClassInfo::kCategorySize, str(kVstAudioEffectClass));
 		copyUtf8(out->name, PClassInfo::kNameSize, info.name);
 		out->classFlags = 0;
-		copyUtf8(out->subCategories, PClassInfo2::kSubCategoriesSize, str(subCategories()));
+		copyUtf8(out->subCategories, PClassInfo2::kSubCategoriesSize, str(subCategoriesText().c_str()));
 		copyUtf8(out->vendor, PClassInfo2::kVendorSize, info.vendor);
 		copyUtf8(out->version, PClassInfo2::kVersionSize, info.version);
 		copyUtf8(out->sdkVersion, PClassInfo2::kVersionSize, str(kVstVersionString));
@@ -1155,7 +2027,16 @@ public:
 	}
 
 	tresult PLUGIN_API getClassInfoUnicode(int32 index, PClassInfoW* out) override {
-		if (index == 1 && out && araApi(api))
+		if (out && (kindAt(index) == Kind::Controller || kindAt(index) == Kind::Compat))
+			return extraClassInfo(out, kindAt(index), [&](PClassInfoW* o) {
+				copyUtf16(o->name, PClassInfo::kNameSize, str(extraName(kindAt(index)).c_str()));
+				o->classFlags = 0;
+				copyUtf8(o->subCategories, PClassInfoW::kSubCategoriesSize, str(""));
+				copyUtf16(o->vendor, PClassInfoW::kVendorSize, info.vendor);
+				copyUtf16(o->version, PClassInfoW::kVersionSize, info.version);
+				copyUtf16(o->sdkVersion, PClassInfoW::kVersionSize, str(kVstVersionString));
+			});
+		if (out && kindAt(index) == Kind::Ara)
 			return araClassInfo(out, [&](PClassInfoW* o) {
 				copyUtf16(o->name, PClassInfo::kNameSize, info.name);
 				o->classFlags = 0;
@@ -1171,7 +2052,7 @@ public:
 		copyUtf8(out->category, PClassInfo::kCategorySize, str(kVstAudioEffectClass));
 		copyUtf16(out->name, PClassInfo::kNameSize, info.name);
 		out->classFlags = 0;
-		copyUtf8(out->subCategories, PClassInfoW::kSubCategoriesSize, str(subCategories()));
+		copyUtf8(out->subCategories, PClassInfoW::kSubCategoriesSize, str(subCategoriesText().c_str()));
 		copyUtf16(out->vendor, PClassInfoW::kVendorSize, info.vendor);
 		copyUtf16(out->version, PClassInfoW::kVersionSize, info.version);
 		copyUtf16(out->sdkVersion, PClassInfoW::kVersionSize, str(kVstVersionString));
@@ -1192,12 +2073,26 @@ public:
 			return result;
 		}
 #endif
-		if (std::memcmp(cid, info.class_id, sizeof(TUID)) != 0)
+		if (options().compat && std::memcmp(cid, options().compatId, sizeof(TUID)) == 0) {
+			auto* compat = new Compatibility(info.class_id);
+			tresult result = compat->queryInterface(reinterpret_cast<const int8*>(requested), obj);
+			compat->release();
+			return result;
+		}
+		const bool asController = options().controller && std::memcmp(cid, options().controllerId, sizeof(TUID)) == 0;
+		if (!asController && std::memcmp(cid, info.class_id, sizeof(TUID)) != 0)
 			return kResultFalse;
 		void* core = api->create();
 		if (!core)
 			return kResultFalse;
+		if (asController) {
+			// Not an instance people use: out of instances() and the MCP hub. Older cores lack it; then it is listed.
+			auto* role = static_cast<const ferritron_role_api*>(api->get_extension(FERRITRON_EXT_ROLE));
+			if (role && role->struct_size >= sizeof(ferritron_role_api) && role->set_role)
+				role->set_role(core, FERRITRON_ROLE_CONTROLLER);
+		}
 		auto* plugin = new Plugin(api, core);
+		plugin->separateController = asController;
 		// The object starts with one reference: hand the host its own and drop ours.
 		tresult result = plugin->queryInterface(reinterpret_cast<const int8*>(requested), obj);
 		plugin->release();
@@ -1208,6 +2103,16 @@ public:
 
 private:
 	static ferritron_str str(const char* s) { return {s, static_cast<uint32_t>(std::strlen(s))}; }
+
+	std::string extraName(Kind kind) const {
+		return std::string(info.name.ptr, info.name.len) + (kind == Kind::Controller ? " Controller" : " Compatibility");
+	}
+
+	std::string subCategoriesText() const {
+		if (info.vst3_subcategories.len > 0)
+			return std::string(info.vst3_subcategories.ptr, info.vst3_subcategories.len);
+		return subCategories();
+	}
 
 	const char* subCategories() const {
 		switch (info.kind) {

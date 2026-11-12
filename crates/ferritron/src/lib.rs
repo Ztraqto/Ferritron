@@ -9,8 +9,8 @@
 //! #[ferritron::plugin]
 //! impl Process for Gain {
 //!     fn process(&mut self, ctx: &mut Context) {
-//!         let gain = db_to_gain(ctx.params.gain.value());
-//!         ctx.io.for_each_sample(|s| *s *= gain);
+//!         let gain = db_to_gain(ctx.params().gain.value());
+//!         ctx.io().for_each_sample(|s| *s *= gain);
 //!     }
 //! }
 //! ```
@@ -20,7 +20,7 @@
 pub use ferritron_core::*;
 pub use ferritron_macros::plugin;
 
-/// The Ferritron version this plugin is built with (e.g. `"1.3.0"`).
+/// The Ferritron version this plugin is built with (e.g. `"2.0.0"`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Plugin formats. Linking a format crate is all it takes to export that
@@ -40,6 +40,11 @@ use ferritron_standalone as _;
 use ferritron_auv3 as _;
 #[cfg(all(feature = "aax", any(windows, target_os = "macos")))]
 use ferritron_aax as _;
+#[cfg(all(feature = "vst2", any(windows, target_os = "macos", target_os = "linux")))]
+use ferritron_vst2 as _;
+
+#[cfg(feature = "dsp")]
+pub use ferritron_dsp as dsp;
 
 #[cfg(feature = "web")]
 #[doc(hidden)]
@@ -110,7 +115,7 @@ macro_rules! __require_ara {
 
 pub mod prelude {
     pub use crate::util::{db_to_gain, gain_to_db};
-    pub use crate::{BoolParam, EnumParam, FloatParam, IntParam, Process, Quality, Setup, Tail};
+    pub use crate::{BoolParam, EnumParam, FloatParam, IntParam, ParamRef, ParsedText, Process, Quality, Setup, Tail};
 }
 
 /// Exports `ferritron_plugin_entry`, the format-independent entry point.

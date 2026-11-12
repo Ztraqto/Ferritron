@@ -1,0 +1,11 @@
+{
+  "plugin": "dev.ferritron.examples.instances",
+  "ferritron": "1.4.0",
+  "class_id": "6fd35c93ad6c70f7ca9f783c83184fa1",
+  "params": [
+    {"index": 0, "id": 1973533079, "name": "レベル", "flags": 0, "default": 0.8333333333333334, "value": 0.20999999999999996},
+    {"index": 1, "id": 38022426, "name": "色のシード", "flags": 12, "default": 0, "value": 0.5803921568627451},
+    {"index": 2, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1}
+  ],
+  "state": "4652544e010000000500000097b9a175713d0ad7a37046c01a2d4402000000000080624000000040000000000000f03f030000400000e09790feec4104000040000000b9e1c7c741"
+}

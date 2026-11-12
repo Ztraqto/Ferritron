@@ -119,6 +119,9 @@ public static unsafe class Host
         public uint Kind;
         public fixed byte ClassId[16];
         public uint Isolation;
+        // Added in 1.3.1 (the shims read them; leaving them out let CLAP read past the struct).
+        public Str Vst3Subcategories, ClapFeatures;
+        public uint AudioFlags, MinChannels, MaxChannels, SidechainChannels, Vst2Id;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -129,6 +132,21 @@ public static unsafe class Host
         public uint StepCount;
         public double DefaultNormalized;
         public uint Flags;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 64)]
+    unsafe struct ProcessData
+    {
+        [FieldOffset(0)] public uint Size;
+        [FieldOffset(4)] public uint Frames;
+        [FieldOffset(8)] public uint NumChannels;
+        [FieldOffset(12)] public uint NumEvents;
+        [FieldOffset(16)] public float** Channels;
+        [FieldOffset(24)] public Event* Events;
+        [FieldOffset(32)] public void* Executor;
+        [FieldOffset(40)] public Event* OutEvents;
+        [FieldOffset(48)] public uint OutCapacity;
+        [FieldOffset(56)] public uint* OutCount;
     }
 
     [StructLayout(LayoutKind.Explicit, Size = 24)]
@@ -158,10 +176,11 @@ public static unsafe class Host
         public delegate* unmanaged<uint, double, byte*, uint, int> FormatParam;
         public delegate* unmanaged<uint, Str, double*, byte> ParseParam;
         public delegate* unmanaged<void*, double, uint, byte> Activate;
-        public delegate* unmanaged<void*, float**, uint, uint, Event*, uint, void*, byte> Process;
+        public delegate* unmanaged<void*, ProcessData*, byte> Process;
         public delegate* unmanaged<void*, byte*, uint, uint> SaveState;
         public delegate* unmanaged<void*, byte*, uint, byte> LoadState;
         public delegate* unmanaged<byte*, void*> GetExtension;
+        public delegate* unmanaged<void*, void> Reset;
     }
 
     [StructLayout(LayoutKind.Sequential)] struct LatencyApi { public delegate* unmanaged<void*, uint> Get; }
@@ -228,6 +247,9 @@ public static unsafe class Host
         info->Url = Utf8(pluginInfo.Url);
         info->Email = Utf8(pluginInfo.Email);
         info->Kind = (uint)pluginInfo.Kind;
+        // Empty strings and 0 IDs: the formats' defaults. Mono or stereo, as Rust plugins without `[audio]`.
+        info->MinChannels = 1;
+        info->MaxChannels = 2;
         ulong a = Fnv1a64(pluginInfo.Id, 0x666572726974726ful), b = Fnv1a64(pluginInfo.Id, 0x6e00000000000001ul);
         for (int k = 0; k < 8; k++)
         {
@@ -238,7 +260,7 @@ public static unsafe class Host
         latencyApi->Get = &GetLatency;
         var t = (Api*)NativeMemory.AllocZeroed((nuint)sizeof(Api));
         t->StructSize = (uint)sizeof(Api);
-        t->AbiVersion = 1;
+        t->AbiVersion = 2;
         t->Info = info;
         t->Create = &Create;
         t->Destroy = &Destroy;
@@ -255,6 +277,7 @@ public static unsafe class Host
         t->SaveState = &SaveState;
         t->LoadState = &LoadState;
         t->GetExtension = &GetExtension;
+        t->Reset = &Reset;
         api = t;
         return api;
     }
@@ -395,6 +418,14 @@ public static unsafe class Host
     }
 
     [UnmanagedCallersOnly]
+    static void Reset(void* p)
+    {
+        var inst = Self(p);
+        try { inst.Plugin.Reset(); }
+        catch { inst.Failed = true; }
+    }
+
+    [UnmanagedCallersOnly]
     static byte Activate(void* p, double sampleRate, uint maxBlock)
     {
         var inst = Self(p);
@@ -425,8 +456,11 @@ public static unsafe class Host
     }
 
     [UnmanagedCallersOnly]
-    static byte Process(void* p, float** channels, uint count, uint frames, Event* events, uint numEvents, void* executor)
+    static byte Process(void* p, ProcessData* data)
     {
+        float** channels = data->Channels;
+        uint count = data->NumChannels, frames = data->Frames, numEvents = data->NumEvents;
+        Event* events = data->Events;
         // Denormals are flushed by the Rust side (ferritron_core::companion).
         var inst = Self(p);
         try

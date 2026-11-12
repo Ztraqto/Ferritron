@@ -96,8 +96,8 @@ struct {ident};
 #[ferritron::plugin]
 impl Process for {ident} {{
     fn process(&mut self, ctx: &mut Context) {{
-        let gain = db_to_gain(ctx.params.gain.value());
-        ctx.io.for_each_sample(|s| *s *= gain);
+        let gain = db_to_gain(ctx.params().gain.value());
+        ctx.io().for_each_sample(|s| *s *= gain);
     }}
 }}
 "#
@@ -120,10 +120,10 @@ struct {ident} {{
 #[ferritron::plugin]
 impl Process for {ident} {{
     fn process(&mut self, ctx: &mut Context) {{
-        let rate = ctx.sample_rate as f32;
-        let volume = db_to_gain(ctx.params.volume.value());
-        let notes = ctx.notes;
-        let out = ctx.io.channel_mut(0);
+        let rate = ctx.sample_rate() as f32;
+        let volume = db_to_gain(ctx.params().volume.value());
+        let notes = ctx.notes();
+        let out = ctx.io().channel_mut(0);
         let mut next = 0;
         for (i, sample) in out.iter_mut().enumerate() {{
             while let Some(note) = notes.get(next).filter(|n| n.offset as usize == i) {{
@@ -144,8 +144,8 @@ impl Process for {ident} {{
             self.voices.retain(|v| v.2 > 1e-4);
             *sample = sum * volume;
         }}
-        for ch in 1..ctx.io.num_channels() {{
-            ctx.io.copy_channel(0, ch);
+        for ch in 1..ctx.io().num_channels() {{
+            ctx.io().copy_channel(0, ch);
         }}
     }}
 }}

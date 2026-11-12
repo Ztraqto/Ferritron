@@ -1,0 +1,16 @@
+[package]
+name = "vst3-ids"
+description = "Ferritron example: fixed VST3 class IDs, a separate edit controller class and a compatibility list (P5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferritron = { workspace = true, features = ["vst3"], default-features = false }
+
+[dev-dependencies]
+ferritron-manifest.workspace = true

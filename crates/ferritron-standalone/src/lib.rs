@@ -21,6 +21,11 @@
 //! play notes from MIDI. The plugin's state is kept between runs in
 //! Ferritron's data folder (`standalone/<plugin id>.state`).
 //!
+//! The plugin's MIDI output (`ctx.midi_out`) is sent on Windows and Linux to the
+//! MIDI output named in `standalone/midi-out.txt` (or the `FERRITRON_MIDI_OUT`
+//! variable); the names found are listed in `standalone/midi-out-ports.txt`.
+//! Nothing is sent unless one is named. macOS, iOS and Android do not send yet.
+//!
 //! macOS and iOS: written and type-checked, never built or run on a Mac.
 
 pub mod engine;

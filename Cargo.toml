@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "examples/*", "tools/*"]
 
 [workspace.package]
-version = "1.3.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -25,6 +25,7 @@ ferritron-wam = { path = "crates/ferritron-wam" }
 ferritron-standalone = { path = "crates/ferritron-standalone" }
 ferritron-auv3 = { path = "crates/ferritron-auv3" }
 ferritron-aax = { path = "crates/ferritron-aax" }
+ferritron-vst2 = { path = "crates/ferritron-vst2" }
 ferritron-web = { path = "crates/ferritron-web" }
 ferritron-gpu-view = { path = "crates/ferritron-gpu-view" }
 ferritron-ara = { path = "crates/ferritron-ara" }
@@ -33,6 +34,8 @@ ferritron-graph = { path = "crates/ferritron-graph" }
 ferritron-slang = { path = "crates/ferritron-slang" }
 ferritron-wasm = { path = "crates/ferritron-wasm" }
 ferritron-mcp = { path = "tools/ferritron-mcp" }
+ferritron-dsp = { path = "crates/ferritron-dsp" }
+ferritron-native-graphics = { path = "crates/ferritron-native-graphics" }
 
 [profile.release]
 lto = "thin"

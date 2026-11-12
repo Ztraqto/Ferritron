@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ferritron Web Extras</title>
+<style>
+  :root { color-scheme: dark light; }
+  body { margin: 0; padding: 12px 16px; font: 13px system-ui, sans-serif; background: #16181d; color: #e8e9ec; }
+  @media (prefers-color-scheme: light) { body { background: #f4f5f7; color: #1b1c1f; } }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  pre { margin: 0 0 6px; padding: 6px 8px; background: rgba(128,128,128,.18); border-radius: 4px; white-space: pre-wrap; }
+  #lock { height: 44px; border: 1px dashed #888; border-radius: 4px; display: flex; align-items: center; justify-content: center; margin-top: 6px; }
+</style>
+</head>
+<body>
+<h1 id="title">Web extras</h1>
+<pre id="theme"></pre>
+<pre id="settings"></pre>
+<pre id="dialog"></pre>
+<pre id="menu">menu: -</pre>
+<pre id="wheel">wheel: -</pre>
+<pre id="pointer">pointer: -</pre>
+<div id="lock">click here: pointer lock</div>
+<button id="gain" style="position:absolute;right:16px;top:380px">gain -12 dB</button>
+<script>
+const $ = (id) => document.getElementById(id);
+const show = (id, text) => { $(id).textContent = text; };
+$("title").textContent = ferritron.t("ui-title") + " / " + ferritron.plugin.name + " (" + ferritron.plugin.id + ")";
+
+// E7: theme
+let themeEvents = 0;
+const themeText = () => "theme: " + JSON.stringify(ferritron.theme) + " changes=" + themeEvents;
+show("theme", themeText());
+ferritron.onThemeChange(() => { themeEvents++; show("theme", themeText()); });
+
+// R4: settings kept across sessions
+const visits = ferritron.settings.get("visits", 0) + 1;
+ferritron.settings.set("visits", visits);
+let changes = [];
+ferritron.settings.onChange((k, v) => { changes.push(k + "=" + JSON.stringify(v)); show("settings", settingsText()); });
+const settingsText = () => "settings: visits=" + ferritron.settings.get("visits") + " keys=" + JSON.stringify(ferritron.settings.keys()) + " changes=" + changes.join(",");
+show("settings", settingsText());
+
+// E12: file dialogs (the answer comes from the host side)
+(async () => {
+  const open = await ferritron.openFile({ title: "Open a sample", filters: [{ name: "Audio", extensions: ["wav", "aif"] }] });
+  const save = await ferritron.saveFile({ title: "Save preset", name: "preset.json", filters: [{ name: "Preset", extensions: ["json"] }] });
+  show("dialog", "dialog: open=" + JSON.stringify(open) + " save=" + JSON.stringify(save));
+})();
+
+// E13 (our own menu): opened at load; a click on an item shows its id
+ferritron.contextMenu([
+  { id: "reset", label: "Reset to default" },
+  { id: "copy", label: "Copy value" },
+  { separator: true },
+  { id: "learn", label: "MIDI learn", checked: true },
+  { id: "off", label: "Unavailable", enabled: false },
+], { x: 20, y: 250 }).then((id) => show("menu", "menu: " + id));
+
+// E8: wheel with both axes, unit and modifiers
+window.addEventListener("wheel", (e) => {
+  show("wheel", "wheel: dx=" + e.deltaX + " dy=" + e.deltaY + " mode=" + e.deltaMode + " shift=" + e.shiftKey + " ctrl=" + e.ctrlKey);
+}, { passive: true });
+
+// E1: modifier keys on pointer events
+window.addEventListener("pointerdown", (e) => {
+  show("pointer", "pointer: shift=" + e.shiftKey + " ctrl=" + e.ctrlKey + " alt=" + e.altKey + " meta=" + e.metaKey + " button=" + e.button);
+}, true);
+
+// A parameter edit from the page: the host records it as automation (begin, set, end).
+$("gain").addEventListener("click", () => ferritron.edit("gain", -12));
+
+// E10: pointer lock gives relative movement
+$("lock").addEventListener("click", async () => {
+  try { await $("lock").requestPointerLock(); } catch (e) { $("lock").textContent = "lock failed: " + e; }
+  $("lock").textContent = "locked: " + (document.pointerLockElement === $("lock"));
+});
+document.addEventListener("pointerlockchange", () => {
+  if (!document.pointerLockElement) $("lock").textContent = "unlocked";
+});
+document.addEventListener("pointerlockerror", () => { $("lock").textContent = "pointerlockerror"; });
+</script>
+</body>
+</html>

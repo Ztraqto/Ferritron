@@ -78,7 +78,7 @@ impl Process for GpuReverb {
 
     fn process(&mut self, ctx: &mut Context) {
         let (Some(graph), Some(dry)) = (self.graph.as_mut(), self.dry) else { return };
-        let mix = ctx.params.mix.value() / 100.0;
+        let mix = ctx.params().mix.value() / 100.0;
         // Without convolvers, the dry path passes everything.
         let dry_gain = if self.wet.is_empty() { 1.0 } else { 1.0 - mix };
         if let Some(gain) = graph.node_mut::<Gain>(dry) {
@@ -89,10 +89,10 @@ impl Process for GpuReverb {
                 gain.set(mix);
             }
         }
-        let (n, channels) = (ctx.io.frames(), ctx.io.num_channels().min(CHANNELS));
+        let (n, channels) = (ctx.io().frames(), ctx.io().num_channels().min(CHANNELS));
         for (ch, input) in self.inputs.iter_mut().enumerate() {
             if ch < channels {
-                input[..n].copy_from_slice(ctx.io.channel_mut(ch));
+                input[..n].copy_from_slice(ctx.io().channel_mut(ch));
             } else {
                 input[..n].fill(0.0);
             }
@@ -101,7 +101,7 @@ impl Process for GpuReverb {
         let [left, right] = &mut self.outputs[..] else { return };
         graph.process(&ins, &mut [&mut left[..n], &mut right[..n]]);
         for ch in 0..channels {
-            ctx.io.channel_mut(ch).copy_from_slice(&self.outputs[ch][..n]);
+            ctx.io().channel_mut(ch).copy_from_slice(&self.outputs[ch][..n]);
         }
     }
 }
@@ -173,4 +173,12 @@ mod tests {
         let worst = offline.iter().zip(&ir).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(worst < 1e-5, "the bounce is the impulse response (largest difference {worst})");
     }
+}
+
+/// G5: parameter IDs, order and class ID are those of 1.4.0, and a state saved by 1.4.0 loads.
+#[cfg(test)]
+#[test]
+fn loads_state_saved_by_1_4_0() {
+    let n = ferritron::testing::check_fixture::<GpuReverb>(include_str!("../../../tests/fixtures/1.4.0/gpu-reverb.json")).unwrap_or_else(|e| panic!("{e}"));
+    assert!(n > 0);
 }

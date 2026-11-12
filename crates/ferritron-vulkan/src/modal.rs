@@ -209,6 +209,36 @@ impl PersistentModalBank {
         self.gpu.name()
     }
 
+    /// True once the device this bank runs on is lost (see [`Gpu::get`]). A
+    /// lost bank is silent until [`revive`](Self::revive) builds it again.
+    pub fn lost(&self) -> bool {
+        self.commands.lost()
+    }
+
+    /// Marks this bank's device as lost, as if the device had been lost (for
+    /// tests: no device is lost, and the mark holds for every user of the
+    /// process's device).
+    #[doc(hidden)]
+    pub fn simulate_loss(&self) {
+        self.gpu.lost.store(true, Ordering::Relaxed);
+    }
+
+    /// Builds the bank again after its device was lost: on the current
+    /// device, which is a new one if the lost one is still current (see
+    /// [`Gpu::get`]). The lanes keep their current coefficients. Consumes the
+    /// bank (its resources and the kernel claim are released first), and is
+    /// called off the audio thread. On error the caller plays without it.
+    pub fn revive(self) -> Result<Self, String> {
+        let count = self.params.lanes as usize;
+        let lanes: Vec<ModalLane> = {
+            let src = self.lanes.slice::<ModalLane>();
+            (0..count).map(|i| unsafe { *src.add(i) }).collect()
+        };
+        let (inputs, outputs, max_frames, deadline) = (self.params.inputs as usize, self.params.outputs as usize, self.params.max_frames as usize, self.deadline);
+        drop(self);
+        Self::new(&lanes, inputs, outputs, max_frames, deadline)
+    }
+
     /// Blocks the GPU did not finish in time (they played silent).
     pub fn missed_blocks(&self) -> u64 {
         self.misses
@@ -276,6 +306,12 @@ impl PersistentModalBank {
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) -> bool {
         let p = self.params;
         let n = inputs.iter().map(|c| c.len()).chain(outputs.iter().map(|c| c.len())).min().unwrap_or(0).min(p.max_frames as usize);
+        if self.commands.lost() {
+            // The device is gone: this block is silent, like a missed deadline.
+            outputs.iter_mut().take(p.outputs as usize).for_each(|out| out[..n].fill(0.0));
+            self.misses += 1;
+            return false;
+        }
         // Input and frame count first, then the block number that announces them.
         let input = self.input.slice::<f32>();
         for (ch, data) in inputs.iter().take(p.inputs as usize).enumerate() {
@@ -376,6 +412,41 @@ mod tests {
         let mut again = PersistentModalBank::new(&lanes, 1, 1, 256, Duration::from_millis(20)).expect("free again after the first is dropped");
         let mut out = vec![0.0f32; 256];
         assert!(again.process(&[&[0.0f32; 256]], &mut [&mut out]));
+    }
+
+    /// V1 (rebuild, simulated loss): a lost bank is silent; `revive` builds it
+    /// again on a new device (the loss is set by hand, the device is real),
+    /// and it then gives the CPU's answer.
+    #[test]
+    fn a_lost_bank_is_built_again_and_answers_like_the_cpu() {
+        let _serial = crate::serial();
+        let lanes: Vec<ModalLane> = (0..512)
+            .map(|i| {
+                let [b0, b1, b2, a1, a2] = resonator(60.0 + 7.0 * i as f32, 48_000.0, 0.999);
+                ModalLane { b0, b1, b2, a1, a2, input: 0, output: 0, pad: 0 }
+            })
+            .collect();
+        let mut bank = match PersistentModalBank::new(&lanes, 1, 1, 64, Duration::from_millis(20)) {
+            Ok(b) => b,
+            Err(e) => return eprintln!("skipping: {e}"),
+        };
+        let before = bank.gpu.generation();
+        bank.gpu.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut out = vec![1.0f32; 64];
+        assert!(!bank.process(&[&[1.0f32; 64]], &mut [&mut out]), "a lost bank does not answer");
+        assert!(out.iter().all(|&v| v == 0.0), "a lost bank is silent");
+        assert!(bank.lost(), "the bank reports its lost device");
+        let mut bank = bank.revive().expect("built again");
+        assert!(!bank.lost(), "the new bank is not on a lost device");
+        assert!(bank.gpu.generation() > before, "built again on a new device");
+        let input: Vec<f32> = (0..64).map(|i| if i == 3 { 1.0 } else { 0.0 }).collect();
+        let mut state = vec![[0.0f32; 2]; lanes.len()];
+        let want = cpu(&lanes, 1, std::slice::from_ref(&input), &mut state);
+        let mut got = vec![0.0f32; 64];
+        assert!(bank.process(&[&input], &mut [&mut got]), "the new bank answers");
+        let peak = want[0].iter().map(|v| v.abs()).fold(1e-3f32, f32::max);
+        let worst = got.iter().zip(&want[0]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-3 * peak, "off by {worst} (peak {peak})");
     }
 
     #[test]

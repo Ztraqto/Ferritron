@@ -1,0 +1,21 @@
+[plugin]
+id     = "dev.ferritron.examples.analyzer"
+name   = "Ferritron Analyzer"
+vendor = "Ztraqto"
+
+[params]
+# The lowest level the display shows; the worker clamps the spectrum to it.
+floor = { type = "float", range = [-120, -40], default = -90, unit = "dB" }
+
+# What the audio thread hands out:
+#   wave     a ring of samples the worker reads (the FFT runs on the worker thread)
+#   spectrum the latest 2048 magnitudes (dB) for the editor
+[streams]
+wave     = { len = 16384, kind = "tap" }
+spectrum = { len = 2048 }
+
+[view]
+backend    = "web"
+entry      = "ui"
+size       = [520, 260]
+background = "#16181d"

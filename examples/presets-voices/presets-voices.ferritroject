@@ -1,0 +1,31 @@
+[plugin]
+id         = "dev.ferritron.examples.presets-voices"
+name       = "Ferritron Presets and Voices"
+vendor     = "Ztraqto"
+midi_input = true
+
+# `display` gives text and typed input without code, and the unit is part of the text.
+[params]
+cutoff = { type = "float", range = [20, 20000], default = 1000, scale = "log", display = "hz", smooth = "100ms", poly = true }
+level  = { type = "float", range = [-90, 6], default = 0, display = "db" }
+mix    = { type = "float", range = [0, 1], default = 0.5, display = "percent" }
+delay  = { type = "float", range = [0, 2000], default = 250, display = "ms" }
+pitch  = { type = "float", range = [0, 127], default = 69, display = "note" }
+speed  = { type = "float", range = [0.25, 4], default = 1, display = "ratio" }
+taps   = { type = "int", range = [1, 8], default = 4, format = "%d taps" }
+shape  = { type = "float", range = [0, 100], default = 12.5, format = "%.1f dB", unit = "dB" }
+mode   = { type = "enum", choices = ["Clean", "Warm", "Dark"] }
+on     = { type = "bool", default = true }
+
+# Factory presets: parameters by key and plain value; unlisted parameters stay as they are.
+[presets.warm]
+name   = "Warm Pad"
+cutoff = 800
+mix    = 0.35
+mode   = "Warm"
+
+[presets.bright]
+cutoff = 12000
+level  = -6
+mode   = "Clean"
+on     = false

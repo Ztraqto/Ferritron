@@ -1,0 +1,36 @@
+[plugin]
+id     = "dev.ferritron.examples.multiband-test"
+name   = "Ferritron Multiband Test"
+vendor = "Ztraqto"
+categories = ["Distortion", "Multi-band"]
+# An effect that also takes MIDI (CC, pitch bend, program change ...).
+midi_input = true
+
+# 1 to 32 channels, any layout; a sidechain input as wide as the main bus.
+[audio]
+channels = { min = 1, max = 8 }
+unsupported = "passthrough"
+sidechain = { channels = "main" }
+
+# The VST3 class ID is fixed (never change it after release).
+[vst3]
+class_id = "6F1E4C2A-9B3D-4E77-A1C5-D1A570000001"
+# 1.4.0 handed Windows hosts this class ID byte-swapped (BC8): hosts that read
+# moduleinfo.json open old projects with the new ID through this list.
+compatibility = { id = "6F1E4C2A-9B3D-4E77-A1C5-D1A5700000C1", replaces = ["2A4C1E6F-3D9B-774E-A1C5-D1A570000001"] }
+
+# The VST 2 plugin ID (4 characters; never change it after release).
+[vst2]
+unique_id = "MbTs"
+
+[params]
+# Explicit IDs: automation and MIDI maps keep working whatever the key is.
+input_gain  = { type = "float", range = [-36, 36], default = 0, unit = "dB", id = 0 }
+input_pan   = { type = "float", range = [-1, 1], default = 0, id = 1 }
+# `initial` is the sound of a new instance; hosts reset to `default`.
+output_gain = { type = "float", range = [-36, 36], default = 0, initial = -1, unit = "dB", id = 2 }
+# A log scale: equal steps are equal ratios, like a frequency.
+freq        = { type = "float", range = [10, 30000], default = 1000, scale = "log", unit = "Hz", id = 3 }
+# The plugin writes and reads the text (here "-INF dB" at the bottom) and maps the knob itself.
+level       = { type = "float", range = [-96, 12], default = 0, scale = "custom", text = "custom", id = 4 }
+mode        = { type = "enum", choices = ["Minimum Phase", "Linear Phase"], default = "Minimum Phase", id = 696 }

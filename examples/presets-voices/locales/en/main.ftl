@@ -1,0 +1,10 @@
+param-cutoff = Cutoff
+param-level = Level
+param-mix = Mix
+param-delay = Delay
+param-pitch = Pitch
+param-speed = Speed
+param-taps = Taps
+param-shape = Shape
+param-mode = Mode
+param-on = On

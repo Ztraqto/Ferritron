@@ -13,9 +13,10 @@
 //! | Ports | |
 //! |---|---|
 //! | 0 .. n | one control input per parameter, plain values (as in the host's parameter list) |
-//! | effect: n .. n+4 | audio in L, R; audio out L, R |
-//! | instrument: n .. n+3 | audio out L, R; MIDI in (atom sequence) |
-//! | then | latency (output), freewheel (input: the host renders offline) |
+//! | then | `ferritron_manifest::lv2_port_plan`: effects: audio in (one port per channel), sidechain in; audio out; MIDI in (atom sequence: instruments and `midi_input`); transport (atom sequence with `time:Position`, for plugins using the 1.3.1 audio features); latency (output); freewheel (input: the host renders offline); MIDI out (atom sequence, always last: what `ctx.midi_out` writes) |
+//!
+//! LV2 ports are fixed, so the channel count is fixed too: stereo when the
+//! plugin accepts it, else the nearest count in its range.
 //!
 //! State is the plugin's own state, stored as one `atom:Chunk`. The editor
 //! (Windows, macOS) embeds in the host's window through `ui:parent`; with
@@ -115,18 +116,64 @@ pub(crate) struct Instance {
     controls: Vec<*const f32>,
     /// The last value seen on each control port (NaN: none yet).
     last: Vec<f32>,
-    audio_in: [*const f32; 2],
-    audio_out: [*mut f32; 2],
+    /// Set by a successful state restore: the next `run` takes the port values as they are
+    /// (no events), so the restored state is not overwritten by the host's port values.
+    adopt_ports: bool,
+    plan: Vec<ferritron_manifest::Lv2Port>,
+    audio_in: Vec<*const f32>,
+    sc_in: Vec<*const f32>,
+    audio_out: Vec<*mut f32>,
     midi_in: *const LV2_Atom_Sequence,
+    /// The MIDI output (an atom sequence the host reads), if connected.
+    midi_out: *mut LV2_Atom_Sequence,
+    time_in: *const LV2_Atom_Sequence,
+    /// What the host last said of time (hosts send `time:Position` when it changes).
+    transport: ferritron_core::transport::TransportC,
+    /// The last `time:speed` the host sent (0 = stopped): the position moves on with it.
+    speed: f64,
+    time_urids: TimeUrids,
     latency_out: *mut f32,
     freewheel_in: *const f32,
     offline: bool,
     midi_event: LV2_URID,
     chunk: LV2_URID,
     state_key: LV2_URID,
+    /// `atom:Sequence` (the type of the MIDI output port).
+    sequence: LV2_URID,
     events: Vec<Event>,
+    /// Room for sorting `events` without allocating.
+    sort_scratch: Vec<Event>,
+    /// The plugin's transport and sidechain entry points, looked up once (null: none).
+    transport_ext: *const ferritron_core::abi::TransportApi,
+    sidechain_ext: *const ferritron_core::abi::SidechainApi,
     /// The open editor, if any (see `ui`).
     pub(crate) ui: std::sync::atomic::AtomicPtr<ui::Ui>,
+}
+
+/// The URIDs of `time:Position` and its properties.
+#[derive(Clone, Copy, Default)]
+struct TimeUrids {
+    object: LV2_URID,
+    position: LV2_URID,
+    speed: LV2_URID,
+    bpm: LV2_URID,
+    bar: LV2_URID,
+    bar_beat: LV2_URID,
+    beats_per_bar: LV2_URID,
+    beat_unit: LV2_URID,
+    frame: LV2_URID,
+    int: LV2_URID,
+    long: LV2_URID,
+    float: LV2_URID,
+    double: LV2_URID,
+}
+
+/// The ports of the plugin after its parameters (same list as the Turtle file).
+fn port_plan(api: &PluginApi) -> Vec<ferritron_manifest::Lv2Port> {
+    let info = unsafe { &*api.info };
+    let flags = info.audio_flags;
+    let sidechain = (flags & ferritron_core::abi::AUDIO_SIDECHAIN != 0).then_some(info.sidechain_channels);
+    ferritron_manifest::lv2_port_plan(is_instrument(api), info.min_channels, info.max_channels, sidechain, flags & ferritron_core::abi::AUDIO_MIDI_INPUT != 0)
 }
 
 unsafe extern "C" fn instantiate(
@@ -154,6 +201,7 @@ unsafe extern "C" fn instantiate(
     }
     let ids = param_ids(api);
     let n = ids.len();
+    let plan = port_plan(api);
     let mut me = Box::new(Instance {
         api,
         instance,
@@ -162,17 +210,43 @@ unsafe extern "C" fn instantiate(
         instrument: is_instrument(api),
         controls: vec![std::ptr::null(); n],
         last: vec![f32::NAN; n],
+        adopt_ports: false,
         ids,
-        audio_in: [std::ptr::null(); 2],
-        audio_out: [std::ptr::null_mut(); 2],
+        audio_in: vec![std::ptr::null(); plan.iter().filter(|p| matches!(p, ferritron_manifest::Lv2Port::In(_))).count()],
+        sc_in: vec![std::ptr::null(); plan.iter().filter(|p| matches!(p, ferritron_manifest::Lv2Port::Sidechain(_))).count()],
+        audio_out: vec![std::ptr::null_mut(); plan.iter().filter(|p| matches!(p, ferritron_manifest::Lv2Port::Out(_))).count()],
+        plan,
         midi_in: std::ptr::null(),
+        midi_out: std::ptr::null_mut(),
+        time_in: std::ptr::null(),
+        transport: Default::default(),
+        speed: 0.0,
+        time_urids: TimeUrids {
+            object: map(urid, ATOM_OBJECT),
+            position: map(urid, TIME_POSITION),
+            speed: map(urid, TIME_SPEED),
+            bpm: map(urid, TIME_BPM),
+            bar: map(urid, TIME_BAR),
+            bar_beat: map(urid, TIME_BAR_BEAT),
+            beats_per_bar: map(urid, TIME_BEATS_PER_BAR),
+            beat_unit: map(urid, TIME_BEAT_UNIT),
+            frame: map(urid, TIME_FRAME),
+            int: map(urid, ATOM_INT),
+            long: map(urid, ATOM_LONG),
+            float: map(urid, ATOM_FLOAT),
+            double: map(urid, ATOM_DOUBLE),
+        },
         latency_out: std::ptr::null_mut(),
         freewheel_in: std::ptr::null(),
         offline: false,
         midi_event: map(urid, MIDI_EVENT),
         chunk: map(urid, ATOM_CHUNK),
         state_key: map(urid, "urn:ferritron:state"),
+        sequence: map(urid, ATOM_SEQUENCE),
         events: Vec::with_capacity(MAX_EVENTS),
+        sort_scratch: vec![Event::midi(0, 0, 0, 0, 0); MAX_EVENTS],
+        transport_ext: unsafe { (api.get_extension)(c"ferritron.transport.v1".as_ptr()) } as *const ferritron_core::abi::TransportApi,
+        sidechain_ext: unsafe { (api.get_extension)(c"ferritron.sidechain.v1".as_ptr()) } as *const ferritron_core::abi::SidechainApi,
         ui: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     });
     // The editor finds its instance through this pointer (`ferritron.host.v2`).
@@ -192,22 +266,43 @@ unsafe extern "C" fn connect_port(handle: LV2_Handle, port: u32, data: *mut c_vo
         me.controls[port] = data as *const f32;
         return;
     }
-    match (me.instrument, port - n as usize) {
-        (false, 0) => me.audio_in[0] = data as *const f32,
-        (false, 1) => me.audio_in[1] = data as *const f32,
-        (false, 2) | (true, 0) => me.audio_out[0] = data as *mut f32,
-        (false, 3) | (true, 1) => me.audio_out[1] = data as *mut f32,
-        (true, 2) => me.midi_in = data as *const LV2_Atom_Sequence,
-        (false, 4) | (true, 3) => me.latency_out = data as *mut f32,
-        (false, 5) | (true, 4) => me.freewheel_in = data as *const f32,
-        _ => {}
+    use ferritron_manifest::Lv2Port::*;
+    match me.plan.get(port - n as usize).copied() {
+        Some(In(c)) => me.audio_in[c as usize] = data as *const f32,
+        Some(Sidechain(c)) => me.sc_in[c as usize] = data as *const f32,
+        Some(Out(c)) => me.audio_out[c as usize] = data as *mut f32,
+        Some(Midi) => me.midi_in = data as *const LV2_Atom_Sequence,
+        Some(Time) => me.time_in = data as *const LV2_Atom_Sequence,
+        Some(Latency) => me.latency_out = data as *mut f32,
+        Some(Freewheel) => me.freewheel_in = data as *const f32,
+        Some(MidiOut) => me.midi_out = data as *mut LV2_Atom_Sequence,
+        None => {}
     }
 }
 
 unsafe extern "C" fn activate(handle: LV2_Handle) {
     let me = unsafe { &mut *(handle as *mut Instance) };
+    // LV2 has no speaker names: the usual layout for the channel count.
+    let layout = ferritron_core::Speaker::default_layout(me.audio_out.len());
+    let ids: Vec<u32> = layout.speakers().iter().map(|s| s.id()).collect();
+    let ext = unsafe { (me.api.get_extension)(c"ferritron.layout.v1".as_ptr()) } as *const ferritron_core::abi::LayoutApi;
+    if let Some(api) = unsafe { ext.as_ref() } {
+        unsafe { (api.set)(me.instance, ids.as_ptr(), ids.len() as u32) };
+    }
     unsafe { (me.api.activate)(me.instance, me.sample_rate, me.max_block) };
-    me.last.fill(f32::NAN);
+    // `last` is not reset here. A fresh instance starts with NaN (no port value seen yet), and
+    // after that it keeps the values seen, so a host that re-sends unchanged values after
+    // deactivate/activate makes no events. A state restore is adopted in `run` (`adopt_ports`).
+}
+
+/// Records the control port values as they are now, without events: the host's
+/// values after a state restore must not replace the restored state.
+fn adopt_control_values(me: &mut Instance) {
+    for i in 0..me.ids.len() {
+        if let Some(&value) = unsafe { me.controls[i].as_ref() } {
+            me.last[i] = value;
+        }
+    }
 }
 
 /// Control port changes since the last block, as parameter events at offset 0.
@@ -234,13 +329,18 @@ fn midi_events(me: &mut Instance, frames: u32) {
     while offset + size_of::<LV2_Atom_Event>() <= total {
         let event = unsafe { &*(base.add(8 + offset) as *const LV2_Atom_Event) };
         let data = unsafe { base.add(8 + offset + size_of::<LV2_Atom_Event>()) };
-        if event.body.kind == me.midi_event && event.body.size >= 3 && me.events.len() < MAX_EVENTS {
-            let bytes = unsafe { std::slice::from_raw_parts(data, 3) };
+        if event.body.kind == me.midi_event && event.body.size >= 2 && me.events.len() < MAX_EVENTS {
+            // Two-byte messages (program change, channel pressure) are read as two bytes.
+            let len = (event.body.size as usize).min(3);
+            let bytes = unsafe { std::slice::from_raw_parts(data, len) };
             let (status, channel) = (bytes[0] & 0xf0, (bytes[0] & 0x0f) as i16);
             let at = (event.frames.max(0) as u32).min(frames.saturating_sub(1));
+            let data2 = bytes.get(2).copied().unwrap_or(0);
             match status {
-                0x90 if bytes[2] > 0 => me.events.push(Event::note(at, true, bytes[1] as i16, channel, bytes[2] as f32 / 127.0, -1)),
-                0x80 | 0x90 => me.events.push(Event::note(at, false, bytes[1] as i16, channel, bytes[2] as f32 / 127.0, -1)),
+                0x90 if len == 3 && data2 > 0 => me.events.push(Event::note(at, true, bytes[1] as i16, channel, data2 as f32 / 127.0, -1)),
+                0x80 | 0x90 if len == 3 => me.events.push(Event::note(at, false, bytes[1] as i16, channel, data2 as f32 / 127.0, -1)),
+                // Controllers, pressure, pitch bend, program changes.
+                0xA0..=0xE0 => me.events.push(Event::midi(at, status, channel as u8, bytes[1], data2)),
                 _ => {}
             }
         }
@@ -248,6 +348,162 @@ fn midi_events(me: &mut Instance, frames: u32) {
         offset += (size_of::<LV2_Atom_Event>() + event.body.size as usize + 7) & !7;
     }
 }
+
+/// `t` moved on by `samples` at `speed` (0 = stopped) and `sample_rate`.
+fn advanced(t: &ferritron_core::transport::TransportC, samples: u64, speed: f64, sample_rate: f64) -> ferritron_core::transport::TransportC {
+    let mut t = *t;
+    if speed <= 0.0 || samples == 0 {
+        return t;
+    }
+    let moved = samples as f64 * speed;
+    if t.flags & ferritron_core::transport::TRANSPORT_POSITION_SAMPLES != 0 {
+        t.position_samples += moved.round() as i64;
+    }
+    if t.flags & ferritron_core::transport::TRANSPORT_POSITION_BEATS != 0 && t.flags & ferritron_core::transport::TRANSPORT_TEMPO != 0 {
+        t.position_beats += moved / sample_rate * t.tempo / 60.0;
+    }
+    t
+}
+
+/// Reads `time:Position` objects from the transport port into `me.transport`.
+fn time_events(me: &mut Instance) {
+    let Some(seq) = (unsafe { me.time_in.as_ref() }) else { return };
+    let t = me.time_urids;
+    let total = seq.atom.size as usize;
+    let base = (seq as *const LV2_Atom_Sequence).cast::<u8>();
+    let mut offset = 8usize;
+    let mut speed = None;
+    while offset + size_of::<LV2_Atom_Event>() <= total {
+        let event = unsafe { &*(base.add(8 + offset) as *const LV2_Atom_Event) };
+        let body = unsafe { base.add(8 + offset + size_of::<LV2_Atom_Event>()) };
+        let size = event.body.size as usize;
+        if event.body.kind == t.object && size >= 8 && unsafe { *(body.add(4) as *const u32) } == t.position {
+            // Object body: id, otype, then properties { key, context, atom { size, type }, value }.
+            let (mut at, c) = (8usize, &mut me.transport);
+            let (mut bar, mut bar_beat, mut per_bar, mut unit) = (None::<i64>, None::<f64>, None::<f64>, None::<i32>);
+            while at + 16 <= size {
+                let prop = unsafe { body.add(at) };
+                let key = unsafe { *(prop as *const u32) };
+                let (vsize, vtype) = unsafe { (*(prop.add(8) as *const u32) as usize, *(prop.add(12) as *const u32)) };
+                let value = unsafe { prop.add(16) };
+                let num = |_: u32| -> Option<f64> {
+                    unsafe {
+                        match () {
+                            _ if vtype == t.long => Some(*(value as *const i64) as f64),
+                            _ if vtype == t.float => Some(f64::from(*(value as *const f32))),
+                            _ if vtype == t.double => Some(*(value as *const f64)),
+                            _ if vtype == t.int => Some(f64::from(*(value as *const i32))),
+                            _ => None,
+                        }
+                    }
+                };
+                if key == t.speed {
+                    speed = num(0);
+                } else if key == t.bpm {
+                    if let Some(v) = num(0) {
+                        c.flags |= ferritron_core::transport::TRANSPORT_TEMPO;
+                        c.tempo = v;
+                    }
+                } else if key == t.bar {
+                    bar = num(0).map(|v| v as i64);
+                } else if key == t.bar_beat {
+                    bar_beat = num(0);
+                } else if key == t.beats_per_bar {
+                    per_bar = num(0);
+                } else if key == t.beat_unit {
+                    unit = num(0).map(|v| v as i32);
+                } else if key == t.frame {
+                    if let Some(v) = num(0) {
+                        c.flags |= ferritron_core::transport::TRANSPORT_POSITION_SAMPLES;
+                        c.position_samples = v as i64;
+                    }
+                }
+                at += (16 + vsize + 7) & !7;
+            }
+            if let (Some(n), Some(d)) = (per_bar, unit) {
+                c.flags |= ferritron_core::transport::TRANSPORT_TIME_SIGNATURE;
+                c.numerator = n.round() as u16;
+                c.denominator = d.max(1) as u16;
+            }
+            if let (Some(bar), Some(bb), Some(n), Some(d)) = (bar, bar_beat, per_bar, unit) {
+                // Positions in quarter notes: a bar is `n` beats of `4 / d` quarters.
+                let q = 4.0 / f64::from(d.max(1));
+                c.flags |= ferritron_core::transport::TRANSPORT_POSITION_BEATS | ferritron_core::transport::TRANSPORT_BAR_START;
+                c.bar_start_beats = bar as f64 * n * q;
+                c.position_beats = c.bar_start_beats + bb * q;
+            }
+            if let Some(s) = speed {
+                if s > 0.0 {
+                    c.flags |= ferritron_core::transport::TRANSPORT_PLAYING;
+                } else {
+                    c.flags &= !ferritron_core::transport::TRANSPORT_PLAYING;
+                }
+            }
+        }
+        offset += (size_of::<LV2_Atom_Event>() + size + 7) & !7;
+    }
+    if let Some(s) = speed {
+        me.speed = s;
+    }
+}
+
+/// Writes the MIDI output port for one block: an `atom:Sequence` of `midi:MidiEvent`
+/// atoms, in the buffer the host gave (no allocation; nothing is written when the port
+/// is not connected or too small to hold a header).
+struct MidiSink {
+    seq: *mut LV2_Atom_Sequence,
+    /// Body bytes in use: the unit and pad (8), then the events.
+    used: u32,
+    /// Body bytes the host made room for (`atom.size` when the block started).
+    capacity: u32,
+    midi: LV2_URID,
+}
+
+impl MidiSink {
+    /// An empty sequence in `seq`, or a sink that writes nothing.
+    ///
+    /// # Safety
+    /// `seq` is null or the host's output atom buffer, valid until `run` returns.
+    unsafe fn begin(seq: *mut LV2_Atom_Sequence, sequence: LV2_URID, midi: LV2_URID) -> Self {
+        let mut sink = MidiSink { seq: std::ptr::null_mut(), used: 0, capacity: 0, midi };
+        let Some(s) = (unsafe { seq.as_mut() }) else { return sink };
+        if s.atom.size < 8 {
+            return sink;
+        }
+        sink.capacity = s.atom.size;
+        s.atom.kind = sequence;
+        s.unit = 0; // frames
+        s.pad = 0;
+        s.atom.size = 8;
+        sink.seq = seq;
+        sink.used = 8;
+        sink
+    }
+
+    /// Appends one MIDI message at `frames` (in the block). Dropped when it does not fit.
+    fn push(&mut self, frames: i64, bytes: &[u8]) {
+        // Event header (frames, atom size and type), then the body padded to 8 bytes.
+        const EVENT: u32 = 8 + 8 + 8;
+        if self.seq.is_null() || bytes.is_empty() || bytes.len() > 8 || self.used.saturating_add(EVENT) > self.capacity {
+            return;
+        }
+        // SAFETY: the room was checked above; the host's buffer lasts for the block.
+        unsafe {
+            let base = (self.seq as *mut u8).add(8 + self.used as usize);
+            (base as *mut i64).write_unaligned(frames);
+            (base.add(8) as *mut u32).write_unaligned(bytes.len() as u32);
+            (base.add(12) as *mut u32).write_unaligned(self.midi);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(16), bytes.len());
+            std::ptr::write_bytes(base.add(16 + bytes.len()), 0, 8 - bytes.len());
+        }
+        self.used += EVENT;
+        // The body size the host reads back: unit and pad, then the events.
+        unsafe { (*self.seq).atom.size = self.used };
+    }
+}
+
+/// The events the plugin wrote during one `process` call (see `run`).
+const OUT_EVENTS: usize = 256;
 
 unsafe extern "C" fn run(handle: LV2_Handle, frames: u32) {
     let me = unsafe { &mut *(handle as *mut Instance) };
@@ -263,21 +519,44 @@ unsafe extern "C" fn run(handle: LV2_Handle, frames: u32) {
         }
     }
     me.events.clear();
+    // The MIDI output starts empty; the blocks below add to it (also when `process` is skipped).
+    let mut midi_out = unsafe { MidiSink::begin(me.midi_out, me.sequence, me.midi_event) };
+    if std::mem::take(&mut me.adopt_ports) {
+        adopt_control_values(me);
+    }
     control_events(me);
     midi_events(me, frames);
-    me.events.sort_by_key(|e| e.offset); // stable: parameters first at the same offset
-    let [Some(out_l), Some(out_r)] = me.audio_out.map(|p| (!p.is_null()).then_some(p)) else { return };
+    time_events(me);
+    // Stable (parameters first at the same offset), without allocating.
+    let n = me.events.len();
+    ferritron_core::abi::sort_events(&mut me.events, &mut me.sort_scratch[..n]);
+    if me.audio_out.is_empty() || me.audio_out.iter().any(|p| p.is_null()) {
+        return;
+    }
+    // Fixed arrays: nothing here may allocate (audio thread).
+    const MAX: usize = ferritron_core::MAX_CHANNELS;
+    let n_out = me.audio_out.len().min(MAX);
+    let mut outs = [std::ptr::null_mut::<f32>(); MAX];
+    outs[..n_out].copy_from_slice(&me.audio_out[..n_out]);
+    let outs = &outs[..n_out];
     // In place on the outputs: copy the input there first (hosts may pass the same buffers).
-    for (out, input) in [out_l, out_r].into_iter().zip(me.audio_in) {
+    for (c, &out) in outs.iter().enumerate() {
+        let input = me.audio_in.get(c).copied().unwrap_or(std::ptr::null());
         if me.instrument || input.is_null() {
             unsafe { std::ptr::write_bytes(out, 0, frames as usize) };
         } else if input != out as *const f32 {
             unsafe { std::ptr::copy_nonoverlapping(input, out, frames as usize) };
         }
     }
+    // The host's transport and the sidechain, for the blocks below.
+    let transport_ext = me.transport_ext;
+    let sidechain_ext = me.sidechain_ext;
+    let sc_connected = !me.sc_in.is_empty() && me.sc_in.iter().all(|p| !p.is_null());
     // Blocks longer than the plugin was activated for go in parts.
     let mut start = 0u32;
     let mut next_event = 0usize;
+    // Events the plugin writes (`ctx.midi_out`, parameter changes), read back after each `process`.
+    let mut out = [Event::midi(0, 0, 0, 0, 0); OUT_EVENTS];
     while start < frames {
         let len = (frames - start).min(me.max_block);
         let end = start + len;
@@ -286,16 +565,60 @@ unsafe extern "C" fn run(handle: LV2_Handle, frames: u32) {
             me.events[next_event].offset -= start;
             next_event += 1;
         }
-        let channels = unsafe { [out_l.add(start as usize), out_r.add(start as usize)] };
+        let mut channels = [std::ptr::null_mut::<f32>(); MAX];
+        for (dst, &p) in channels.iter_mut().zip(outs) {
+            *dst = unsafe { p.add(start as usize) };
+        }
+        // The transport for this piece: moved on from the host's last position.
+        if let Some(t) = unsafe { transport_ext.as_ref() } {
+            let piece = advanced(&me.transport, start as u64, me.speed, me.sample_rate);
+            unsafe { (t.set)(me.instance, &piece) };
+        }
+        let channels = &channels[..n_out];
+        if let Some(sc) = unsafe { sidechain_ext.as_ref() } {
+            if sc_connected {
+                let n_sc = me.sc_in.len().min(MAX);
+                let mut ptrs = [std::ptr::null::<f32>(); MAX];
+                for (dst, &p) in ptrs.iter_mut().zip(&me.sc_in[..n_sc]) {
+                    *dst = unsafe { p.add(start as usize) as *const f32 };
+                }
+                unsafe { (sc.set)(me.instance, ptrs.as_ptr(), n_sc as u32) };
+            } else {
+                unsafe { (sc.set)(me.instance, std::ptr::null(), 0) };
+            }
+        }
         let events = &me.events[first..next_event];
-        let ok = unsafe { (api.process)(me.instance, channels.as_ptr(), 2, len, events.as_ptr(), events.len() as u32, std::ptr::null()) };
+        let mut out_count = 0u32;
+        let ok = unsafe {
+            {
+                let mut d = ferritron_core::abi::ProcessData::new(channels.as_ptr(), channels.len() as u32, len, events.as_ptr(), events.len() as u32, std::ptr::null());
+                d.out_events = out.as_mut_ptr();
+                d.out_capacity = OUT_EVENTS as u32;
+                d.out_count = &raw mut out_count;
+                (api.process)(me.instance, &d)
+            }
+        };
+        if ok {
+            for e in &out[..(out_count as usize).min(OUT_EVENTS)] {
+                if e.kind == ferritron_core::abi::EVENT_MIDI {
+                    let m = unsafe { e.data.midi };
+                    let status = (m.status & 0xf0) | (m.channel & 0x0f);
+                    // Program change and channel pressure are two-byte messages.
+                    let bytes = [status, m.data1, m.data2];
+                    let len = if matches!(status & 0xf0, 0xC0 | 0xD0) { 2 } else { 3 };
+                    midi_out.push((start + e.offset) as i64, &bytes[..len]);
+                }
+            }
+        }
         if !ok {
-            for c in channels {
+            for &c in channels {
                 unsafe { std::ptr::write_bytes(c, 0, len as usize) };
             }
         }
         start = end;
     }
+    // The host sends `time:Position` when it changes; until then the position moves on.
+    me.transport = advanced(&me.transport, frames as u64, me.speed, me.sample_rate);
     if let Some(latency) = unsafe { me.latency_out.as_mut() } {
         let ext = unsafe { (api.get_extension)(EXT_LATENCY.as_ptr()) } as *const LatencyApi;
         *latency = unsafe { ext.as_ref() }.map_or(0.0, |l| unsafe { (l.get)(me.instance) } as f32);
@@ -326,7 +649,12 @@ unsafe extern "C" fn restore(handle: LV2_Handle, retrieve: LV2_State_Retrieve_Fu
         return LV2_STATE_ERR_NO_PROPERTY;
     }
     let ok = unsafe { (me.api.load_state)(me.instance, data.cast(), size as u32) };
-    if ok { LV2_STATE_SUCCESS } else { LV2_STATE_ERR_UNKNOWN }
+    if ok {
+        me.adopt_ports = true;
+        LV2_STATE_SUCCESS
+    } else {
+        LV2_STATE_ERR_UNKNOWN
+    }
 }
 
 static STATE: LV2_State_Interface = LV2_State_Interface { save, restore };

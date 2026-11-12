@@ -1,0 +1,40 @@
+[package]
+name = "ferritron-native-graphics"
+description = "Ferritron Native Graphics (FNG): a small, general 2D drawing library (shapes, paths, images, text) with wgpu and CPU backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "fng"
+
+[features]
+default = ["wgpu", "system-fonts"]
+# wgpu backend (Renderer).
+wgpu = ["dep:wgpu", "dep:bytemuck"]
+# CPU backend (CpuRenderer): reference pictures, screenshots, machines without a GPU.
+cpu = ["dep:png"]
+# Operating-system font discovery (Windows: DirectWrite; other systems: a later stage).
+system-fonts = ["dep:windows"]
+
+[dependencies]
+ttf-parser = "0.25"
+rustybuzz = "0.20"
+unicode-linebreak = "0.1"
+wgpu = { version = "30", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+png = { version = "0.18", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_DirectWrite",
+] }
+
+[dev-dependencies]
+# Tests use the CPU backend: enable it for a plain `cargo test`.
+ferritron-native-graphics = { path = ".", features = ["cpu"] }
+pollster = "1"

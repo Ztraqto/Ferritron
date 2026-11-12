@@ -431,6 +431,7 @@ pub(crate) unsafe fn run_child(api: &'static PluginApi, args: &str) {
             begin_edit: child_begin,
             perform_edit: child_perform,
             end_edit: child_end,
+            request_resize: None,
         };
         let opened = match inner.as_ref() {
             Some(inner) => (inner.open)(

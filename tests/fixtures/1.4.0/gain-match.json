@@ -1,0 +1,11 @@
+{
+  "plugin": "dev.ferritron.examples.gain-match",
+  "ferritron": "1.4.0",
+  "class_id": "2d14f304868527d6b1abc510115b029c",
+  "params": [
+    {"index": 0, "id": 1226851856, "name": "モード", "flags": 1, "default": 0, "value": 0},
+    {"index": 1, "id": 446760101, "name": "グループ", "flags": 0, "default": 0, "value": 0.6},
+    {"index": 2, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1}
+  ],
+  "state": "4652544e0100000005000000104620490000000000000000a504a11a000000000000244000000040000000000000f03f030000400000604fd8cbe6410400004000008075354ac541"
+}

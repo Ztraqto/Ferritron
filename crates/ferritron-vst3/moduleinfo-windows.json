@@ -1,0 +1,45 @@
+{
+  "Name": "{name}",
+  "Version": "{version}",
+  "Factory Info": {
+    "Vendor": "{vendor}",
+    "URL": "{url}",
+    "E-Mail": "{email}",
+    "Flags": {
+      "Unicode": true,
+      "Classes Discardable": false,
+      "Component Non Discardable": false
+    }
+  },
+{#vst3.has-replaces}  "Compatibility": [
+    {
+      "New": "{vst3.class-id.com}",
+      "Old": [{#vst3.replaces}"{uid}"{^last}, {/last}{/vst3.replaces}]
+    }
+  ],
+{/vst3.has-replaces}  "Classes": [
+    {
+      "CID": "{vst3.class-id.com}",
+      "Category": "Audio Module Class",
+      "Name": "{name}",
+      "Vendor": "{vendor}",
+      "Version": "{version}",
+      "SDKVersion": "{vst3.sdk-version}",
+      "Sub Categories": [{#vst3.subcategories}"{name}"{^last}, {/last}{/vst3.subcategories}],
+      "Class Flags": 0,
+      "Cardinality": 2147483647,
+      "Snapshots": []
+    }{#vst3.controller},
+    {
+      "CID": "{vst3.controller-id.com}",
+      "Category": "Component Controller Class",
+      "Name": "{name} Controller",
+      "Vendor": "{vendor}",
+      "Version": "{version}",
+      "SDKVersion": "{vst3.sdk-version}",
+      "Class Flags": 0,
+      "Cardinality": 2147483647,
+      "Snapshots": []
+    }{/vst3.controller}
+  ]
+}

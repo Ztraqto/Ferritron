@@ -21,6 +21,9 @@
 //!   project (names, notes, anything that is not a parameter).
 //! - **Messages**: [`InstanceHandle::on_message`] and [`InstanceHandle::post`]
 //!   exchange JSON text with the instance's web editor.
+//! - **Notifications**: [`InstanceHandle::notify`] (any thread, the audio
+//!   thread included) runs the [`InstanceHandle::on_notify`] handler on the
+//!   host's main thread.
 //!
 //! [`Process::init`]: crate::Process::init
 //! [`Context::instance`]: crate::Context::instance
@@ -32,6 +35,17 @@ use std::ffi::c_void;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+
+/// `ParamInfo::normalize` that survives a panic in a plugin's own scale (`scale = "custom"`):
+/// `fallback` is used instead. Such a panic must not unwind into the host.
+fn normalize_or(info: &ParamInfo, plain: f64, fallback: f64) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| info.normalize(plain))).unwrap_or(fallback)
+}
+
+/// `ParamInfo::denormalize` that survives a panic in a plugin's own scale (`scale = "custom"`).
+fn denormalize_or(info: &ParamInfo, normalized: f64, fallback: f64) -> f64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| info.denormalize(normalized))).unwrap_or(fallback)
+}
 
 /// `ferritron_host_callbacks` (`ferritron.host.v1`): the shim's way to tell
 /// the host about a parameter the plugin changed by itself (any thread).
@@ -78,6 +92,12 @@ pub const TRACK_HAS_NAME: u32 = 1 << 0;
 pub const TRACK_HAS_COLOR: u32 = 1 << 1;
 /// [`TrackInfoC::flags`]: `index` is set.
 pub const TRACK_HAS_INDEX: u32 = 1 << 2;
+/// [`TrackInfoC::flags`]: `kind` is set (2.0).
+pub const TRACK_HAS_KIND: u32 = 1 << 3;
+/// [`TrackInfoC::flags`]: `location` is set (2.0).
+pub const TRACK_HAS_LOCATION: u32 = 1 << 4;
+/// [`TrackInfoC::flags`]: `channels` is set (2.0).
+pub const TRACK_HAS_CHANNELS: u32 = 1 << 5;
 
 /// `ferritron_track_info` (`ferritron.track.v1`).
 #[repr(C)]
@@ -90,18 +110,57 @@ pub struct TrackInfoC {
     pub color: [u8; 3],
     /// Position of the track in the host's mixer, from 0.
     pub index: u32,
+    /// (2.0) [`TrackKind`] as a number: 0 track, 1 return, 2 bus, 3 master.
+    pub kind: u32,
+    /// (2.0) [`PluginLocation`] as a number: 0 before the fader, 1 after it, 2 as the panner.
+    pub location: u32,
+    /// (2.0) Audio channels of the track.
+    pub channels: u32,
+}
+
+/// What kind of mixer channel an instance sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrackKind {
+    /// An ordinary track.
+    Track,
+    /// A return (FX, aux) track.
+    Return,
+    /// A bus (group).
+    Bus,
+    /// The master channel.
+    Master,
+}
+
+/// Where in the channel strip an instance sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginLocation {
+    /// An insert before the volume fader.
+    PreFader,
+    /// An insert after the volume fader.
+    PostFader,
+    /// In the channel's panner slot.
+    Panner,
 }
 
 /// The track (mixer channel) an instance sits on, as far as the host says.
 /// VST3 hosts tell through `IInfoListener`, CLAP hosts through `track-info`;
-/// many hosts tell only the name, some nothing.
+/// many hosts tell only the name, some nothing. No format tells a track's
+/// mute, solo or fader position (see `docs/host-mixer-info.md`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrackInfo {
     pub name: Option<String>,
     /// Red, green, blue.
     pub color: Option<[u8; 3]>,
-    /// Position in the host's mixer, from 0.
+    /// Position in the host's mixer, from 0 (VST3).
     pub index: Option<u32>,
+    /// Track, return, bus or master (CLAP).
+    pub kind: Option<TrackKind>,
+    /// Before or after the fader, or the panner (VST3).
+    pub location: Option<PluginLocation>,
+    /// Audio channels of the track (CLAP).
+    pub channels: Option<u32>,
 }
 
 /// An instance's identity: stable while the instance lives, saved with the
@@ -143,9 +202,13 @@ impl fmt::Display for InstanceId {
 trait Cells: Send + Sync {
     fn infos(&self) -> &'static [ParamInfo];
     fn cell(&self, index: usize) -> &ParamCell;
+    fn stream_hub(&self) -> Option<&crate::stream::StreamHub>;
 }
 
 impl<S: ParamSet> Cells for S {
+    fn stream_hub(&self) -> Option<&crate::stream::StreamHub> {
+        ParamSet::stream_hub(self)
+    }
     fn infos(&self) -> &'static [ParamInfo] {
         S::infos()
     }
@@ -162,6 +225,7 @@ enum Host {
 }
 
 type Handler = Box<dyn FnMut(&str, &InstanceHandle) + Send>;
+type NotifyHandler = Box<dyn FnMut(u64, &InstanceHandle) + Send>;
 
 /// Messages kept for an editor that is not open; older ones are dropped.
 const OUTBOX_LIMIT: usize = 256;
@@ -173,6 +237,8 @@ pub(crate) struct Link {
     params: Arc<dyn Cells>,
     typed: Arc<dyn Any + Send + Sync>,
     alive: AtomicBool,
+    /// The controller copy of a `[vst3] controller_id` plugin (`hide`): not listed anywhere.
+    hidden: AtomicBool,
     host: Mutex<Host>,
     track: Mutex<TrackInfo>,
     /// Set by `wake`, taken by the next `process` call.
@@ -181,6 +247,42 @@ pub(crate) struct Link {
     revision: AtomicU64,
     handler: Mutex<Option<Handler>>,
     outbox: Mutex<VecDeque<String>>,
+    /// Work for the host's main thread (`abi::REQUEST_*`), taken by shims.
+    pub(crate) main_requests: std::sync::atomic::AtomicU32,
+    /// Values set in bulk (`load_values`), applied by the next `process`.
+    bulk: Mutex<Bulk>,
+    /// bulk.pending, readable without the lock (the audio thread looks at it every block).
+    bulk_pending: AtomicBool,
+    /// How many editors of this instance are open.
+    editors: Arc<std::sync::atomic::AtomicU32>,
+    /// Codes for the main thread (`InstanceHandle::notify`), and their handler.
+    pub(crate) notifications: crate::notify::NotifyQueue,
+    notify_handler: Mutex<Option<NotifyHandler>>,
+    /// Held while notifications are delivered (the shim's poll and the fallback thread).
+    delivering: Mutex<()>,
+    /// When the shim last polled `take_requests` (milliseconds of `clock_ms`); creation time at first.
+    pub(crate) last_poll: AtomicU64,
+    /// The shim asks `pending` and polls when there is work (CLAP's `request_callback`):
+    /// the fallback thread leaves this instance alone.
+    pub(crate) polls_on_demand: AtomicBool,
+    /// The shim has polled take_requests at least once: it delivers on its main thread.
+    pub(crate) polled: AtomicBool,
+    /// The plugin's factory presets, and the built-in "Program" parameter: the preset chosen
+    /// (by the host or `presets::load`) and the one last loaded.
+    presets: &'static [crate::presets::Preset],
+    pub(crate) program: ParamCell,
+    /// Grows when parameter values move (any thread; relaxed), for `instances_watch`.
+    pub(crate) params_revision: AtomicU64,
+    program_applied: AtomicU64,
+    /// Data the plugin attached for its editor, by type (`InstanceHandle::attach`).
+    shared: Mutex<std::collections::HashMap<std::any::TypeId, Arc<dyn Any + Send + Sync>>>,
+}
+
+/// Parameter values waiting to be applied together at the start of a block.
+struct Bulk {
+    pending: bool,
+    /// Plain values by parameter index; NaN = leave as is. Allocated once.
+    values: Vec<f64>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -195,13 +297,18 @@ static REGISTRY_REVISION: AtomicU64 = AtomicU64::new(0);
 static SHIM_CTX: Mutex<Vec<(usize, Weak<Link>)>> = Mutex::new(Vec::new());
 
 impl Link {
-    pub(crate) fn new<P: Process>(plugin_id: &'static str, params: Arc<P::Params>) -> Arc<Self> {
+    pub(crate) fn bump_params(&self) {
+        self.params_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn new<P: Process>(plugin_id: &'static str, params: Arc<P::Params>, presets: &'static [crate::presets::Preset]) -> Arc<Self> {
         let link = Arc::new(Self {
             plugin_id,
             id: AtomicU64::new(InstanceId::random().0),
             params: params.clone(),
             typed: params,
             alive: AtomicBool::new(true),
+            hidden: AtomicBool::new(false),
             host: Mutex::new(Host::None),
             track: Mutex::new(TrackInfo::default()),
             wake: AtomicBool::new(false),
@@ -209,16 +316,126 @@ impl Link {
             revision: AtomicU64::new(0),
             handler: Mutex::new(None),
             outbox: Mutex::new(VecDeque::new()),
+            main_requests: std::sync::atomic::AtomicU32::new(0),
+            bulk: Mutex::new(Bulk { pending: false, values: Vec::new() }),
+            bulk_pending: AtomicBool::new(false),
+            editors: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            notifications: crate::notify::NotifyQueue::new(),
+            notify_handler: Mutex::new(None),
+            delivering: Mutex::new(()),
+            last_poll: AtomicU64::new(clock_ms()),
+            polls_on_demand: AtomicBool::new(false),
+            polled: AtomicBool::new(false),
+            presets,
+            program: ParamCell::new(0.0),
+            params_revision: AtomicU64::new(0),
+            program_applied: AtomicU64::new(0f64.to_bits()),
+            shared: Mutex::new(std::collections::HashMap::new()),
         });
+        // Data streams keep their writes only while an editor is open.
+        if let Some(hub) = link.params.stream_hub() {
+            hub.link(&link.editors);
+        }
         let mut registry = lock(&REGISTRY);
         registry.retain(|w| w.strong_count() > 0);
         registry.push(Arc::downgrade(&link));
         REGISTRY_REVISION.fetch_add(1, Ordering::AcqRel);
+        drop(registry);
+        let handle = InstanceHandle(link.clone());
+        crate::watch::emit(move || crate::watch::InstanceEvent::Added(handle));
         link
     }
 
     fn changed(&self) {
         self.revision.fetch_add(1, Ordering::AcqRel);
+        // Only while a watch exists: find this link's `Arc` among the live ones.
+        if crate::watch::any() {
+            let me = lock(&REGISTRY).iter().filter_map(Weak::upgrade).find(|l| std::ptr::eq(&**l, self));
+            if let Some(link) = me {
+                crate::watch::emit(move || crate::watch::InstanceEvent::Changed(InstanceHandle(link)));
+            }
+        }
+    }
+
+    /// Any thread (the audio thread included): if the "Program" parameter was set to another
+    /// preset, asks the main thread to load it. Lock-free.
+    pub(crate) fn check_program(&self) {
+        if !self.presets.is_empty() && self.program.get().to_bits() != self.program_applied.load(Ordering::Acquire) {
+            self.main_requests.fetch_or(crate::abi::REQUEST_NOTIFY, Ordering::Release);
+        }
+    }
+
+    /// The "Program" parameter now says `index` and that preset is (being) loaded.
+    pub(crate) fn set_program(&self, index: f64) {
+        self.program.set(index);
+        self.program_applied.store(index.to_bits(), Ordering::Release);
+    }
+
+    /// Main thread: loads the preset the "Program" parameter was set to, if it changed.
+    fn apply_program(self: &Arc<Self>) {
+        if self.presets.is_empty() {
+            return;
+        }
+        let v = self.program.get();
+        if self.program_applied.swap(v.to_bits(), Ordering::AcqRel) != v.to_bits() {
+            if let Some(preset) = self.presets.get(v.round().max(0.0) as usize) {
+                InstanceHandle(self.clone()).load_values(preset.values);
+            }
+        }
+    }
+
+    /// Audio thread, at the start of a block: applies values set with
+    /// `load_values` all at once. Never blocks (a handle holding the lock
+    /// just delays the values to the next block) and never allocates.
+    pub(crate) fn apply_bulk(&self) -> bool {
+        // Without the lock: a block with nothing pending never touches it.
+        if !self.bulk_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(mut bulk) = self.bulk.try_lock() else { return false };
+        if !bulk.pending {
+            self.bulk_pending.store(false, Ordering::Release);
+            return false;
+        }
+        let infos = self.params.infos();
+        for (i, v) in bulk.values.iter_mut().enumerate().take(infos.len()) {
+            if !v.is_nan() {
+                self.params.cell(i).set(infos[i].sanitize(*v));
+                *v = f64::NAN;
+            }
+        }
+        bulk.pending = false;
+        self.bulk_pending.store(false, Ordering::Release);
+        true
+    }
+
+    /// The value `load_values` set for parameter `index` that the audio thread has not applied
+    /// yet. Any thread; never blocks (a busy lock reads as "none").
+    pub(crate) fn pending_value(&self, index: usize) -> Option<f64> {
+        if !self.bulk_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        let bulk = self.bulk.try_lock().ok()?;
+        let v = *bulk.values.get(index).filter(|_| bulk.pending)?;
+        (!v.is_nan()).then(|| self.params.infos()[index].sanitize(v))
+    }
+
+    /// The controller copy of a `[vst3] controller_id` plugin: the instance is not one people use,
+    /// so it leaves `instances()`, `instances_watch` and the MCP hub (the shim's `set_role`). Its
+    /// `Removed` event goes out here; `destroy` sends none for a hidden instance.
+    pub(crate) fn hide(self: &Arc<Self>) {
+        if self.hidden.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        lock(&REGISTRY).retain(|w| w.strong_count() > 0 && !w.ptr_eq(&me));
+        REGISTRY_REVISION.fetch_add(1, Ordering::AcqRel);
+        let (id, plugin_id) = (InstanceId(self.id()), self.plugin_id);
+        crate::watch::emit(move || crate::watch::InstanceEvent::Removed { id, plugin_id });
+    }
+
+    pub(crate) fn is_hidden(&self) -> bool {
+        self.hidden.load(Ordering::Acquire)
     }
 
     /// The instance goes away: no more host calls, no handler (which might
@@ -228,12 +445,21 @@ impl Link {
         *lock(&self.host) = Host::None;
         let handler = lock(&self.handler).take();
         drop(handler);
+        let handler = lock(&self.notify_handler).take();
+        drop(handler);
         lock(&self.outbox).clear();
+        // Attached values go with the instance, here on the main thread.
+        let attached: Vec<_> = lock(&self.shared).drain().collect();
+        drop(attached);
         let me = Arc::downgrade(self);
         lock(&REGISTRY).retain(|w| w.strong_count() > 0 && !w.ptr_eq(&me));
         lock(&SHIM_CTX).retain(|(_, w)| w.strong_count() > 0 && !w.ptr_eq(&me));
         REGISTRY_REVISION.fetch_add(1, Ordering::AcqRel);
-        self.changed();
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        if !self.is_hidden() {
+            let (id, plugin_id) = (InstanceId(self.id()), self.plugin_id);
+            crate::watch::emit(move || crate::watch::InstanceEvent::Removed { id, plugin_id });
+        }
     }
 
     fn remember_ctx(self: &Arc<Self>, ctx: *mut c_void) {
@@ -312,7 +538,7 @@ impl Link {
     /// Tells the host (if it listens) about an edit of parameter `index`.
     fn notify(&self, kind: u32, index: usize) {
         let info = &self.params.infos()[index];
-        let normalized = info.normalize(self.params.cell(index).get());
+        let normalized = normalize_or(info, self.params.cell(index).get(), 0.0);
         // Held during the call: `destroy` cannot pull the shim away meanwhile.
         let host = lock(&self.host);
         match *host {
@@ -389,9 +615,78 @@ impl InstanceHandle {
         self.0.alive.load(Ordering::Acquire)
     }
 
+    /// The controller copy of a `[vst3] controller_id` plugin (not listed by `instances`).
+    pub(crate) fn is_hidden(&self) -> bool {
+        self.0.is_hidden()
+    }
+
     /// The track the instance sits on (see [`TrackInfo`]). Not for the audio thread (locks).
     pub fn track(&self) -> TrackInfo {
         lock(&self.0.track).clone()
+    }
+
+    /// Whether an editor of this instance is open. Lock-free: the audio
+    /// thread may ask (`Context::editor_open`) to stop analysis nobody sees.
+    pub fn is_editor_open(&self) -> bool {
+        self.0.editors.load(Ordering::Acquire) > 0
+    }
+
+    /// Editors call this when they open (`true`) and close (`false`).
+    #[doc(hidden)]
+    pub fn editor_opened(&self, open: bool) {
+        use std::sync::atomic::Ordering::AcqRel;
+        if open {
+            if self.0.editors.fetch_add(1, AcqRel) == 0 {
+                crate::watch::editor_open_changed(self, true);
+            }
+        } else if self.0.editors.fetch_update(AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) == Ok(1) {
+            crate::watch::editor_open_changed(self, false);
+        }
+    }
+
+    /// Editors call this when their window gets the keyboard focus
+    /// ([`InstanceEvent::EditorFocused`](crate::watch::InstanceEvent::EditorFocused)).
+    #[doc(hidden)]
+    pub fn editor_focused(&self) {
+        crate::watch::editor_focused(self);
+    }
+
+    /// A number that grows when the instance's parameter values move. Lock-free.
+    pub fn params_revision(&self) -> u64 {
+        self.0.params_revision.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn link_key(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+
+    /// The streams the plugin declared under `[streams]`: `(name, len, kind)`.
+    pub fn streams(&self) -> Vec<(&'static str, usize, crate::stream::StreamKind)> {
+        self.0.params.stream_hub().map(|h| h.list()).unwrap_or_default()
+    }
+
+    /// A reader of data stream `name` (the newest values the audio thread wrote while an
+    /// editor was open). Every call makes an independent reader.
+    pub fn stream(&self, name: &str) -> Option<crate::stream::StreamReader> {
+        self.0.params.stream_hub()?.reader(name)
+    }
+
+    /// The reader of tap `name`, for a worker. There is one reader at a time: `None` while
+    /// another exists (it is free again when that one is dropped).
+    pub fn tap(&self, name: &str) -> Option<crate::stream::TapReader> {
+        self.0.params.stream_hub()?.tap(name)
+    }
+
+    /// Hands the editor (or any other thread) a value of type `T`, kept until
+    /// the instance goes away (and dropped there, never on the audio thread).
+    /// A second `attach::<T>` replaces the first. Not for the audio thread.
+    pub fn attach<T: Any + Send + Sync>(&self, value: Arc<T>) {
+        lock(&self.0.shared).insert(std::any::TypeId::of::<T>(), value);
+    }
+
+    /// The value attached with [`attach`](Self::attach), if any.
+    pub fn shared<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        lock(&self.0.shared).get(&std::any::TypeId::of::<T>()).cloned()?.downcast::<T>().ok()
     }
 
     /// A number that grows whenever the instance's identity, track or store
@@ -416,12 +711,51 @@ impl InstanceHandle {
 
     /// The plain value (e.g. dB) of parameter `key`; lock-free, any thread.
     pub fn value(&self, key: &str) -> Option<f64> {
-        self.index(key).map(|i| self.0.params.cell(i).get())
+        self.index(key).map(|i| self.0.pending_value(i).unwrap_or_else(|| self.0.params.cell(i).get()))
     }
 
     /// The value of parameter `key` as 0..1; lock-free, any thread.
     pub fn normalized(&self, key: &str) -> Option<f64> {
-        self.index(key).map(|i| self.0.params.infos()[i].normalize(self.0.params.cell(i).get()))
+        self.index(key).map(|i| {
+            let plain = self.0.pending_value(i).unwrap_or_else(|| self.0.params.cell(i).get());
+            normalize_or(&self.0.params.infos()[i], plain, 0.0)
+        })
+    }
+
+    /// Sets many parameters at once, as a preset, Undo or an A/B switch does
+    /// (`values` are `(parameter index, plain value)` pairs; the index is the
+    /// position in the project file). The audio thread switches to all of them
+    /// at the start of one block, never running with half of them. Unlike
+    /// [`set`](Self::set) this is not an automation gesture: hosts record no
+    /// automation and no undo steps for it; they are told the values changed
+    /// (VST3 `kParamValuesChanged`, CLAP `rescan(VALUES)`) and the project
+    /// is marked as changed. Until then, the host, saved state and
+    /// `InstanceHandle::value` already see the new values. Any thread except the audio thread.
+    pub fn load_values(&self, values: &[(usize, f64)]) {
+        let n = self.0.params.infos().len();
+        {
+            let mut bulk = lock(&self.0.bulk);
+            if bulk.values.len() < n {
+                bulk.values.resize(n, f64::NAN);
+            }
+            for &(i, v) in values {
+                if i < n {
+                    bulk.values[i] = v;
+                }
+            }
+            bulk.pending = true;
+            self.0.bulk_pending.store(true, Ordering::Release);
+        }
+        self.0.bump_params();
+        self.0.main_requests.fetch_or(crate::abi::REQUEST_VALUES, Ordering::Release);
+        self.0.changed();
+        self.0.wake();
+    }
+
+    /// Like [`load_values`](Self::load_values) with parameter keys.
+    pub fn load_values_by_key(&self, values: &[(&str, f64)]) {
+        let pairs: Vec<(usize, f64)> = values.iter().filter_map(|&(key, v)| Some((self.index(key)?, v))).collect();
+        self.load_values(&pairs);
     }
 
     /// Starts a gesture on parameter `key` (any thread, not the audio thread).
@@ -438,6 +772,7 @@ impl InstanceHandle {
         if let Some(i) = self.index(key) {
             let info = &self.0.params.infos()[i];
             self.0.params.cell(i).set(info.sanitize(plain));
+            self.0.bump_params();
             self.0.notify(EDIT_PERFORM, i);
             self.0.wake();
         }
@@ -446,7 +781,7 @@ impl InstanceHandle {
     /// Like [`set`](Self::set), with a value from 0 to 1.
     pub fn set_normalized(&self, key: &str, normalized: f64) {
         if let Some(i) = self.index(key) {
-            let plain = self.0.params.infos()[i].denormalize(normalized);
+            let plain = denormalize_or(&self.0.params.infos()[i], normalized, self.0.params.cell(i).get());
             self.set(key, plain);
         }
     }
@@ -467,8 +802,7 @@ impl InstanceHandle {
 
     /// Makes the instance process its next block even if it sleeps (see
     /// [`Tail`](crate::Tail)): for changes `process` must see that are not
-    /// parameter edits. Any thread; lock-free when the host has no
-    /// `request_process` (VST3).
+    /// parameter edits. Any thread except the audio thread (it takes a short lock to reach the host).
     pub fn wake(&self) {
         self.0.wake();
     }
@@ -503,13 +837,82 @@ impl InstanceHandle {
         outbox.push_back(json.into());
     }
 
+    /// Asks the host's main thread to run the [`on_notify`](Self::on_notify) handler with
+    /// `code`: for work the audio thread must not do (loading a preset file after a program
+    /// change, rebuilding a lookup table, telling the editor). Lock-free and allocation-free;
+    /// any thread, the audio thread included (`ctx.instance().notify(code)`).
+    ///
+    /// A code that is already waiting is not queued twice. At most
+    /// [`notify::CAPACITY`](crate::notify::CAPACITY) different codes wait at once; more are
+    /// dropped and counted ([`notify_dropped`](Self::notify_dropped)). The handler runs on the
+    /// host's main thread when the format's shim polls (VST3, VST2, AAX: every 30 ms; CLAP:
+    /// `on_main_thread`, asked for after the block, so a code from another thread waits for the
+    /// next block), and never after the instance is destroyed. Formats whose host gives no main
+    /// thread callback (LV2, the standalone app, AU, WAM) run it on Ferritron's own thread
+    /// `ferritron-notify` within about 0.1 s; with `[isolation]`, on a thread of the plugin's
+    /// process. A format that polls never has its handler run on that thread, however long its
+    /// main thread is busy. Returns false if the code was dropped.
+    pub fn notify(&self, code: u64) -> bool {
+        if !self.0.notifications.push(code) {
+            return false;
+        }
+        self.0.main_requests.fetch_or(crate::abi::REQUEST_NOTIFY, Ordering::Release);
+        true
+    }
+
+    /// Codes [`notify`](Self::notify) dropped because the queue was full, since the instance
+    /// was created.
+    pub fn notify_dropped(&self) -> u32 {
+        self.0.notifications.dropped()
+    }
+
+    /// Sets the handler for [`notify`](Self::notify): called on the host's main thread with
+    /// each code, oldest first. Replaces the previous handler.
+    pub fn on_notify(&self, handler: impl FnMut(u64, &InstanceHandle) + Send + 'static) {
+        if self.is_alive() {
+            *lock(&self.0.notify_handler) = Some(Box::new(handler));
+            start_notify_fallback();
+        }
+    }
+
+    /// Main thread (the shim's poll): runs the handler for every waiting code.
+    pub(crate) fn deliver_notifications(&self) {
+        let _delivering = lock(&self.0.delivering);
+        if !self.is_alive() {
+            return;
+        }
+        self.0.apply_program();
+        let mut codes = [0u64; crate::notify::CAPACITY];
+        let n = self.0.notifications.take(&mut codes);
+        if n == 0 {
+            return;
+        }
+        // Taken out while it runs: the handler may call `on_notify` or `notify` itself.
+        let handler = lock(&self.0.notify_handler).take();
+        if let Some(mut handler) = handler {
+            for &code in &codes[..n] {
+                // A handler that panics is dropped (not put back), and the rest of the codes are not delivered.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(code, self))).is_err() {
+                    return;
+                }
+            }
+            let mut slot = lock(&self.0.notify_handler);
+            if slot.is_none() && self.is_alive() {
+                *slot = Some(handler);
+            }
+        }
+    }
+
     /// For editors: delivers a message from the page to the handler.
     #[doc(hidden)]
     pub fn deliver_message(&self, message: &str) {
         // Taken out while it runs: the handler may call `on_message` itself.
         let handler = lock(&self.0.handler).take();
         if let Some(mut handler) = handler {
-            handler(message, self);
+            // A handler that panics is dropped (not put back).
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(message, self))).is_err() {
+                return;
+            }
             let mut slot = lock(&self.0.handler);
             if slot.is_none() && self.is_alive() {
                 *slot = Some(handler);
@@ -584,6 +987,54 @@ pub fn instances_of(plugin_id: &str) -> Vec<InstanceHandle> {
         .filter(|l| l.plugin_id == plugin_id && l.alive.load(Ordering::Acquire))
         .map(InstanceHandle)
         .collect()
+}
+
+/// Every live instance (any plugin), in creation order.
+pub(crate) fn all_live() -> Vec<InstanceHandle> {
+    lock(&REGISTRY).iter().filter_map(Weak::upgrade).filter(|l| l.alive.load(Ordering::Acquire)).map(InstanceHandle).collect()
+}
+
+/// Milliseconds since the first call, never 0.
+pub(crate) fn clock_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// A shim that has not polled for this long is taken as one that never polls
+/// (LV2, the standalone app, AU, WAM): Ferritron's own thread delivers its notifications.
+const POLL_GRACE_MS: u64 = 100;
+
+/// Starts (once) the thread that delivers notifications of instances whose shim does not poll
+/// `take_requests` on a main thread.
+fn start_notify_fallback() {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        clock_ms();
+        STARTED.call_once(|| {
+            // The thread never ends: keep this code loaded, or no thread is started.
+            if !crate::module::pin_current_module() {
+                return;
+            }
+            let _ = std::thread::Builder::new().name("ferritron-notify".into()).spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let now = clock_ms();
+                    let links: Vec<Arc<Link>> = lock(&REGISTRY).iter().filter_map(Weak::upgrade).collect();
+                    for link in links {
+                        if !link.alive.load(Ordering::Acquire) || link.polls_on_demand.load(Ordering::Relaxed) || link.polled.load(Ordering::Acquire) || link.main_requests.load(Ordering::Acquire) & crate::abi::REQUEST_NOTIFY == 0 {
+                            continue;
+                        }
+                        let polled = link.last_poll.load(Ordering::Acquire);
+                        if now.saturating_sub(polled) > POLL_GRACE_MS {
+                            link.main_requests.fetch_and(!crate::abi::REQUEST_NOTIFY, Ordering::AcqRel);
+                            InstanceHandle(link).deliver_notifications();
+                        }
+                    }
+                }
+            });
+        });
+    }
 }
 
 /// A number that grows whenever an instance (of any plugin) is created or

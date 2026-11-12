@@ -13,9 +13,9 @@
 //! only plugins signed with PACE's wraptool (an iLok and Avid's approval),
 //! except Pro Tools Developer, which loads unsigned builds for testing.
 //!
-//! Not covered: AAX DSP (HDX hardware), AudioSuite, side chains and buses
-//! wider than stereo. Written without the SDK at hand: never compiled or
-//! run (see the README).
+//! Not covered: AAX DSP (HDX hardware) and AudioSuite. One mono side chain; buses
+//! up to 16 channels (stem formats), all MIDI, the transport, latency changes.
+//! Compiled and linked against the AAX SDK, never run in Pro Tools (see the README).
 //!
 //! The shim compiles the SDK's ACF entry points under `ferritron_aax_*`
 //! names; this crate exports them under their real names, so they are

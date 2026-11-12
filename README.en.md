@@ -41,10 +41,20 @@ A simple, fast and extensible audio plugin framework written in Rust.
   the emulator (x86_64, API 34), not yet on a phone)
 - 🚧 Written and type-checked, but never built or run on a Mac
   ([macOS developers wanted](#macos-developers-wanted)); the same for iPhone / iPad
-- 🧪 Written against Avid's published API without the AAX SDK at hand; not
-  yet compiled (developers with the SDK: please try it)
+- 🧪 Built and linked against Avid's AAX SDK (2.10.0); not run, as there is
+  no Pro Tools here (developers with Pro Tools: please try it)
 - ⚠️ The code exists but is not verified
 - — Not supported
+
+
+**What 2.0.0 was checked on**: the 2.0.0 changes (C ABI v2, control-period automation, the built-in
+bypass, output events, ...) were run on Windows through `Harness` tests, the VST3 test host
+(`ferritron-testhost`), and the LV2 and standalone paths. On 2.0.0 every example passes Steinberg's
+VST3 validator (all 537 tests, 24 examples), and clap-validator 0.4.1 reports no failure for 21 of 23
+examples (the other two do what they demonstrate: a plugin that moves its own parameter, and one that
+starts at a value other than its default). In a DAW, FL Studio 2026's plugin scan loads the VST2 build
+and reports it "ok"; the VST3 and CLAP builds have not been inserted and played in a DAW on 2.0.0; AAX is built against the AAX SDK but not run (no Pro Tools); AU, AUv3 and iOS are type-checked
+only. AVX-512 and NEON SIMD paths were not run. See [docs/performance.md](docs/performance.md).
 
 ## macOS developers wanted
 
@@ -93,22 +103,22 @@ struct Gain;
 #[ferritron::plugin]
 impl Process for Gain {
     fn process(&mut self, ctx: &mut Context) {
-        let gain = db_to_gain(ctx.params.gain.value());
-        ctx.io.for_each_sample(|s| *s *= gain);
+        let gain = db_to_gain(ctx.params().gain.value());
+        ctx.io().for_each_sample(|s| *s *= gain);
     }
 }
 ```
 
 `Cargo.toml` needs `crate-type = ["cdylib"]` under `[lib]`. Parameters are
 declared once in the project file; `#[ferritron::plugin]` generates the typed
-`ctx.params` struct, stable parameter IDs and the format entry points from it.
+`ctx.params()` struct, stable parameter IDs and the format entry points from it.
 See [examples/gain](examples/gain).
 
 ### Editors (HTML / JS)
 
 Put a web UI in a folder and declare it. It is embedded into the plugin and
 shown with the system WebView (WebView2 on Windows). There is no local
-server, and it works in VST3 and CLAP.
+server, and it works in VST3 and CLAP. The editor stays on its own pages: links to other sites do not open inside it.
 
 ```toml
 # gain.ferritroject
@@ -157,6 +167,8 @@ See [examples/gain/ui](examples/gain/ui).
 - **Built-in switches**: `ferritron.builtins` holds `"ferritron.bypass"` and,
   with `[quality]`, `"ferritron.quality"`, in the same shape as
   `ferritron.params`; `ferritron.set` / `edit` / `onChange` work with their keys.
+  After a full bypass is switched off, Ferritron calls the plugin's `reset` before it runs again, so
+  notes that did not stop during the bypass and old delay or reverb contents do not come back.
 
 - **HiDPI**: sizes are logical, and the editor is scaled to the host's scale
   factor (VST3 `IPlugViewContentScaleSupport`, CLAP `set_scale`) or else the
@@ -245,6 +257,17 @@ has the focus. This works the same in an editor in a separate process
 (`[view] process = true`). See
 [examples/gpu-view](examples/gpu-view): a level bar drawn by one shader.
 
+An editor that takes text tells the view where its caret is with
+`Ui::set_text_input` (logical pixels). On Windows, the composition window of a
+Japanese or other input method then sits at that place (not checked with a real
+IME).
+
+An editor made with `FngAdapter` (Ferritron Native Graphics) is drawn on the
+CPU in its window when no GPU device can present to it, or when the device
+stays lost after three attempts in a row (Windows only). The GPU is tried again
+every five seconds. `FERRITRON_GPU_VIEW=cpu` takes the CPU mode from the start.
+Editors that need the GPU still do not open without one.
+
 ### Silence and export quality
 
 **Idle plugins cost nothing.** When a plugin's input has been silent (below
@@ -267,13 +290,13 @@ fn tail(&self) -> Tail {
   two seconds. It never cuts off sound that is still there.
 - `Tail::Infinite`: never sleep (generators, test tones).
 
-**Best quality on export, automatically.** `ctx.quality` is `Quality::Best`
+**Best quality on export, automatically.** `ctx.quality()` is `Quality::Best`
 while the host renders offline (export, bounce, freeze) and
 `Quality::Normal` while the user plays and edits; it follows within the
 block the host says so. What a level means is the plugin's choice:
 
 ```rust
-let taps = if ctx.quality.is_best() { 512 } else { 64 };   // oversampling, filter length, ...
+let taps = if ctx.quality().is_best() { 512 } else { 64 };   // oversampling, filter length, ...
 ```
 
 With `[quality]` in the project file, the plugin also gets a "Quality"
@@ -328,7 +351,7 @@ calls the GPU API, and one GPU device is shared by the whole process.
 // in activate():
 self.reverb = ferritron_gpu::Convolver::new(&impulse_response, setup.max_block_size)?;
 // in process():
-self.reverb.process(ctx.io.channel_mut(0));
+self.reverb.process(ctx.io().channel_mut(0));
 ```
 
 See [examples/gpu-reverb](examples/gpu-reverb), a 2-second convolution reverb.
@@ -459,6 +482,33 @@ With 256-sample blocks (`ferritron-bench`), real time with `max` keeps up
 to 256 filters on the CPU and moves 1,024 and more to the GPU; offline, the
 GPU wins from 256 filters. `examples/gpu-reverb` is built as a graph, and
 `examples/gpu-modal` uses an `IirNode`.
+
+`Graph::placement(id)` reports where a node runs (CPU or GPU), and
+`Graph::set_placement(id, device)` fixes it. A fixed node is built again and
+the graph is prepared again, so the latency may change: the plugin calls
+`request_latency`. A GPU node remembers the placement it chose for its
+configuration. Call both off the audio thread.
+
+When the GPU is lost, `IirNode`, `KernelNode` and `MatrixMixerNode` switch to
+their CPU candidate from the next control period (the start of the next
+`Graph::process` call). Their state is not carried over: filter and delay
+contents start empty, so the sound has a short gap. If the switch changes the
+latency, `Graph::take_latency_changed()` returns true once; the plugin should
+then call `request_latency` (the compensation stays as it was until the next
+`prepare`).
+
+`ConvolverNode` has no CPU candidate, so it does not switch. It builds itself
+again on its own GPU thread and, while that fails, tries again every five
+seconds.
+
+Preparing the graph (for example in the plugin's `activate`) calls each node's
+`revive`. `PersistentModalBank::revive` and `TensorMixer::revive` in
+`ferritron-vulkan` build a bank or mixer again after the device is lost, and
+the node returns to the GPU when that works (otherwise it stays on the CPU).
+Nothing retries these every five seconds.
+
+All of this was checked with a loss set by hand. A real device loss has not
+been tested.
 
 #### Fusing GPU stages
 
@@ -681,6 +731,18 @@ offered. [examples/ara-stretch](examples/ara-stretch) uses both defaults.
 Both examples pass every case of the ARA SDK's `ARATestHost` for VST3 and
 CLAP.
 
+#### Limits
+
+- **Sample rate.** The bridge renders only the parts whose audio file has the
+  host's sample rate. A file at another rate (for example a 44.1 kHz file in a
+  48 kHz project) is silent. Ferritron does not resample.
+- **Memory.** Audio files are read into memory in full: channels × samples × 4
+  bytes (one hour of stereo at 48 kHz is about 1.4 GB). A region of a file that
+  could not be read is silent.
+- **Largest block.** A part of a region that is longer than the maximum block
+  size the host announced is not rendered, so it is silent. This happens in
+  blocks longer than that maximum.
+
 ### Crash isolation
 
 By default, a panic in plugin code is caught and the plugin outputs silence.
@@ -717,6 +779,8 @@ sound.
   reload the rebuilt code there.
 - `FERRITRON_ISOLATION_SHARE=plugin|instance` and
   `FERRITRON_ISOLATION_PIPELINE=0|1` override the project file.
+- **Time limits**: the host normally waits 250 ms at most for one block. While it renders offline (an
+  export, for example) it waits up to 30 s, and for the first block after `activate` up to 5 s.
 
 Windows and macOS. On Windows the child process is the plugin library under
 `rundll32`; on macOS a tiny helper, `ferritron-host`, which
@@ -763,8 +827,11 @@ connect to the hub (and they report which DAW process and track they are
 on). The AI client can list them, read and set parameters (the DAW is told,
 as for edits in the editor) and capture the audio before and after the
 plugin as WAV files with their levels. The hub listens on 127.0.0.1 only and
-accepts only processes that present the token in the user's Ferritron
-folder. A second `ferritron-mcp` started by another AI client relays to the
+accepts only processes that prove they hold the token in the user's Ferritron
+folder. The token itself is never sent: the hub, the plugins and the bridge
+check each other with an HMAC-SHA256 challenge and response, so a program that
+waits on the port cannot get the token. On Unix the token file is readable only
+by its owner. A second `ferritron-mcp` started by another AI client relays to the
 first, so there is always one hub.
 
 Tools: `list_plugins`, `get_parameters`, `set_parameter`, `capture_audio`.
@@ -808,17 +875,25 @@ peers by themselves. See [examples/gain-match](examples/gain-match).
 ### Instruments
 
 Set `kind = "instrument"` under `[plugin]`. The plugin then gets notes instead
-of audio input. `ctx.notes` holds the block's note on/off events with sample
+of audio input. `ctx.notes()` holds the block's note on/off events with sample
 offsets. See [examples/sine-synth](examples/sine-synth): a 16-voice sine synth.
 
 ```rust
-for note in ctx.notes {
+for note in ctx.notes() {
     match note.kind {
         NoteKind::On => { /* start a voice at note.offset: note.key, note.velocity */ }
         NoteKind::Off => { /* release it */ }
     }
 }
 ```
+
+Voice ends: a CLAP host gets the end of each voice (`NOTE_END`) when its note-off arrives, so it can
+release that voice's per-note modulation. A plugin with a release tail sets
+`Process::REPORTS_VOICE_END = true` and calls `ctx.voice_ended(offset, voice, note_id)` itself when
+the tail is over. A `NOTE_CHOKE` from the host arrives as a note-off. Ferritron does not claim the
+voices of overlapping notes on one key. `VoiceMods` keeps a released voice's modulation until
+`end(id)` is called, so modulation carries through the release; a new note takes a free voice, or a
+released one when none is free.
 
 ### Standalone apps, phones, the web, LV2, AAX
 
@@ -839,9 +914,16 @@ the same parameter keys, state, translations and (HTML/JS) editor.
 - **Standalone** (feature `standalone`, on by default): plays through the
   default audio output (and input, for effects) and every MIDI input, with
   the plugin's editor in a window. The state is kept in Ferritron's data
-  folder (`standalone/<plugin id>.state`) for the next start. The app's
+  folder (`standalone/<plugin id>.state`) for the next start. On Windows and
+  Linux, `ctx.midi_out` goes to the MIDI output named on the first line of
+  `standalone/midi-out.txt` (or in the `FERRITRON_MIDI_OUT` variable); the
+  names found are listed in `standalone/midi-out-ports.txt`, to copy from.
+  With neither set, nothing is sent. The app's
   executable is a small launcher `cargo ferritron` compiles (on Windows with
   the C compiler of the Visual Studio Build Tools).
+  Limits: the plugin gets only note on and off from MIDI (no controllers,
+  pitch bend or pressure), no transport and no side-chain input. The
+  channel count is fixed at 2 in and out.
 - **Android**: an app playing through AAudio with low latency (Android 9 or
   later). The editor runs in a WebView and pages see the same
   `window.ferritron` as inside a DAW; plugins without an HTML/JS editor get
@@ -870,9 +952,12 @@ the same parameter keys, state, translations and (HTML/JS) editor.
 - **LV2** (feature `lv2`, on by default, no SDK): a control port per
   parameter, MIDI, state, latency and freewheel (export). The Turtle files
   (`manifest.ttl`, `plugin.ttl`) are generated from the project file. Editors
-  on Windows and macOS. Parameter changes the plugin makes by itself
-  (`InstanceHandle`, MCP) are not recorded by the host: LV2 control ports
-  belong to the host.
+  on Windows and macOS. The plugin has a MIDI output port (`midi_out`) that
+  carries `ctx.midi_out`. LV2 control port values belong to the host.
+  Parameter changes the plugin makes by itself (`InstanceHandle`, MCP) are not
+  reported to the host. A preset the plugin selects (`load_values`,
+  `presets::load`) survives saving and reopening the project. The host's knobs
+  may show old values until the user moves them.
 - **AAX** (feature `aax`, off by default): Avid gives the AAX SDK to
   registered developers only; get it and point `AAX_SDK_DIR` at it (without
   it the build warns and leaves AAX out). Pro Tools loads only plugins
@@ -917,6 +1002,13 @@ fn init(&mut self, instance: &InstanceHandle) {
 See [examples/instances](examples/instances). Handles need the plugin and
 its editor in the host's process (not with `[isolation]` or a `[view]` in
 its own process).
+
+With `[vst3] controller_id`, the VST3 edit controller's instance is not listed
+by `instances::<P>()` or MCP. When the host connects the processor and the
+controller in one process, the editor attaches to the processor's instance,
+and `[streams]`, `store` and `on_message` reach it (the editor's path is not
+yet verified). The controller's state is not saved. Use `controller_id` only
+to migrate an existing plugin.
 
 ### Parameter types
 
@@ -963,6 +1055,89 @@ param-gain = ゲイン
 - `cargo ferritron bundle` notices newly added `.ftl` files. With plain
   `cargo build`, edit any tracked file (or run `cargo clean -p <package>`)
   after adding a new one.
+
+## New in 2.0
+
+The main additions of 2.0.0. Moving an existing plugin: [docs/migration-2.0.md](docs/migration-2.0.md);
+measurements: [docs/performance.md](docs/performance.md).
+
+### How parameter changes flow
+
+```toml
+[process]
+automation    = "control"   # default; "sample" (1.x timing), "events" (read ctx.param_events() yourself)
+control_block = 32          # control period in samples
+
+[params]
+cutoff = { type = "float", range = [20, 20000], default = 1000, scale = "log", smooth = "20ms" }
+
+[params.band]               # repeated parameters: ctx.params().band[i].freq
+repeat = 8
+[params.band.fields]
+freq = { type = "float", range = [20, 20000], default = 1000 }
+```
+
+- Automation takes effect at the start of each control period; periods without a change are joined
+  into one `process` call (dense automation: 512 -> 16 calls per block).
+- For a float parameter with `smooth`, `value()` is the smoothed value and `target()` the host's;
+  `ctx.ramp(&p, &mut buf)` gives the per-sample values.
+- `ctx.changed(&p)` / `any_changed()` / `changed_indices()` tell what changed since last time.
+- `ctx.set_param` and `ctx.midi_out` send values and MIDI to the host from the audio thread (no allocation).
+
+### Threads and memory
+
+- `Process::scratch` and `ctx.scratch::<f32>(n)`: working memory reserved in `activate`, lent without allocating.
+- Workers (`#[ferritron::plugin(worker = ...)]`) and `[streams]`: heavy analysis off the audio thread,
+  results streamed to the editor (`examples/analyzer`).
+- Writes to a data stream or a tap come from the audio thread only. If two threads write at once, the
+  second write is dropped instead of corrupting the buffer.
+- `[isolation] mode = "process"` sizes its shared memory by the real channel count and block length
+  (about 41 KB per stereo instance at 512 samples; 1.4.0 mapped about 2.1 MB).
+
+### DSP parts (`ferritron::dsp`, feature `dsp`, on by default)
+
+SIMD (`F32x4`, `F32x8`, run-time ISA choice, `FERRITRON_ISA=scalar`), `Biquad` / `BiquadX4` / `BiquadX8`,
+`DelayLine`, `Smoother`, `Fft`, `PartitionedConvolver`, `Oversampler`, `Dither` and more. Independent of the core.
+
+### Settings kept across projects
+
+```rust
+let settings = ferritron::settings::<MyPlugin>();
+settings.set("theme", "dark");
+let zoom = settings.get_or("zoom", 1.0);
+let _watch = settings.on_change(|key, value| { /* changes from other instances and processes too */ });
+```
+
+One JSON file per plugin ID (on Windows under `%APPDATA%\Ferritron\settings`); several processes may
+write at once without losing keys. The web editor's `ferritron.settings` uses the same file.
+
+### Notifications, presets, per-note modulation, watching instances
+
+```rust
+// From the audio thread (no allocation); the handler runs on the host's main thread.
+ctx.notify(PROGRAM_CHANGED);
+instance.on_notify(|code, handle| { /* read a file, tell the editor */ });
+
+// Changes of other instances and editors (one Ferritron thread serves everyone)
+let _watch = ferritron::instances_watch(|event| { /* Added / Removed / Changed / Params / Editor* */ });
+let owner = ferritron::SingletonView::owner_of(MY_PLUGIN_ID); // the editor that does the shared view
+```
+
+- `[presets]` become the host's preset list (VST3 program list, CLAP `preset-load` and preset
+  discovery, VST2 programs). User presets: `presets::save_user` / `load_user`.
+- `poly = true` float parameters can be modulated per note in CLAP. Instruments that set
+  `Process::VOICES` get CLAP note expressions and VST3 Note Expression (`ctx.voice_events()`).
+- `TrackInfo` also tells the kind of track, where the plugin sits and the channel count. No format
+  tells mute, solo or the fader ([docs/host-mixer-info.md](docs/host-mixer-info.md), Japanese).
+- Checked with `Harness` tests, the VST3 validator and clap-validator; not yet in a DAW.
+
+### Testing
+
+`ferritron::testing::Harness` gained parameter access by index and ID, the `flags` hosts see,
+`host_latency()`, `load_values`, `set_automation_mode`, arbitrary event lists (`process_events`),
+`memory_report()` and `assert_no_alloc()` (feature `alloc-check`). `testing::check_fixture` reads a state
+and parameter list saved by an earlier version (`tests/fixtures/1.4.0/`) and checks that IDs, class ID
+and saved values still hold.
 
 ## Building
 
@@ -1043,7 +1218,9 @@ not yet built or run on a Mac**; see the status in
 
 **Linux** works the same way (`cargo ferritron bundle gain` writes
 `<name>.vst3/Contents/x86_64-linux/<name>.so` and `<name>.clap`; `--install`
-copies to `~/.vst3` and `~/.clap`). There is no editor on Linux yet. Hot
+copies to `~/.vst3` and `~/.clap`). There is no editor on Linux yet. On Linux
+VST3 a parameter change or latency change made from another thread is not
+handed to the host on the main thread, because nothing polls for it yet. Hot
 reload and process isolation use the same POSIX code as macOS but are not
 tested on Linux (isolation needs the `ferritron-host` helper, which only
 directory bundles such as VST3 get).
@@ -1105,6 +1282,26 @@ This builds the `gain` package in release mode and writes
 (and `Ferritron Gain.component` on macOS).
 Copy them to `C:\Program Files\Common Files\VST3\` and `...\Common Files\CLAP\`,
 or pass `--install` from an administrator shell. Then rescan plugins in your DAW.
+
+What to do after every bundle can be written in the project file's `[bundle]`
+(read by `cargo ferritron bundle`; not built into the plugin):
+
+```toml
+[bundle]
+install = true          # copy each format to its install folder every time (as --install)
+shortcuts = true        # shortcuts to each format's install folder in target/bundled
+shortcut_prefix = "_"   # the start of each shortcut's name (default "_")
+```
+
+- `shortcuts`: one per bundled format, named `<prefix><format> Plugins` (`_VST3 Plugins`,
+  `_CLAP Plugins`, ...; a `.lnk` file on Windows, a symbolic link elsewhere). Formats without an
+  install folder (the standalone app) get none. A folder that does not exist yet still gets its
+  shortcut, with a warning. `--shortcuts` makes them for one run, `--no-shortcuts` skips them.
+- `install`: the same copy as `--install`, every time; not for `--target` or `--pgo` builds. A
+  folder that needs administrator rights gives a warning and the bundle still succeeds (with
+  `--install` it is an error, as before). `--no-install` skips it for one run.
+- VST 2 installs to the folder hosts read from the registry (`HKLM\SOFTWARE\VST`,
+  `VSTPluginsPath`), else `%COMMONPROGRAMFILES%\VST2`; the `VSTPLUGINS` variable overrides it.
 
 #### Audio Units (macOS)
 
@@ -1282,10 +1479,15 @@ WAM and the Android app).
 
 ## Versions
 
-All Ferritron crates share one version (currently **1.3.0**); see
+All Ferritron crates share one version (currently **2.0.0**); see
 [CHANGELOG.md](CHANGELOG.md). Pin it in a plugin with
-`ferritron = { path = "...", version = "1.3.0" }`; `ferritron::VERSION` and
+`ferritron = { path = "...", version = "2.0.0" }`; `ferritron::VERSION` and
 `cargo ferritron --version` report it.
+
+> **Ferritron 1.4.x and older are deprecated.** Use 2.0.0 for new work and move existing
+> plugins up: see [docs/migration-2.0.md](docs/migration-2.0.md) and "Moving up from 1.4.x" in
+> [CHANGELOG.md](CHANGELOG.md). Older versions get no fixes, and `cargo ferritron bundle`
+> warns when a plugin uses one.
 
 ## License
 

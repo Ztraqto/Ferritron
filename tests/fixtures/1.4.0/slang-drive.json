@@ -1,0 +1,11 @@
+{
+  "plugin": "dev.ferritron.examples.slang-drive",
+  "ferritron": "1.4.0",
+  "class_id": "6343196002e80957aed2290704c8c541",
+  "params": [
+    {"index": 0, "id": 1856310078, "name": "ドライブ", "flags": 0, "default": 0.3333333333333333, "value": 0.21},
+    {"index": 1, "id": 1880363132, "name": "出力", "flags": 0, "default": 0.75, "value": 0.58},
+    {"index": 2, "id": 1073741824, "name": "バイパス", "flags": 2, "default": 0, "value": 1}
+  ],
+  "state": "4652544e01000000050000003e0ba56e3d0ad7a3703d1e407c1014702a5c8fc2f52824c000000040000000000000f03f030000400000003b8288e24104000040000000ce392ae741"
+}

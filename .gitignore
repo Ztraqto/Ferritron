@@ -1,4 +1,5 @@
 /target
+/target-*
 # .NET build output (C# examples)
 bin/
 obj/

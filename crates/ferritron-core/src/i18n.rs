@@ -289,9 +289,9 @@ mod tests {
     use super::*;
 
     static INFOS: [ParamInfo; 3] = [
-        ParamInfo { id: 1, key: "gain", name: "Gain", unit: "dB", kind: ParamKind::Float { min: 0.0, max: 1.0 }, default: 0.0 },
-        ParamInfo { id: 2, key: "mode", name: "Mode", unit: "", kind: ParamKind::Enum { choices: &["Clean", "Warm"] }, default: 0.0 },
-        ParamInfo { id: 3, key: "on", name: "Enabled", unit: "", kind: ParamKind::Bool, default: 1.0 },
+        ParamInfo { id: 1, key: "gain", name: "Gain", unit: "dB", kind: ParamKind::Float { min: 0.0, max: 1.0 }, default: 0.0, scale: crate::ParamScale::Linear, text: None },
+        ParamInfo { id: 2, key: "mode", name: "Mode", unit: "", kind: ParamKind::Enum { choices: &["Clean", "Warm"] }, default: 0.0, scale: crate::ParamScale::Linear, text: None },
+        ParamInfo { id: 3, key: "on", name: "Enabled", unit: "", kind: ParamKind::Bool, default: 1.0, scale: crate::ParamScale::Linear, text: None },
     ];
 
     const JA: &str = "param-gain = ゲイン\nparam-mode-1 = ウォーム\n";
@@ -322,6 +322,8 @@ mod tests {
             unit: "",
             kind: ParamKind::Enum { choices: &["Auto", "Normal", "Best"] },
             default: 0.0,
+            scale: crate::ParamScale::Linear,
+            text: None,
         };
         assert_eq!(l.name_of(INFOS.len() + 1, &quality), "音質");
         assert_eq!(l.format(INFOS.len() + 1, &quality, 2.0), "最高");

@@ -38,11 +38,20 @@ pub use nodes::{ConvolverNode, IirNode, MatrixMixerNode};
 /// The node graph, re-exported so plugins need one dependency.
 pub use ferritron_graph as graph;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use batch::{Batcher, Registry};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Longest the GPU may take to answer one round (or, offline, one tail)
+/// before it counts as lost. Real-time callers never wait for it.
+const GPU_WAIT: Duration = Duration::from_secs(2);
+
+/// After a failed attempt to open the GPU again (or to build a convolver on
+/// it), the next attempt waits this long.
+const REBUILD_RETRY: Duration = Duration::from_secs(5);
 
 /// Largest grid size: the FFT (2G points) must fit in workgroup memory.
 const MAX_GRID: usize = 1024;
@@ -189,6 +198,9 @@ struct Exchange {
     completed: u64,
     /// Tail output by grid block, in slot `block % results.len()`.
     results: Vec<(u64, Vec<f32>)>,
+    /// The GPU's input stream starts again at this window (a grid block):
+    /// it forgets its history, and results of earlier windows are dropped.
+    restart: Option<u64>,
     stop: bool,
 }
 
@@ -196,12 +208,29 @@ struct Shared {
     exchange: Mutex<Exchange>,
     /// Signalled when a tail result is stored (offline mode waits on it).
     done: Condvar,
-    /// The GPU fell too far behind and lost input: tails are off from now on.
-    broken: AtomicBool,
+    /// The GPU failed (device lost, a panic, or no answer within
+    /// [`GPU_WAIT`]). The convolver then passes its input through, until the
+    /// GPU thread has built it again on a device.
+    lost: AtomicBool,
     last_gpu_micros: AtomicU64,
+    /// Times the GPU thread built this convolver again. The audio thread
+    /// starts its input stream again when this changes (G1).
+    rebuilds: AtomicU64,
+    /// Generation of the device the convolver's GPU state is on.
+    device_generation: AtomicU64,
+    /// Set by the audio thread once when a call is longer than `max_block`;
+    /// the GPU thread prints the warning and clears it.
+    oversized: AtomicBool,
 }
 
 /// A long convolution with its tail on the GPU. See the crate docs.
+///
+/// If the GPU is lost (or stops answering), the convolver passes its input
+/// through unchanged ([`device_lost`](Self::device_lost)) while the GPU
+/// thread builds it again on a new device; then its tail comes back, with
+/// the input stream restarted from the current position (counted by
+/// [`restarts`](Self::restarts)). Building it again needs a device that can
+/// be opened: until one can, it stays lost.
 pub struct Convolver {
     head: Vec<f32>,
     /// Input history (head taps, and input not yet handed to the GPU thread),
@@ -212,12 +241,18 @@ pub struct Convolver {
     sent: u64,
     max_block: usize,
     grid: u64,
+    /// Tail delay in grid blocks (`D`).
+    delay: u64,
     /// First grid block that has a tail (earlier ones have no tail input yet).
     first_tail_block: u64,
     /// The audio thread's copy of the tail of grid block `tail_block`.
     tail: Vec<f32>,
     tail_block: Option<u64>,
     tail_valid: bool,
+    /// The GPU must start its input stream again; no tail until it has.
+    restart_due: bool,
+    /// Times the input stream started again (see [`restarts`](Self::restarts)).
+    restarts: AtomicU64,
     has_tail: bool,
     offline: bool,
     shared: Arc<Shared>,
@@ -226,6 +261,12 @@ pub struct Convolver {
     slot: Option<(Arc<ConvSlot>, Arc<Batcher<ConvSlot>>)>,
     misses: AtomicU64,
     adapter: String,
+    /// `Shared::rebuilds` as the audio thread last saw it.
+    rebuilds_seen: u64,
+    /// The loss was announced to the GPU thread (once per loss).
+    lost_announced: bool,
+    /// A call longer than `max_block` was seen and reported to the GPU thread.
+    oversize_reported: bool,
 }
 
 impl Convolver {
@@ -254,20 +295,37 @@ impl Convolver {
                 pending_start: 0,
                 completed: 0,
                 results: (0..results).map(|_| (u64::MAX, vec![0.0; grid])).collect(),
+                restart: None,
                 stop: false,
             }),
             done: Condvar::new(),
-            broken: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
             last_gpu_micros: AtomicU64::new(0),
+            rebuilds: AtomicU64::new(0),
+            device_generation: AtomicU64::new(0),
+            oversized: AtomicBool::new(false),
         });
         let (slot, adapter) = if tail.is_empty() {
             (None, String::from("(no tail: CPU only)"))
         } else {
             let gpu = Gpu::new(tail, grid, delay, max_block)?;
             let adapter = gpu.ctx.adapter.clone();
+            shared.device_generation.store(gpu.ctx.generation, Relaxed);
             let slot = Arc::new(ConvSlot {
                 shared: shared.clone(),
-                work: Mutex::new(ConvWork { result: vec![0.0; grid], samples: Vec::with_capacity(max_block * 16), next: 0, completed: 0, gpu }),
+                work: Mutex::new(ConvWork {
+                    result: vec![0.0; grid],
+                    samples: Vec::with_capacity(max_block * 16),
+                    next: 0,
+                    completed: 0,
+                    gpu,
+                    // A copy of the tail, to build the GPU state again after a loss.
+                    ir: Arc::from(tail),
+                    grid,
+                    delay,
+                    max_block,
+                    retry_at: None,
+                }),
             });
             let batcher = CONVOLVERS.register("ferritron-gpu-convolution", run_convolutions, slot.clone())?;
             (Some((slot, batcher)), adapter)
@@ -279,16 +337,22 @@ impl Convolver {
             sent: 0,
             max_block,
             grid: grid as u64,
+            delay: delay as u64,
             first_tail_block: delay as u64,
             tail: vec![0.0; grid],
             tail_block: None,
             tail_valid: false,
+            restart_due: false,
+            restarts: AtomicU64::new(0),
             has_tail: slot.is_some(),
             offline: mode == Mode::Offline,
             shared,
             slot,
             misses: AtomicU64::new(0),
             adapter,
+            rebuilds_seen: 0,
+            lost_announced: false,
+            oversize_reported: false,
         })
     }
 
@@ -307,9 +371,39 @@ impl Convolver {
         self.shared.last_gpu_micros.load(Relaxed)
     }
 
+    /// Times the GPU fell too far behind and its input stream started again
+    /// from the current position (G1). Each restart silences the tail for
+    /// about `delay` grid blocks (a few milliseconds per restart) and the
+    /// tail then resumes from silence before the restart point. A host or
+    /// plugin that cares can notify its editor when this grows.
+    pub fn restarts(&self) -> u64 {
+        self.restarts.load(Relaxed)
+    }
+
+    /// True while the GPU is lost (or stopped answering) and this convolver
+    /// has not been built again yet: it passes its input through unchanged.
+    /// The GPU thread then tries to build it again on a new device, every
+    /// [`REBUILD_RETRY`] at most, and the tail comes back (see
+    /// [`device_generation`](Self::device_generation) and
+    /// [`rebuilds`](Self::rebuilds)).
+    pub fn device_lost(&self) -> bool {
+        self.shared.lost.load(Acquire)
+    }
+
+    /// Times the GPU state was built again after a loss.
+    pub fn rebuilds(&self) -> u64 {
+        self.shared.rebuilds.load(Acquire)
+    }
+
+    /// Generation of the GPU device the convolver runs on (it goes up each
+    /// time a new device is opened after a loss). 0 without a tail.
+    pub fn device_generation(&self) -> u64 {
+        self.shared.device_generation.load(Acquire)
+    }
+
     /// Hands input not yet sent to the GPU thread. In real time it never
     /// waits: if the lock is busy, the input stays in `history` for the next
-    /// block.
+    /// block (and a due restart waits for it too).
     fn send_input(&mut self) {
         let mut ex = if self.offline {
             self.shared.exchange.lock().unwrap_or_else(PoisonError::into_inner)
@@ -321,18 +415,30 @@ impl Convolver {
         };
         let mask = self.history.len() - 1;
         let unsent = (self.pos - self.sent) as usize;
-        if ex.pending.len() + unsent > ex.pending.capacity() {
-            // The GPU thread stalled for many blocks.
-            self.shared.broken.store(true, Relaxed);
-            return;
+        // Offline waits for the GPU instead of dropping input, so only real time overflows.
+        let overflow = !self.offline && ex.pending.len() + unsent > ex.pending.capacity();
+        if self.restart_due || overflow {
+            // The GPU fell too far behind (or lost input): drop the backlog and
+            // start its input stream again at the next window, from here on.
+            let window = self.pos.div_ceil(self.grid);
+            ex.pending.clear();
+            ex.pending_start = self.pos;
+            ex.restart = Some(window);
+            self.sent = self.pos;
+            self.restart_due = false;
+            self.first_tail_block = window + self.delay;
+            self.tail_block = None;
+            self.tail_valid = false;
+            self.restarts.fetch_add(1, Relaxed);
+        } else {
+            if ex.pending.is_empty() {
+                ex.pending_start = self.sent;
+            }
+            for t in self.sent..self.pos {
+                ex.pending.push(self.history[t as usize & mask]);
+            }
+            self.sent = self.pos;
         }
-        if ex.pending.is_empty() {
-            ex.pending_start = self.sent;
-        }
-        for t in self.sent..self.pos {
-            ex.pending.push(self.history[t as usize & mask]);
-        }
-        self.sent = self.pos;
         ex.completed = self.pos / self.grid;
         drop(ex);
         if let Some((_, batcher)) = &self.slot {
@@ -343,28 +449,41 @@ impl Convolver {
     /// Fetches the tail of grid block `g` from the GPU thread. Waits only
     /// in offline mode.
     fn fetch_tail(&mut self, g: u64) {
-        self.tail_block = Some(g);
-        self.tail_valid = false;
-        if !self.has_tail || g < self.first_tail_block || self.shared.broken.load(Relaxed) {
+        if !self.has_tail || g < self.first_tail_block || self.restart_due {
+            self.tail_block = Some(g);
+            self.tail_valid = false;
             return;
         }
-        let ex = if self.offline {
+        let mut ex = if self.offline {
             let ex = self.shared.exchange.lock().unwrap_or_else(PoisonError::into_inner);
             let ready = |ex: &mut Exchange| {
                 let n = ex.results.len();
-                ex.results[g as usize % n].0 != g && !ex.stop && !self.shared.broken.load(Relaxed)
+                ex.results[g as usize % n].0 != g && !ex.stop && !self.shared.lost.load(Relaxed)
             };
-            Ok(self.shared.done.wait_while(ex, ready).unwrap_or_else(PoisonError::into_inner))
-        } else {
-            self.shared.exchange.try_lock()
-        };
-        if let Ok(mut ex) = ex {
-            let n = ex.results.len();
-            let slot = &mut ex.results[g as usize % n];
-            if slot.0 == g {
-                std::mem::swap(&mut self.tail, &mut slot.1);
-                self.tail_valid = true;
+            let (ex, timeout) = self.shared.done.wait_timeout_while(ex, GPU_WAIT, ready).unwrap_or_else(PoisonError::into_inner);
+            if timeout.timed_out() {
+                // No answer in time: the GPU counts as lost (G3).
+                self.shared.lost.store(true, Relaxed);
+                self.tail_block = Some(g);
+                self.tail_valid = false;
+                return;
             }
+            ex
+        } else {
+            match self.shared.exchange.try_lock() {
+                Ok(ex) => ex,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                // The GPU thread holds the lock for a moment: try again at the next sample.
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            }
+        };
+        self.tail_block = Some(g);
+        self.tail_valid = false;
+        let n = ex.results.len();
+        let slot = &mut ex.results[g as usize % n];
+        if slot.0 == g {
+            std::mem::swap(&mut self.tail, &mut slot.1);
+            self.tail_valid = true;
         }
         if !self.tail_valid {
             self.misses.fetch_add(1, Relaxed);
@@ -372,11 +491,50 @@ impl Convolver {
     }
 
     /// Convolves `block` in place. Real-time safe: no allocation, never waits.
-    /// `block.len()` must not exceed `max_block`.
+    /// Blocks longer than `max_block` are convolved in pieces of `max_block`:
+    /// the whole block is always processed.
     pub fn process(&mut self, block: &mut [f32]) {
-        let n = block.len().min(self.max_block);
-        let block = &mut block[..n];
+        if block.len() > self.max_block && !self.oversize_reported {
+            // Once per convolver: the GPU thread prints the warning (the audio thread never prints).
+            self.oversize_reported = true;
+            self.shared.oversized.store(true, Release);
+        }
+        for piece in block.chunks_mut(self.max_block) {
+            self.process_piece(piece);
+        }
+    }
+
+    /// One piece of at most `max_block` samples.
+    fn process_piece(&mut self, block: &mut [f32]) {
+        let n = block.len();
         let mask = self.history.len() - 1;
+        if self.shared.lost.load(Acquire) {
+            // The GPU is gone: the input passes through unchanged. The history
+            // and the position keep running, so the stream can start again
+            // from here when the GPU thread has built this convolver anew.
+            for (i, &x) in block.iter().enumerate() {
+                self.history[(self.pos as usize + i) & mask] = x;
+            }
+            self.pos += n as u64;
+            self.sent = self.pos;
+            self.tail_block = None;
+            self.tail_valid = false;
+            if self.has_tail && !self.lost_announced {
+                // Once per loss: wake the GPU thread so it tries to build us again.
+                self.lost_announced = true;
+                if let Some((_, batcher)) = &self.slot {
+                    batcher.notify();
+                }
+            }
+            return;
+        }
+        self.lost_announced = false;
+        let rebuilds = self.shared.rebuilds.load(Acquire);
+        if rebuilds != self.rebuilds_seen {
+            // Built again on a device: its input stream starts again from here (G1).
+            self.rebuilds_seen = rebuilds;
+            self.restart_due = true;
+        }
         for (i, &x) in block.iter().enumerate() {
             self.history[(self.pos as usize + i) & mask] = x;
         }
@@ -401,13 +559,12 @@ impl Convolver {
         }
         self.pos += n as u64;
 
-        if self.has_tail && !self.shared.broken.load(Relaxed) {
+        if self.has_tail {
             if self.pos - self.sent > (self.history.len() - self.head.len()) as u64 {
-                // Unsent input was overwritten: the GPU would see a gap.
-                self.shared.broken.store(true, Relaxed);
-            } else {
-                self.send_input();
+                // Unsent input was overwritten: the GPU would see a gap, so it starts again.
+                self.restart_due = true;
             }
+            self.send_input();
         }
     }
 }
@@ -416,8 +573,8 @@ impl Drop for Convolver {
     fn drop(&mut self) {
         self.shared.exchange.lock().unwrap_or_else(PoisonError::into_inner).stop = true;
         self.shared.done.notify_all();
-        if let Some((slot, _)) = self.slot.take() {
-            CONVOLVERS.unregister(&slot);
+        if let Some((slot, batcher)) = self.slot.take() {
+            CONVOLVERS.unregister(&slot, &batcher);
         }
     }
 }
@@ -435,6 +592,13 @@ struct ConvWork {
     next: u64,
     completed: u64,
     result: Vec<f32>,
+    /// The tail (the impulse response after the head), to build `gpu` again.
+    ir: Arc<[f32]>,
+    grid: usize,
+    delay: usize,
+    max_block: usize,
+    /// A failed rebuild is not tried again before this.
+    retry_at: Option<std::time::Instant>,
 }
 
 /// The GPU thread shared by every convolver of the process (see `batch`):
@@ -447,19 +611,62 @@ pub fn convolvers_on_gpu_thread() -> usize {
     CONVOLVERS.len()
 }
 
+/// Test hook: the GPU thread waits on this before each round, so a test can
+/// hold it back and make the audio side fall behind.
+#[cfg(test)]
+static GPU_GATE: Mutex<()> = Mutex::new(());
+
 fn run_convolutions(batcher: &Batcher<ConvSlot>) {
-    while batcher.wait() {
+    loop {
+        // A lost convolver is tried again every REBUILD_RETRY; otherwise the
+        // thread sleeps until a convolver notifies it.
+        let lost_now = batcher.slots().iter().any(|s| s.shared.lost.load(Acquire));
+        let limit = if lost_now { REBUILD_RETRY } else { Duration::MAX };
+        match batcher.wait_within(limit) {
+            Some(true) | None => {}
+            Some(false) => return,
+        }
+        #[cfg(test)]
+        drop(GPU_GATE.lock().unwrap_or_else(PoisonError::into_inner));
         let slots = batcher.slots();
+        for slot in &slots {
+            if slot.shared.oversized.swap(false, Acquire) {
+                eprintln!("ferritron: a convolution was called with a block longer than its max_block; the GPU cannot keep up with it in real time, so some tail blocks are missed (see missed_blocks())");
+            }
+        }
         let mut works: Vec<_> = slots.iter().map(|s| s.work.lock().unwrap_or_else(PoisonError::into_inner)).collect();
-        // Take every convolver's new input.
+        // Build lost convolvers again (on a new device if the old one is lost).
         for (slot, work) in slots.iter().zip(works.iter_mut()) {
-            let (start, completed) = {
+            // A convolver whose device was replaced under it counts as lost.
+            if work.gpu.ctx.generation != GENERATION.load(Acquire) {
+                slot.shared.lost.store(true, Release);
+            }
+            if !slot.shared.lost.load(Acquire) || work.retry_at.is_some_and(|t| std::time::Instant::now() < t) {
+                continue;
+            }
+            if let Err(why) = rebuild(slot, work) {
+                eprintln!("ferritron: convolution waits for the GPU ({why}); it is tried again in {} s", REBUILD_RETRY.as_secs());
+                work.retry_at = Some(std::time::Instant::now() + REBUILD_RETRY);
+            }
+        }
+        // Take every convolver's new input, and its restart if one is due.
+        for (slot, work) in slots.iter().zip(works.iter_mut()) {
+            let (start, completed, restart) = {
                 let mut ex = slot.shared.exchange.lock().unwrap_or_else(PoisonError::into_inner);
+                let restart = ex.restart.take();
+                if restart.is_some() {
+                    // Results of the old stream are void.
+                    ex.results.iter_mut().for_each(|r| r.0 = u64::MAX);
+                }
                 work.samples.clear();
                 work.samples.extend_from_slice(&ex.pending);
                 ex.pending.clear();
-                (ex.pending_start, ex.completed)
+                (ex.pending_start, ex.completed, restart)
             };
+            if let Some(window) = restart {
+                work.gpu.reset_stream();
+                work.next = window;
+            }
             if !work.samples.is_empty() {
                 work.gpu.upload(start, &work.samples);
             }
@@ -467,20 +674,34 @@ fn run_convolutions(batcher: &Batcher<ConvSlot>) {
         }
         // Rounds: one window of every convolver that has one due, per submission.
         loop {
-            let due: Vec<usize> = (0..works.len()).filter(|&i| works[i].next < works[i].completed).collect();
+            let due: Vec<usize> = (0..works.len()).filter(|&i| !slots[i].shared.lost.load(Relaxed) && works[i].next < works[i].completed).collect();
             let Some(&first) = due.first() else { break };
             let begun = Instant::now();
             let ctx = works[first].gpu.ctx.clone();
-            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            for &i in &due {
-                let k = works[i].next;
-                works[i].gpu.encode(k, &mut encoder);
+            // The device answers, or it is lost: a panic (a wgpu call that
+            // failed), or no answer within GPU_WAIT.
+            let round = catch_unwind(AssertUnwindSafe(|| {
+                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                for &i in &due {
+                    let k = works[i].next;
+                    works[i].gpu.encode(k, &mut encoder);
+                }
+                ctx.queue.submit([encoder.finish()]);
+                for &i in &due {
+                    works[i].gpu.staging.map_async(wgpu::MapMode::Read, .., |_| {});
+                }
+                ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(GPU_WAIT) })
+            }));
+            if !matches!(round, Ok(Ok(_))) {
+                let why = match round {
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => "a GPU call panicked".into(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                eprintln!("ferritron: the GPU is lost for convolution ({why}); the convolvers pass their input through");
+                lose(&ctx, &slots);
+                break;
             }
-            ctx.queue.submit([encoder.finish()]);
-            for &i in &due {
-                works[i].gpu.staging.map_async(wgpu::MapMode::Read, .., |_| {});
-            }
-            let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
             let micros = begun.elapsed().as_micros() as u64;
             for &i in &due {
                 let work = &mut *works[i];
@@ -500,6 +721,37 @@ fn run_convolutions(batcher: &Batcher<ConvSlot>) {
     }
 }
 
+/// The device failed: every convolver on it is lost. The GPU thread builds
+/// them again on a new device (see [`rebuild`]); the audio side passes its
+/// input through until then.
+fn lose(ctx: &Context, slots: &[Arc<ConvSlot>]) {
+    ctx.lost.store(true, Relaxed);
+    for slot in slots {
+        // Under the lock, so an offline waiter cannot miss the notification.
+        let _ex = slot.shared.exchange.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.shared.lost.store(true, Release);
+        slot.shared.done.notify_all();
+    }
+}
+
+/// Builds a convolver's GPU state again, on the current device (a new one
+/// if the old one was lost). The audio side starts its input stream again
+/// once it sees the new `rebuilds` count (the impulse response is uploaded
+/// from the copy the convolver keeps). Runs on the GPU thread only.
+fn rebuild(slot: &ConvSlot, work: &mut ConvWork) -> Result<(), String> {
+    let gpu = Gpu::new(&work.ir[..], work.grid, work.delay, work.max_block)?;
+    work.gpu = gpu;
+    work.samples.clear();
+    // Nothing is due until the audio side restarts the stream (it does so at once).
+    work.next = u64::MAX;
+    work.completed = 0;
+    work.retry_at = None;
+    slot.shared.device_generation.store(work.gpu.ctx.generation, Relaxed);
+    slot.shared.rebuilds.fetch_add(1, Release);
+    slot.shared.lost.store(false, Release);
+    Ok(())
+}
+
 /// The process's GPU device and pipelines, shared by every convolver
 /// (design doc 2.3): a device per instance costs time and memory, and many
 /// devices at once strain drivers.
@@ -507,6 +759,12 @@ pub(crate) struct Context {
     pub(crate) adapter: String,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    /// Set by the device's error and loss callbacks, or by a failed round.
+    /// Once set, this device is not used again: [`context`] opens a new one.
+    pub(crate) lost: Arc<AtomicBool>,
+    /// 1 for the first device this process opened, then up by one each time
+    /// a new one replaces a lost device (V1).
+    pub(crate) generation: u64,
     forward: wgpu::ComputePipeline,
     accumulate: wgpu::ComputePipeline,
     inverse: wgpu::ComputePipeline,
@@ -518,7 +776,27 @@ pub(crate) struct Context {
     spectra: Mutex<HashMap<(u64, usize, usize), std::sync::Weak<wgpu::Buffer>>>,
 }
 
-static CONTEXT: OnceLock<Result<Arc<Context>, String>> = OnceLock::new();
+/// The process's device (see [`context`]).
+struct ContextSlot {
+    /// The device in use: a lost one stays here until a new one replaces it.
+    current: Option<Arc<Context>>,
+    /// Why no device could be opened, if none ever was (cached for good).
+    never: Option<String>,
+    /// Generation of the newest device.
+    generation: u64,
+    /// After a failed attempt to open a device again: no attempt before this.
+    retry_at: Option<std::time::Instant>,
+}
+
+static CONTEXT: Mutex<ContextSlot> = Mutex::new(ContextSlot { current: None, never: None, generation: 0, retry_at: None });
+
+/// Devices replaced after a loss, kept until the process ends (see [`context`]).
+static RETIRED: Mutex<Vec<Arc<Context>>> = Mutex::new(Vec::new());
+
+/// Generation of the newest device. The GPU thread compares it with the
+/// generation each convolver runs on: a convolver on an older device is
+/// built again.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// The GPU to use. Only the native backend is started first (Vulkan;
 /// Metal on Apple): starting every backend wgpu has (DX12, OpenGL) takes
@@ -541,9 +819,60 @@ fn adapter() -> Result<wgpu::Adapter, String> {
     }
 }
 
+/// The process's GPU device. After a device is lost, the next call opens a
+/// new one (generation up by one), at most once per [`REBUILD_RETRY`] while
+/// opening fails. A failure before any device was ever opened is final.
 pub(crate) fn context() -> Result<Arc<Context>, String> {
-    CONTEXT
-        .get_or_init(|| {
+    let mut slot = CONTEXT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(ctx) = &slot.current {
+        if !ctx.lost.load(Relaxed) {
+            return Ok(ctx.clone());
+        }
+    }
+    if let Some(why) = &slot.never {
+        return Err(why.clone());
+    }
+    if slot.retry_at.is_some_and(|t| std::time::Instant::now() < t) {
+        return Err("the GPU was lost and a new device is not ready yet".into());
+    }
+    let generation = slot.generation + 1;
+    match open_context(generation) {
+        Ok(ctx) => {
+            slot.generation = generation;
+            slot.retry_at = None;
+            if let Some(old) = slot.current.replace(ctx.clone()) {
+                // The Vulkan side may still hold the old device's raw handle
+                // (its `adopt` keeps a device it does not see as lost): keep
+                // the old one alive, so that handle never dangles.
+                RETIRED.lock().unwrap_or_else(PoisonError::into_inner).push(old);
+            }
+            GENERATION.store(generation, Release);
+            Ok(ctx)
+        }
+        Err(why) => {
+            if slot.current.is_none() {
+                slot.never = Some(why.clone());
+            } else {
+                slot.retry_at = Some(std::time::Instant::now() + REBUILD_RETRY);
+            }
+            Err(why)
+        }
+    }
+}
+
+/// The shared Vulkan device for persistent kernels (f7 1-2). [`context`] is
+/// the one place that reopens the shared device after a loss, so it is
+/// called first; `Gpu::get` then returns the device in use instead of
+/// opening a device of its own.
+pub(crate) fn shared_vulkan() -> Result<Arc<ferritron_vulkan::Gpu>, String> {
+    context()?;
+    ferritron_vulkan::Gpu::get()
+}
+
+/// Opens a GPU device and its pipelines (see [`context`]).
+fn open_context(generation: u64) -> Result<Arc<Context>, String> {
+    {
+        {
             let started = std::time::Instant::now();
             let trace = |what: &str| {
                 if std::env::var_os("FERRITRON_TRACE").is_some() {
@@ -575,6 +904,21 @@ pub(crate) fn context() -> Result<Arc<Context>, String> {
                 None => pollster::block_on(adapter.request_device(&descriptor)).map_err(|e| format!("cannot open the GPU: {e}"))?,
             };
             trace("device");
+            // With handlers, wgpu reports errors and losses here instead of
+            // panicking on an error nobody receives (V1).
+            let lost = Arc::new(AtomicBool::new(false));
+            let flag = lost.clone();
+            device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                eprintln!("ferritron: GPU error: {error}");
+                flag.store(true, Relaxed);
+            }));
+            let flag = lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    eprintln!("ferritron: GPU device lost: {message}");
+                    flag.store(true, Relaxed);
+                }
+            });
             let shader = |label: &str, source: &str| {
                 device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(source.into()) })
             };
@@ -591,6 +935,8 @@ pub(crate) fn context() -> Result<Arc<Context>, String> {
                 })
             };
             Ok(Arc::new(Context {
+                lost,
+                generation,
                 forward: pipeline(&convolution, "forward"),
                 accumulate: pipeline(&convolution, "accumulate"),
                 inverse: pipeline(&convolution, "inverse"),
@@ -603,8 +949,8 @@ pub(crate) fn context() -> Result<Arc<Context>, String> {
                 queue,
             }))
             .inspect(|_| trace("ready"))
-        })
-        .clone()
+        }
+    }
 }
 
 /// On Vulkan, opens wgpu's device ourselves with a second queue on the same
@@ -700,6 +1046,9 @@ struct Gpu {
 impl Gpu {
     fn new(tail: &[f32], grid: usize, delay: usize, max_block: usize) -> Result<Self, String> {
         let ctx = context()?;
+        if ctx.lost.load(Relaxed) {
+            return Err("the GPU was lost earlier in this process".into());
+        }
         let device = &ctx.device;
         let n = grid * 2;
         let partitions = tail.len().div_ceil(grid);
@@ -774,9 +1123,16 @@ impl Gpu {
         }
         // Pay pipeline setup now, not on the first audio block; then clear
         // the spectrum the warm-up left behind.
-        gpu.transform_and_sum(0, &mut vec![0.0; grid]);
+        gpu.transform_and_sum(0, &mut vec![0.0; grid])?;
         ctx.queue.write_buffer(&gpu.fdl, 0, &vec![0u8; slots * n * 8]);
         Ok(gpu)
+    }
+
+    /// Clears the input history and the spectra: the stream starts again
+    /// from silence (the GPU thread writes the new input after this).
+    fn reset_stream(&self) {
+        self.ctx.queue.write_buffer(&self.ring, 0, &vec![0u8; self.ring_len * 4]);
+        self.ctx.queue.write_buffer(&self.fdl, 0, &vec![0u8; self.slots * self.n * 8]);
     }
 
     fn write_params(&self, src_base: u32, src_mask: u32, src_count: u32, window: u32, dst_offset: u32, newest: u32) {
@@ -800,14 +1156,15 @@ impl Gpu {
     /// Stores the spectrum of input window `k` (grid blocks `k-1` and `k`)
     /// and computes the tail output of grid block `k + D` into `out`. One
     /// submission: forward FFT, multiply-accumulate, inverse FFT.
-    fn transform_and_sum(&self, k: u64, out: &mut [f32]) {
+    fn transform_and_sum(&self, k: u64, out: &mut [f32]) -> Result<(), String> {
         let ctx = &self.ctx;
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         self.encode(k, &mut encoder);
         ctx.queue.submit([encoder.finish()]);
         self.staging.map_async(wgpu::MapMode::Read, .., |_| {});
-        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(GPU_WAIT) }).map_err(|e| format!("the GPU did not answer: {e}"))?;
         self.read(out);
+        Ok(())
     }
 
     /// Records the work of window `k` (and the copy of its result to the
@@ -1062,6 +1419,45 @@ mod tests {
         drop(c);
     }
 
+    /// f7 1-1: a call longer than max_block is processed whole, and the
+    /// convolver notes it once (the GPU thread prints the warning).
+    #[test]
+    fn an_oversized_call_is_processed_whole_and_noted_once() {
+        let _serial = crate::serial();
+        let Ok(mut conv) = Convolver::new(&decaying_ir(9000), 256) else { return eprintln!("skipping: no GPU") };
+        let mut block = vec![0.0f32; 1024];
+        conv.process(&mut block);
+        assert!(conv.oversize_reported, "the first oversized call is noted");
+        conv.process(&mut vec![0.0f32; 1024]);
+        assert!(conv.oversize_reported);
+    }
+
+    /// f7 1-1: at real-time pace, a 1024-sample block fits when max_block is 1024
+    /// (the grid is then 1024 and one grid block of GPU time is enough).
+    #[test]
+    fn paced_1024_blocks_fit_a_max_block_of_1024() {
+        let _serial = crate::serial();
+        let ir = decaying_ir(9000);
+        let input = noise(96000, 5);
+        let Some((_, misses)) = play(&ir, &input, 1024, &[1024]) else { return };
+        assert_eq!(misses, 0, "a 1024 block with max_block 1024 must not miss deadlines");
+    }
+
+    /// f7 1-2: after a loss, the shared device is reopened once; later calls get the same one.
+    #[test]
+    fn a_lost_shared_device_is_reopened_once() {
+        let _serial = crate::serial();
+        let Ok(before) = context() else { return eprintln!("skipping: no GPU") };
+        before.lost.store(true, Relaxed);
+        let a = context().unwrap();
+        let b = context().unwrap();
+        assert!(a.generation > before.generation, "a new device was opened");
+        assert!(Arc::ptr_eq(&a, &b) && a.generation == b.generation, "later calls reuse the new device");
+        if let (Ok(x), Ok(y)) = (shared_vulkan(), shared_vulkan()) {
+            assert!(Arc::ptr_eq(&x, &y), "the Vulkan side returns one device");
+        }
+    }
+
     #[test]
     fn short_impulse_responses_need_no_gpu() {
         let _serial = crate::serial();
@@ -1069,5 +1465,118 @@ mod tests {
         let mut buf = [1.0, 0.0, 0.0];
         conv.process(&mut buf);
         assert_eq!(buf, [0.5, 0.25, 0.0]);
+    }
+
+    /// V1 (simulated): once the GPU is marked lost, the convolver passes its input through.
+    /// The loss itself is not produced here; only the flag the GPU thread sets is set by hand.
+    #[test]
+    fn a_lost_gpu_passes_the_convolver_input_through() {
+        let _serial = crate::serial();
+        let ir = decaying_ir(9000);
+        let Ok(mut conv) = Convolver::new(&ir, 256) else { return eprintln!("skipping: no GPU") };
+        conv.shared.lost.store(true, Relaxed);
+        assert!(conv.device_lost());
+        let input = noise(1000, 4);
+        let mut block = input.clone();
+        conv.process(&mut block);
+        assert_eq!(block, input, "a lost convolver must not change its input");
+    }
+
+    /// V1 (rebuild, simulated loss): the convolver passes its input through,
+    /// the GPU thread opens a new device and builds the convolver on it, and
+    /// the tail comes back from the restarted stream. The loss is simulated by
+    /// setting the flags by hand (no device was lost); the new device is a real one.
+    #[test]
+    fn a_lost_convolver_is_built_again_and_its_tail_comes_back() {
+        let _serial = crate::serial();
+        let ir = decaying_ir(9000);
+        let Ok(mut conv) = Convolver::new(&ir, 256) else { return eprintln!("skipping: no GPU") };
+        let before = conv.device_generation();
+        // Simulate the loss: the device and the convolver are marked lost.
+        context().unwrap().lost.store(true, Relaxed);
+        conv.shared.lost.store(true, Relaxed);
+        let mut block = noise(256, 5);
+        let input = block.clone();
+        conv.process(&mut block);
+        assert_eq!(block, input, "a lost convolver passes its input through");
+        // Paced silence until the GPU thread has built it again (or give up after 10 s).
+        let pace = std::time::Duration::from_micros(256 * 1_000_000 / 48_000);
+        let started = Instant::now();
+        while conv.rebuilds() == 0 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "the convolver was not built again in 10 s");
+            let mut silent = vec![0.0f32; 256];
+            conv.process(&mut silent);
+            std::thread::sleep(pace);
+        }
+        assert!(!conv.device_lost(), "built again: no longer lost");
+        assert!(conv.device_generation() > before, "built again on a new device");
+        // Then an impulse well after the restart: the tail must come back and reproduce the IR.
+        let impulse_block = 60;
+        let mut out = Vec::new();
+        for b in 0..impulse_block + 40 {
+            let mut block = vec![0.0f32; 256];
+            if b == impulse_block {
+                block[0] = 1.0;
+            }
+            conv.process(&mut block);
+            out.extend_from_slice(&block);
+            std::thread::sleep(pace);
+        }
+        assert!(conv.restarts() >= 1, "the stream starts again after a rebuild");
+        assert!(!conv.device_lost());
+        let at = impulse_block * 256;
+        let peak = ir.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        for j in 0..ir.len() {
+            let got = out[at + j];
+            assert!((got - ir[j]).abs() < 1e-3 * peak.max(1.0), "sample {j} after the impulse: got {got}, want {}", ir[j]);
+        }
+    }
+
+    /// G5: a block longer than max_block is processed whole, not left dry after the first max_block samples.
+    #[test]
+    fn blocks_longer_than_max_block_are_processed_whole() {
+        let _serial = crate::serial();
+        let mut conv = Convolver::new(&[0.5, 0.25], 64).unwrap();
+        let mut buf = vec![1.0f32; 200];
+        conv.process(&mut buf);
+        assert_eq!(buf[0], 0.5);
+        assert!(buf[1..].iter().all(|&v| v == 0.75), "samples after the first 64 were not convolved");
+    }
+
+    /// G1: when the GPU falls behind by more than its backlog, the input
+    /// stream restarts (counted), and the tail comes back once paced again.
+    #[test]
+    fn a_stalled_gpu_restarts_its_stream_and_the_tail_comes_back() {
+        let _serial = crate::serial();
+        let ir = decaying_ir(9000);
+        let Ok(mut conv) = Convolver::new(&ir, 256) else { return eprintln!("skipping: no GPU") };
+        {
+            // Hold the GPU thread back while the audio side runs past its backlog (16 blocks).
+            let _held = GPU_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+            let noise_in = noise(256, 9);
+            for _ in 0..40 {
+                let mut block = noise_in.clone();
+                conv.process(&mut block);
+            }
+        }
+        assert!(conv.restarts() >= 1, "the backlog must force a restart");
+        // Paced again: silence, then one impulse. The output must reproduce the IR after it.
+        let total = 100 * 256;
+        let at = 60 * 256;
+        let mut input = vec![0.0f32; total];
+        input[at] = 1.0;
+        let mut out = Vec::with_capacity(total);
+        for chunk in input.chunks(256) {
+            let mut block = chunk.to_vec();
+            conv.process(&mut block);
+            out.extend_from_slice(&block);
+            std::thread::sleep(std::time::Duration::from_micros(256 * 1_000_000 / 48_000));
+        }
+        assert!(!conv.device_lost());
+        let peak = ir.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        for j in 0..ir.len() {
+            let got = out[at + j];
+            assert!((got - ir[j]).abs() < 1e-3 * peak.max(1.0), "sample {j} after the impulse: got {got}, want {}", ir[j]);
+        }
     }
 }

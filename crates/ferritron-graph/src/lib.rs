@@ -33,6 +33,8 @@
 //! ```
 
 use std::any::Any;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Most input or output channels a node may have.
@@ -123,6 +125,36 @@ pub trait Node: AsAny + Send + 'static {
     fn select_member(&mut self, member: usize) {
         let _ = member;
     }
+    /// Where the node runs, for a node that picks its device (CPU or GPU).
+    /// `None` for nodes with no choice.
+    fn placement(&self) -> Option<Device> {
+        None
+    }
+    /// Builds the node again on `device`, keeping its settings. Off the audio
+    /// thread. Returns false if the node cannot run there (the default: it
+    /// has no choice to make).
+    fn set_placement(&mut self, device: Device) -> bool {
+        let _ = device;
+        false
+    }
+    /// The GPU this node runs on is lost. [`Graph::process`] reads it at the
+    /// start of every control period, so it must be a flag read, not a call
+    /// to the device.
+    fn lost(&self) -> bool {
+        false
+    }
+    /// Switches a lost GPU node to its CPU candidate, which the node kept
+    /// since it was built, and keeps the GPU part for [`revive`](Self::revive).
+    /// Only moves values that already exist (no allocation, no device call),
+    /// so it is real-time safe. Returns false when the node is not lost or
+    /// has no CPU candidate.
+    fn fall_back(&mut self) -> bool {
+        false
+    }
+    /// Called by [`Graph::prepare`], off the audio thread: builds a lost GPU
+    /// part again and goes back to the GPU when that works. Nodes without a
+    /// CPU candidate need nothing.
+    fn revive(&mut self) {}
 }
 
 /// Lets [`Graph::node_mut`] hand nodes back with their concrete type.
@@ -198,6 +230,8 @@ pub struct Graph {
     latency: u32,
     max_block: usize,
     prepared: bool,
+    /// A lost node switched to a CPU candidate with another latency.
+    latency_changed: bool,
 }
 
 impl Graph {
@@ -221,6 +255,7 @@ impl Graph {
             latency: 0,
             max_block: 0,
             prepared: false,
+            latency_changed: false,
         }
     }
 
@@ -264,6 +299,10 @@ impl Graph {
     pub fn prepare(&mut self, max_block: usize) -> Result<(), GraphError> {
         if self.fusion {
             while self.fuse_one() {}
+        }
+        // Before the latencies are read: a node may go back to its GPU.
+        for node in self.nodes.iter_mut().flatten() {
+            node.revive();
         }
         let count = self.nodes.len();
         if let Some(i) = self.ports.iter().position(|&(i, o)| i > MAX_PORTS || o > MAX_PORTS) {
@@ -312,6 +351,7 @@ impl Graph {
         self.incoming = incoming;
         self.max_block = max_block;
         self.prepared = true;
+        self.latency_changed = false;
         Ok(())
     }
 
@@ -378,6 +418,53 @@ impl Graph {
         self.nodes.iter().flatten().map(|n| n.missed_blocks()).sum()
     }
 
+    /// Where node `id` runs (the node that absorbed it, if fused). `None` for
+    /// a node with no choice of device.
+    pub fn placement(&self, id: NodeId) -> Option<Device> {
+        let host = self.resolve(id);
+        self.nodes.get(host.0)?.as_deref()?.placement()
+    }
+
+    /// Fixes where node `id` runs, off the audio thread: the node is built
+    /// again on `device` ([`Node::set_placement`]), and the graph is prepared
+    /// again when it was prepared, since the latency may change. Returns
+    /// `Ok(false)` if the node cannot run on `device` (it stays as it was).
+    /// Save [`placement`](Self::placement) with the project to restore it.
+    pub fn set_placement(&mut self, id: NodeId, device: Device) -> Result<bool, GraphError> {
+        let host = self.resolve(id);
+        let Some(node) = self.nodes.get_mut(host.0).and_then(|n| n.as_deref_mut()) else { return Ok(false) };
+        if !node.set_placement(device) {
+            return Ok(false);
+        }
+        if self.prepared {
+            let max_block = self.max_block;
+            self.prepare(max_block)?;
+        }
+        Ok(true)
+    }
+
+    /// True once after a lost GPU node switched to a CPU candidate with another
+    /// latency. The graph keeps its compensation until the next
+    /// [`prepare`](Self::prepare), so the plugin should report the new
+    /// latency to the host (`request_latency`) and prepare again.
+    pub fn take_latency_changed(&mut self) -> bool {
+        std::mem::take(&mut self.latency_changed)
+    }
+
+    /// At the start of a control period: a lost GPU node runs its CPU
+    /// candidate from now on. The candidate's state starts empty, so filter
+    /// and delay contents are not carried over (a short gap in the sound).
+    fn switch_lost_nodes(&mut self) {
+        for node in self.nodes.iter_mut().flatten() {
+            if node.lost() {
+                let before = node.latency();
+                if node.fall_back() && node.latency() != before {
+                    self.latency_changed = true;
+                }
+            }
+        }
+    }
+
     /// A node with its concrete type, to change its settings.
     /// A node absorbed by fusion is found in the node that absorbed it,
     /// with its own part selected ([`Node::select_member`]).
@@ -397,17 +484,31 @@ impl Graph {
     }
 
     /// Processes one block. Real-time safe. Without [`prepare`](Self::prepare),
-    /// outputs silence.
+    /// outputs silence. A block longer than the `max_block` given to
+    /// `prepare` is processed in pieces of that size, so every frame is
+    /// processed.
     pub fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
-        let n = inputs.iter().map(|c| c.len()).chain(outputs.iter().map(|c| c.len())).min().unwrap_or(0).min(self.max_block);
-        if !self.prepared {
+        let total = inputs.iter().map(|c| c.len()).chain(outputs.iter().map(|c| c.len())).min().unwrap_or(0);
+        if !self.prepared || self.max_block == 0 {
             outputs.iter_mut().for_each(|c| c.fill(0.0));
             return;
         }
+        self.switch_lost_nodes();
+        let mut at = 0;
+        while at < total {
+            let n = (total - at).min(self.max_block);
+            self.run_piece(inputs, outputs, at, n);
+            at += n;
+        }
+    }
+
+    /// Runs the nodes on frames `at..at + n` (at most `max_block` of them).
+    fn run_piece(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]], at: usize, n: usize) {
+        let span = at..at + n;
         let Graph { nodes, ports, edges, order, incoming, ins, outs, .. } = self;
         for (c, buf) in outs[Self::INPUT.0].iter_mut().enumerate() {
             match inputs.get(c) {
-                Some(input) => buf[..n].copy_from_slice(&input[..n]),
+                Some(input) => buf[..n].copy_from_slice(&input[span.clone()]),
                 None => buf[..n].fill(0.0),
             }
         }
@@ -433,10 +534,10 @@ impl Graph {
             }
             if v == Self::OUTPUT.0 {
                 for (out, buf) in outputs.iter_mut().zip(&ins[v]) {
-                    out[..n].copy_from_slice(&buf[..n]);
+                    out[span.clone()].copy_from_slice(&buf[..n]);
                 }
                 for out in outputs.iter_mut().skip(ins[v].len()) {
-                    out[..n].fill(0.0);
+                    out[span.clone()].fill(0.0);
                 }
                 continue;
             }
@@ -505,16 +606,74 @@ pub struct Measured {
 /// an eighth of the block's real-time budget. If the policy allows none,
 /// the first candidate is used. Measured candidates are reset afterwards.
 pub fn choose<T: Node>(candidates: Vec<(Device, T)>, setup: &NodeSetup) -> Option<(T, Vec<Measured>)> {
+    choose_keyed(None, None, candidates, setup)
+}
+
+/// Whether `policy` allows a candidate on `device` with `latency`.
+fn allowed_by(policy: Policy, device: Device, latency: u32) -> bool {
+    match policy {
+        Policy::Off => device == Device::Cpu,
+        Policy::Balanced => device == Device::Cpu || latency == 0,
+        Policy::Max => true,
+    }
+}
+
+/// Placement memory, by configuration key (see [`config_key`]): the device
+/// each configuration was placed on in this process.
+static REMEMBERED: Mutex<BTreeMap<u64, Device>> = Mutex::new(BTreeMap::new());
+
+/// A stable key for a node's configuration (its sizes, kernels, settings),
+/// from numbers the caller picks: the same configuration gives the same key
+/// in every process, so [`choose_keyed`] can reuse a placement.
+pub fn config_key(parts: &[u64]) -> u64 {
+    parts.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &p| (h ^ p).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// The device a configuration was last placed on in this process, if any.
+pub fn remembered_placement(key: u64) -> Option<Device> {
+    REMEMBERED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).copied()
+}
+
+/// The device a placement result chose (from [`choose`] or [`choose_keyed`]).
+pub fn placed_on(measured: &[Measured]) -> Option<Device> {
+    measured.iter().find(|m| m.chosen).map(|m| m.device)
+}
+
+/// [`choose`] with a fixed placement and placement memory.
+///
+/// - `fixed`: this device is used if the policy allows it, without
+///   measuring (the "set placement" of a saved project: opening it again
+///   takes the same path it took before).
+/// - `key`: when no `fixed` is given and this configuration was placed
+///   before in this process, that placement is used; otherwise the candidates
+///   are measured, and the result is remembered under `key`.
+///
+/// Measurements of fixed placements are infinite (not measured). If the
+/// fixed device has no allowed candidate, the candidates are measured.
+pub fn choose_keyed<T: Node>(key: Option<u64>, fixed: Option<Device>, candidates: Vec<(Device, T)>, setup: &NodeSetup) -> Option<(T, Vec<Measured>)> {
+    let wanted = fixed.or_else(|| key.and_then(remembered_placement));
+    if let Some(device) = wanted {
+        let pick = candidates.iter().position(|(d, n)| *d == device && allowed_by(setup.policy, *d, n.latency()));
+        if let Some(pick) = pick {
+            let results = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, (d, n))| Measured { device: *d, micros: f64::INFINITY, latency: n.latency(), allowed: allowed_by(setup.policy, *d, n.latency()), chosen: i == pick })
+                .collect();
+            let node = candidates.into_iter().nth(pick)?.1;
+            return Some((node, results));
+        }
+    }
+    measure_and_choose(key, candidates, setup)
+}
+
+fn measure_and_choose<T: Node>(key: Option<u64>, candidates: Vec<(Device, T)>, setup: &NodeSetup) -> Option<(T, Vec<Measured>)> {
     let block = setup.max_block.max(1);
     let mut results = Vec::with_capacity(candidates.len());
     let mut nodes = Vec::with_capacity(candidates.len());
     for (device, mut node) in candidates {
         let latency = node.latency();
-        let allowed = match setup.policy {
-            Policy::Off => device == Device::Cpu,
-            Policy::Balanced => device == Device::Cpu || latency == 0,
-            Policy::Max => true,
-        };
+        let allowed = allowed_by(setup.policy, device, latency);
         let mut micros = f64::INFINITY;
         if allowed {
             let ins = vec![vec![0.0f32; block]; node.inputs()];
@@ -547,6 +706,9 @@ pub fn choose<T: Node>(candidates: Vec<(Device, T)>, setup: &NodeSetup) -> Optio
         (None, _) => 0,
     };
     results.get_mut(best)?.chosen = true;
+    if let Some(key) = key {
+        REMEMBERED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, results[best].device);
+    }
     let node = nodes.into_iter().nth(best)?;
     Some((node, results))
 }
@@ -896,6 +1058,43 @@ mod tests {
         assert!(measured[0].chosen && !measured[1].chosen && measured[1].micros > measured[0].micros);
     }
 
+    /// G4: a placement can be fixed, and a configuration keeps the placement it got
+    /// (without measuring again), as long as the policy allows it.
+    #[test]
+    fn a_fixed_or_remembered_placement_is_used_without_measuring() {
+        let candidates = || vec![(Device::Cpu, Busy { cost: 5, latency: 0, tag: 1 }), (Device::Gpu, Busy { cost: 400, latency: 0, tag: 2 })];
+        // Fixed: the GPU candidate, even though the CPU is faster.
+        let (node, measured) = choose_keyed(None, Some(Device::Gpu), candidates(), &setup(Policy::Max)).unwrap();
+        assert_eq!(node.tag, 2);
+        assert_eq!(placed_on(&measured), Some(Device::Gpu));
+        assert!(measured.iter().all(|m| m.micros.is_infinite()), "nothing was measured");
+        // The policy still rules: CPU only.
+        let (node, _) = choose_keyed(None, Some(Device::Gpu), candidates(), &setup(Policy::Off)).unwrap();
+        assert_eq!(node.tag, 1, "Off allows only the CPU");
+        // Remembered: the first call measures (the CPU wins), later calls reuse it.
+        let key = config_key(&[0x7e57, 1]);
+        let (node, measured) = choose_keyed(Some(key), None, candidates(), &setup(Policy::Max)).unwrap();
+        assert_eq!((node.tag, remembered_placement(key)), (1, Some(Device::Cpu)));
+        assert!(measured[0].micros.is_finite(), "the first placement measured");
+        let (node, measured) = choose_keyed(Some(key), None, candidates(), &setup(Policy::Max)).unwrap();
+        assert_eq!(node.tag, 1);
+        assert!(measured.iter().all(|m| m.micros.is_infinite()), "the remembered placement is reused");
+    }
+
+    /// G5: a block longer than the prepared size is processed in pieces, all of it.
+    #[test]
+    fn a_block_longer_than_max_block_is_processed_whole() {
+        let mut g = Graph::new(1, 1);
+        let half = g.add(Gain::new(1, 0.5));
+        g.connect(Graph::INPUT, 0, half, 0).unwrap();
+        g.connect(half, 0, Graph::OUTPUT, 0).unwrap();
+        g.prepare(8).unwrap();
+        let input = [2.0f32; 40];
+        let mut output = [0.0f32; 40];
+        g.process(&[&input], &mut [&mut output]);
+        assert!(output.iter().all(|&v| v == 1.0), "frames after the first 8 were dropped: {output:?}");
+    }
+
     #[test]
     fn gains_in_series_fuse_and_keep_their_ids() {
         let mut g = Graph::new(2, 2);
@@ -980,6 +1179,155 @@ mod tests {
         g.node_mut::<Gain>(ends[1].0).unwrap().set(1.0);
         g.process(&[&[1.0; 4], &[2.0; 4]], &mut [&mut l, &mut r]);
         assert_eq!(l[0], 1.0);
+    }
+
+    /// G4: a node's placement is reported (through the node that absorbed it,
+    /// if fused); fixing it builds the node again and prepares the graph
+    /// again, so the latency follows; a node without a choice refuses.
+    #[test]
+    fn set_placement_rebuilds_the_node_and_prepares_again() {
+        struct Placed {
+            device: Device,
+        }
+        impl Node for Placed {
+            fn inputs(&self) -> usize {
+                1
+            }
+            fn outputs(&self) -> usize {
+                1
+            }
+            fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+                outputs[0].copy_from_slice(inputs[0]);
+            }
+            fn latency(&self) -> u32 {
+                if self.device == Device::Gpu { 64 } else { 0 }
+            }
+            fn placement(&self) -> Option<Device> {
+                Some(self.device)
+            }
+            fn set_placement(&mut self, device: Device) -> bool {
+                self.device = device;
+                true
+            }
+        }
+        let mut graph = Graph::new(1, 1);
+        let id = graph.add(Placed { device: Device::Gpu });
+        graph.connect(Graph::INPUT, 0, id, 0).unwrap();
+        graph.connect(id, 0, Graph::OUTPUT, 0).unwrap();
+        graph.prepare(32).unwrap();
+        assert_eq!((graph.placement(id), graph.latency()), (Some(Device::Gpu), 64));
+        assert!(graph.set_placement(id, Device::Cpu).unwrap());
+        assert_eq!((graph.placement(id), graph.latency()), (Some(Device::Cpu), 0), "prepared again: the latency follows");
+        let plain = graph.add(Gain::new(1, 1.0));
+        assert_eq!(graph.placement(plain), None);
+        assert!(!graph.set_placement(plain, Device::Gpu).unwrap());
+    }
+
+    /// A node with a GPU side (`gain`, `latency`) and its CPU candidate kept
+    /// beside it (`other`), like the GPU nodes of `ferritron-gpu`. Each side
+    /// has its own `flag` (the device-lost mark). The switch swaps the sides.
+    struct Sided {
+        gain: f32,
+        latency: u32,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        other: Option<Box<Sided>>,
+        revives: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Node for Sided {
+        fn inputs(&self) -> usize {
+            1
+        }
+        fn outputs(&self) -> usize {
+            1
+        }
+        fn latency(&self) -> u32 {
+            self.latency
+        }
+        fn process(&mut self, inputs: &[&[f32]], outputs: &mut [&mut [f32]]) {
+            for (o, &x) in outputs[0].iter_mut().zip(inputs[0]) {
+                *o = x * self.gain;
+            }
+        }
+        fn lost(&self) -> bool {
+            self.flag.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn fall_back(&mut self) -> bool {
+            if !self.lost() {
+                return false;
+            }
+            let Some(mut other) = self.other.take() else { return false };
+            std::mem::swap(self, &mut *other);
+            self.other = Some(other);
+            true
+        }
+        fn revive(&mut self) {
+            self.revives.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn sided_graph(node: Sided) -> Graph {
+        let mut g = Graph::new(1, 1);
+        let id = g.add(node);
+        g.connect(Graph::INPUT, 0, id, 0).unwrap();
+        g.connect(id, 0, Graph::OUTPUT, 0).unwrap();
+        g
+    }
+
+    /// G-f7 2-1: with the GPU side's loss flag set by hand, the next control
+    /// period runs the CPU candidate, and its output equals a graph with only
+    /// the CPU candidate. The latency change is reported once.
+    #[test]
+    fn a_lost_gpu_node_runs_its_cpu_candidate_from_the_next_block() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        let revives = Arc::new(AtomicUsize::new(0));
+        let cpu = Sided { gain: 0.5, latency: 0, flag: Arc::new(AtomicBool::new(false)), other: None, revives: revives.clone() };
+        let gpu = Sided { gain: 3.0, latency: 64, flag: flag.clone(), other: Some(Box::new(cpu)), revives: revives.clone() };
+        let mut g = sided_graph(gpu);
+        g.prepare(64).unwrap();
+        assert_eq!(revives.load(Ordering::Relaxed), 1, "prepare revives each node once");
+        assert_eq!(g.latency(), 64);
+        let input: Vec<f32> = (0..128).map(|i| i as f32 * 0.01 - 0.6).collect();
+
+        let mut first = vec![0.0f32; 64];
+        g.process(&[&input[..64]], &mut [&mut first]);
+        assert!(first.iter().zip(&input[..64]).all(|(o, i)| *o == i * 3.0), "the GPU side runs first");
+
+        flag.store(true, Ordering::Relaxed);
+        let mut second = vec![0.0f32; 64];
+        g.process(&[&input[64..]], &mut [&mut second]);
+
+        let mut reference = Graph::new(1, 1);
+        let half = reference.add(Gain::new(1, 0.5));
+        reference.connect(Graph::INPUT, 0, half, 0).unwrap();
+        reference.connect(half, 0, Graph::OUTPUT, 0).unwrap();
+        reference.prepare(64).unwrap();
+        let mut want = vec![0.0f32; 64];
+        reference.process(&[&input[64..]], &mut [&mut want]);
+        assert_eq!(second, want, "the CPU candidate's output, the same as a CPU-only graph");
+
+        assert!(g.take_latency_changed(), "the latency went from 64 to 0");
+        assert!(!g.take_latency_changed(), "reported once");
+        assert_eq!(g.latency(), 64, "the compensation stays until the next prepare");
+    }
+
+    /// A lost node without a CPU candidate keeps running where it is.
+    #[test]
+    fn a_lost_node_without_a_cpu_candidate_keeps_its_gpu_side() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let flag = Arc::new(AtomicBool::new(true));
+        let revives = Arc::new(AtomicUsize::new(0));
+        let gpu = Sided { gain: 3.0, latency: 64, flag, other: None, revives };
+        let mut g = sided_graph(gpu);
+        g.prepare(16).unwrap();
+        let input = [1.0f32; 16];
+        let mut out = [0.0f32; 16];
+        g.process(&[&input], &mut [&mut out]);
+        assert!(out.iter().all(|&v| v == 3.0), "no CPU candidate: the node is not switched");
+        assert!(!g.take_latency_changed());
     }
 
     #[test]

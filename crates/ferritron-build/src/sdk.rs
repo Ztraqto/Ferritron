@@ -96,6 +96,17 @@ pub const AAX: Sdk = Sdk {
     source: "https://developer.avid.com (sign up for the AAX SDK)",
 };
 
+/// Steinberg's VST 2.4 SDK. Steinberg no longer licenses it; Ferritron neither
+/// fetches nor ships it. People who already have it (under their existing
+/// agreement) point `VST2_SDK_DIR` at it.
+pub const VST2: Sdk = Sdk {
+    id: "vst2",
+    name: "VST 2 SDK",
+    var: "VST2_SDK_DIR",
+    probe: &["pluginterfaces/vst2.x/aeffect.h", "pluginterfaces/vst2.x/aeffectx.h"],
+    source: "not available from Ferritron: Steinberg no longer licenses VST 2; use the copy you already have",
+};
+
 /// The Android NDK, for Android apps (`--target aarch64-linux-android`).
 pub const NDK: Sdk = Sdk {
     id: "ndk",
@@ -106,7 +117,7 @@ pub const NDK: Sdk = Sdk {
 };
 
 /// Every SDK and tool, in the order tools list them.
-pub const ALL: [&Sdk; 6] = [&VST3, &CLAP, &ARA, &AAX, &NDK, &XCLANG];
+pub const ALL: [&Sdk; 7] = [&VST3, &CLAP, &VST2, &ARA, &AAX, &NDK, &XCLANG];
 
 /// The SDK with `id`.
 pub fn find(id: &str) -> Option<&'static Sdk> {

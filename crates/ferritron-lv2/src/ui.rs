@@ -195,15 +195,15 @@ unsafe extern "C" fn instantiate(
         values,
         view_api,
         view: std::ptr::null_mut(),
-        host: Box::new(ViewHost { ctx: std::ptr::null_mut(), get_param: ui_get, begin_edit: ui_begin, perform_edit: ui_perform, end_edit: ui_end }),
+        host: Box::new(ViewHost { ctx: std::ptr::null_mut(), get_param: ui_get, begin_edit: ui_begin, perform_edit: ui_perform, end_edit: ui_end, request_resize: None }),
         scale,
     });
     let ui_ptr: *mut Ui = &raw mut *ui;
     *ui.host = if let Some(dsp) = unsafe { dsp.as_ref() } {
         dsp.ui.store(ui_ptr, Ordering::Release);
-        ViewHost { ctx: dsp as *const Instance as *mut c_void, get_param: dsp_get, begin_edit: dsp_begin, perform_edit: dsp_perform, end_edit: dsp_end }
+        ViewHost { ctx: dsp as *const Instance as *mut c_void, get_param: dsp_get, begin_edit: dsp_begin, perform_edit: dsp_perform, end_edit: dsp_end, request_resize: None }
     } else {
-        ViewHost { ctx: ui_ptr.cast(), get_param: ui_get, begin_edit: ui_begin, perform_edit: ui_perform, end_edit: ui_end }
+        ViewHost { ctx: ui_ptr.cast(), get_param: ui_get, begin_edit: ui_begin, perform_edit: ui_perform, end_edit: ui_end, request_resize: None }
     };
     // The size the user chose last time (saved with the instance), else the default.
     let (mut width, mut height) = (view_api.width, view_api.height);

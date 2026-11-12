@@ -1,0 +1,13 @@
+param-cutoff = カットオフ
+param-level = レベル
+param-mix = ミックス
+param-delay = ディレイ
+param-pitch = ピッチ
+param-speed = 速さ
+param-taps = タップ
+param-shape = シェイプ
+param-mode = モード
+param-on = オン
+param-mode-0 = クリーン
+param-mode-1 = ウォーム
+param-mode-2 = ダーク
